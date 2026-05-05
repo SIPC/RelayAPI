@@ -20,6 +20,7 @@ import {
   ShieldCheckIcon,
   UserRoundIcon,
   Trash2Icon,
+  UploadIcon,
   WorkflowIcon,
   XCircleIcon,
   type LucideIcon,
@@ -97,6 +98,7 @@ import {
   getDashboardSnapshot,
   getOverview,
   getRequestLogs,
+  importCredentialJson,
   listChannels,
   listCredentials,
   logoutWebSession,
@@ -1529,6 +1531,8 @@ function CredentialsSection({
 }) {
   const [oauthOpen, setOauthOpen] = React.useState(false);
   const [pendingId, setPendingId] = React.useState<string | null>(null);
+  const [uploadingCredential, setUploadingCredential] = React.useState(false);
+  const credentialFileInputRef = React.useRef<HTMLInputElement>(null);
   const [quotaLoadingIds, setQuotaLoadingIds] = React.useState<Set<string>>(
     () => new Set(),
   );
@@ -1639,6 +1643,89 @@ function CredentialsSection({
   }, [credentials, loadQuota]);
 
   const quotaRefreshPending = refreshingAllQuotas || quotaLoadingIds.size > 0;
+  const sortedCredentials = React.useMemo(
+    () =>
+      [...credentials].sort(
+        (left, right) =>
+          codexPlanRank(right.planType) - codexPlanRank(left.planType),
+      ),
+    [credentials],
+  );
+
+  function openCredentialUpload() {
+    credentialFileInputRef.current?.click();
+  }
+
+  async function handleCredentialUploadChange(
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) {
+    const files = Array.from(event.currentTarget.files || []);
+    event.currentTarget.value = "";
+    if (files.length === 0) {
+      return;
+    }
+
+    setUploadingCredential(true);
+    try {
+      const importedCredentials: CodexCredentialRecord[] = [];
+      let failedCount = 0;
+
+      for (const file of files) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(await file.text()) as unknown;
+        } catch (error) {
+          failedCount += 1;
+          console.error(`Failed to parse credential file ${file.name}`, error);
+          continue;
+        }
+
+        const payloads = credentialUploadPayloads(parsed);
+        if (payloads.length === 0) {
+          failedCount += 1;
+          continue;
+        }
+
+        for (const [index, payload] of payloads.entries()) {
+          try {
+            const imported = await importCredentialJson(
+              payload,
+              payloads.length > 1 ? `${file.name}#${index + 1}` : file.name,
+            );
+            importedCredentials.push(imported);
+            quotaLoadRequestedRef.current.add(imported.id);
+          } catch (error) {
+            failedCount += 1;
+            console.error(
+              `Failed to import credential from ${file.name}#${index + 1}`,
+              error,
+            );
+          }
+        }
+      }
+
+      if (importedCredentials.length > 0) {
+        await onRefreshData();
+        importedCredentials.forEach((credential) => {
+          void loadQuota(credential, { forceRefresh: true, silent: true });
+        });
+      }
+
+      if (importedCredentials.length > 0 && failedCount > 0) {
+        toast.error(
+          `已上传 ${formatNumber(importedCredentials.length)} 个，失败 ${formatNumber(failedCount)} 个`,
+        );
+      } else if (importedCredentials.length > 0) {
+        toast.success(
+          `已上传 ${formatNumber(importedCredentials.length)} 个 Codex 凭据`,
+        );
+      } else {
+        toast.error("没有成功上传的 Codex 凭据");
+      }
+    } finally {
+      setUploadingCredential(false);
+    }
+  }
 
   async function remove(credential: CodexCredentialRecord) {
     setPendingId(credential.id);
@@ -1655,6 +1742,15 @@ function CredentialsSection({
 
   return (
     <>
+      <input
+        ref={credentialFileInputRef}
+        type="file"
+        accept="application/json,.json"
+        className="hidden"
+        multiple
+        onChange={handleCredentialUploadChange}
+      />
+
       <Card>
         <CardHeader>
           <CardTitle>Codex 凭据</CardTitle>
@@ -1676,6 +1772,19 @@ function CredentialsSection({
                 )}
                 刷新全部额度
               </Button>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={uploadingCredential}
+                onClick={openCredentialUpload}
+              >
+                {uploadingCredential ? (
+                  <Spinner data-icon="inline-start" />
+                ) : (
+                  <UploadIcon data-icon="inline-start" />
+                )}
+                上传凭证
+              </Button>
               <Button type="button" onClick={() => setOauthOpen(true)}>
                 <PlusIcon data-icon="inline-start" />
                 连接 Codex
@@ -1696,14 +1805,29 @@ function CredentialsSection({
                   并可创建默认通道。
                 </EmptyDescription>
               </EmptyHeader>
-              <Button type="button" onClick={() => setOauthOpen(true)}>
-                <PlusIcon data-icon="inline-start" />
-                连接 Codex
-              </Button>
+              <div className="flex flex-wrap items-center justify-center gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={uploadingCredential}
+                  onClick={openCredentialUpload}
+                >
+                  {uploadingCredential ? (
+                    <Spinner data-icon="inline-start" />
+                  ) : (
+                    <UploadIcon data-icon="inline-start" />
+                  )}
+                  上传凭证
+                </Button>
+                <Button type="button" onClick={() => setOauthOpen(true)}>
+                  <PlusIcon data-icon="inline-start" />
+                  连接 Codex
+                </Button>
+              </div>
             </Empty>
           ) : (
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
-              {credentials.map((credential) => {
+              {sortedCredentials.map((credential) => {
                 const quota = quotas[credential.id];
                 const quotaLoading = quotaLoadingIds.has(credential.id);
                 const name =
@@ -1712,19 +1836,19 @@ function CredentialsSection({
                 return (
                   <Card
                     key={credential.id}
-                    className="bg-linear-to-br from-card via-card to-muted/45 shadow-sm"
+                    className="relative bg-linear-to-br from-card via-card to-muted/45 shadow-sm"
                   >
                     <CardContent className="grid gap-3">
-                      <div className="flex items-center justify-between gap-2">
-                        <div className="flex min-w-0 items-center gap-2">
+                      <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
+                        <div className="flex min-w-0 items-center gap-2 overflow-hidden">
                           <Badge
                             variant="outline"
-                            className={`h-6 shrink-0 px-3 text-sm font-semibold ${codexPlanBadgeTone(credential.planType)}`}
+                            className={`h-6 shrink-0 px-2 text-sm font-semibold ${codexPlanBadgeTone(credential.planType)}`}
                           >
                             {codexPlanLabel(credential.planType)}
                           </Badge>
                           <div
-                            className="min-w-0 truncate text-base font-medium"
+                            className="min-w-0 flex-1 truncate text-base font-medium"
                             title={name}
                           >
                             {name}
@@ -1788,6 +1912,14 @@ function CredentialsSection({
                         </div>
                       </div>
                     </CardContent>
+                    {refreshingAllQuotas && quotaLoading && (
+                      <div className="absolute inset-0 z-10 flex items-center justify-center bg-card/70 backdrop-blur-[1px]">
+                        <div className="flex items-center gap-2 rounded-full border bg-background/90 px-3 py-1.5 text-sm font-medium shadow-sm">
+                          <Spinner data-icon="inline-start" />
+                          刷新额度中
+                        </div>
+                      </div>
+                    )}
                   </Card>
                 );
               })}
@@ -3091,7 +3223,14 @@ function UsageHealthBadge({
     : never;
 }) {
   if (status === "normal") {
-    return <Badge variant="secondary">正常</Badge>;
+    return (
+      <Badge
+        variant="outline"
+        className="border-emerald-500/45 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+      >
+        正常
+      </Badge>
+    );
   }
   if (status === "warning") {
     return <Badge variant="outline">警告</Badge>;
@@ -3344,6 +3483,26 @@ function parseUtcDate(value: string | null | undefined) {
   return new Date(timestamp);
 }
 
+function credentialUploadPayloads(parsed: unknown) {
+  if (Array.isArray(parsed)) {
+    return parsed.filter(isRecord);
+  }
+  if (!isRecord(parsed)) {
+    return [];
+  }
+  if (Array.isArray(parsed.credentials)) {
+    return parsed.credentials.filter(isRecord);
+  }
+  if (Array.isArray(parsed.data)) {
+    return parsed.data.filter(isRecord);
+  }
+  return [parsed];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
 function codexPlanLabel(planType: string) {
   const normalized = codexPlanKey(planType);
   const labels: Record<string, string> = {
@@ -3356,6 +3515,30 @@ function codexPlanLabel(planType: string) {
     team: "Team",
   };
   return labels[normalized] || planType || "未知";
+}
+
+function codexPlanRank(planType: string) {
+  const normalized = codexPlanKey(planType);
+  if (normalized === "pro") {
+    return 50;
+  }
+  if (
+    normalized === "prolite" ||
+    normalized === "pro-lite" ||
+    normalized === "pro_lite"
+  ) {
+    return 40;
+  }
+  if (normalized === "team") {
+    return 30;
+  }
+  if (normalized === "plus") {
+    return 20;
+  }
+  if (normalized === "free") {
+    return 10;
+  }
+  return 0;
 }
 
 function codexPlanBadgeTone(planType: string) {

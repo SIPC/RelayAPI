@@ -224,6 +224,84 @@ export async function refreshCodexCredential(id: string) {
   return publicCredential(await refreshCodexCredentialWithTokens(id));
 }
 
+export function importCodexCredentialFromJson(
+  input: unknown,
+  options: { filename?: string } = {},
+) {
+  const parsed = objectValue(input);
+  if (!parsed) {
+    throw new HttpError(
+      400,
+      "invalid_codex_credential_json",
+      "Uploaded Codex credential must be a JSON object",
+    );
+  }
+
+  const type = stringValue(parsed.type);
+  if (type && type !== "codex") {
+    throw new HttpError(
+      400,
+      "invalid_codex_credential_type",
+      "Uploaded credential JSON is not a Codex credential",
+    );
+  }
+
+  const tokens: CodexTokenBundle = {
+    access_token: stringValue(parsed.access_token),
+    refresh_token: stringValue(parsed.refresh_token),
+    id_token: stringValue(parsed.id_token),
+    expired: stringValue(parsed.expired || parsed.expire),
+    last_refresh: stringValue(parsed.last_refresh),
+  };
+  if (!tokens.refresh_token && !tokens.access_token) {
+    throw new HttpError(
+      400,
+      "missing_codex_tokens",
+      "Uploaded Codex credential must include access_token or refresh_token",
+    );
+  }
+
+  const accessClaims = decodeJwtPayload(tokens.access_token);
+  const idClaims = decodeJwtPayload(tokens.id_token);
+  const accessAuth = objectValue(accessClaims?.["https://api.openai.com/auth"]);
+  const idAuth = objectValue(idClaims?.["https://api.openai.com/auth"]);
+  const profile = objectValue(accessClaims?.["https://api.openai.com/profile"]);
+  const auth = idAuth || accessAuth;
+  const email =
+    stringValue(parsed.email) ||
+    stringValue(idClaims?.email) ||
+    stringValue(profile?.email);
+  const accountId =
+    stringValue(parsed.account_id) ||
+    stringValue(parsed.accountId) ||
+    stringValue(auth?.chatgpt_account_id);
+  const planType =
+    stringValue(parsed.plan_type) ||
+    stringValue(parsed.planType) ||
+    stringValue(auth?.chatgpt_plan_type);
+  const id =
+    stringValue(parsed.id) || createCredentialId({ email, accountId, tokens });
+
+  const saved = upsertCodexCredential({
+    id,
+    email,
+    accountId,
+    planType,
+    tokens,
+    metadata: {
+      imported_from: "web_upload",
+      import_filename: options.filename,
+      imported_at: new Date().toISOString(),
+      source_disabled: parsed.disabled,
+    },
+  });
+  if (!saved) {
+    throw new Error("Failed to import Codex credential");
+  }
+  ensureDefaultChannel(saved);
+  return publicCredential(saved);
+}
+
 async function refreshCodexCredentialWithTokens(id: string) {
   const credential = getCodexCredentialWithTokens(id);
   if (!credential) {

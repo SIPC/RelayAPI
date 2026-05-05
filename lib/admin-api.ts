@@ -229,6 +229,19 @@ export function listCredentials() {
   return adminRequest<CodexCredentialRecord[]>("/api/admin/codex/credentials");
 }
 
+export function importCredentialJson(
+  credential: Record<string, unknown>,
+  filename?: string,
+) {
+  return adminRequest<CodexCredentialRecord>(
+    "/api/admin/codex/credentials/import",
+    {
+      method: "POST",
+      body: { credential, filename },
+    },
+  );
+}
+
 export function deleteCredential(id: string) {
   return adminRequest<AdminDeleteResponse>(
     `/api/admin/codex/credentials/${encodePath(id)}`,
