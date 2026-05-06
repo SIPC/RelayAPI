@@ -125,7 +125,7 @@ curl -b relay-web-cookie.txt http://localhost:3000/api/admin/codex/credentials
 curl -b relay-web-cookie.txt http://localhost:3000/api/admin/channels
 ```
 
-A default channel is created automatically when a Codex credential is saved. Channels are the routing unit; credentials are only resources bound to channels.
+After saving a Codex credential, create or update a channel and bind the credential to it. Channels are the routing unit; credentials are resources bound to channels.
 
 Refresh quota for a credential:
 

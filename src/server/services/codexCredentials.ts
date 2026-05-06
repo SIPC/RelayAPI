@@ -14,11 +14,7 @@ import {
   upsertCodexCredential,
 } from "@/src/server/repositories/codexCredentials";
 import { credentialUsageHealth } from "@/src/server/repositories/logs";
-import {
-  detachCredentialFromChannels,
-  getChannelByCredentialId,
-  insertChannel,
-} from "@/src/server/repositories/channels";
+import { detachCredentialFromChannels } from "@/src/server/repositories/channels";
 import {
   saveOAuthPendingState,
   takeOAuthPendingState,
@@ -360,7 +356,6 @@ export function importCodexCredentialFromJson(
   if (!saved) {
     throw new Error("Failed to import Codex credential");
   }
-  ensureDefaultChannel(saved);
   return publicCredential(saved);
 }
 
@@ -517,27 +512,7 @@ async function saveTokenResponse(
   if (!saved) {
     throw new Error("Failed to save Codex credential");
   }
-  ensureDefaultChannel(saved);
   return saved;
-}
-
-function ensureDefaultChannel(credential: CodexCredentialRecord) {
-  if (getChannelByCredentialId(credential.id)) {
-    return;
-  }
-  insertChannel({
-    id: randomId("ch"),
-    name: credential.email
-      ? `Codex · ${credential.email}`
-      : `Codex · ${credential.accountId || credential.id}`,
-    baseUrl: serverConfig.codexBaseUrl,
-    credentialId: credential.id,
-    enabled: true,
-    priority: 100,
-    weight: 1,
-    modelAllowlist: [],
-    status: "healthy",
-  });
 }
 
 async function importLegacyCredentialsOnce() {
@@ -590,9 +565,7 @@ async function importLegacyCredentialsOnce() {
           tokens,
           metadata: { imported_from: filePath },
         });
-        if (saved) {
-          ensureDefaultChannel(saved);
-        }
+        void saved;
       } catch {
         // Ignore malformed legacy credential files. They are never returned to UI.
       }

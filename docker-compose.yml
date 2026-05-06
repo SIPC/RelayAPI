@@ -15,4 +15,7 @@ services:
       # RELAY_ENCRYPTION_KEY: "change_me_to_a_long_random_secret"
       # CODEX_REDIRECT_URI: "http://localhost:1455/auth/callback"
     volumes:
-      - ./data:/app/data
+      - relay-api-data:/app/data
+
+volumes:
+  relay-api-data:
