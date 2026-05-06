@@ -17,6 +17,7 @@ import {
   RefreshCwIcon,
   RouteIcon,
   SearchIcon,
+  SettingsIcon,
   ShieldCheckIcon,
   UserRoundIcon,
   Trash2Icon,
@@ -97,7 +98,7 @@ import {
   getCredentialQuota,
   getDashboardSnapshot,
   getOverview,
-  getRequestLogs,
+  getRequestLogsPage,
   importCredentialJson,
   listChannels,
   listCredentials,
@@ -107,11 +108,13 @@ import {
   WEB_AUTH_EXPIRED_EVENT,
   updateApiKey,
   updateChannel,
+  updateCredentialRouting,
   type AdminDashboardRequestLogRow,
   type ApiKeyPayload,
   type ChannelPayload,
   type CodexQuotaReport,
   type OAuthStartResponse,
+  type RequestLogsPage,
 } from "@/lib/admin-api";
 import type {
   AdminOverviewStats,
@@ -128,13 +131,13 @@ type AdminDashboardProps = {
   initialApiKeys: PublicApiKey[];
   initialChannels: ChannelRecord[];
   initialCredentials: CodexCredentialRecord[];
-  initialRequestLogs: AdminDashboardRequestLogRow[];
+  initialRequestLogsPage: RequestLogsPage;
   initialOverviewStats: AdminOverviewStats;
   initialNow: number;
 };
 
 type SectionId = "overview" | "apiKeys" | "credentials" | "channels" | "logs";
-type LogStatusFilter = "all" | "success" | "error" | "stream";
+type LogStatusFilter = "all" | "success" | "error";
 
 type NavigationItem = {
   id: SectionId;
@@ -165,7 +168,7 @@ type ApiKeyFormState = {
 
 type ChannelFormState = {
   name: string;
-  credentialId: string;
+  credentialIds: string;
   enabled: boolean;
   baseUrl: string;
   priority: string;
@@ -184,7 +187,6 @@ const LOG_STATUS_FILTERS: Array<{ id: LogStatusFilter; label: string }> = [
   { id: "all", label: "全部" },
   { id: "success", label: "成功" },
   { id: "error", label: "错误" },
-  { id: "stream", label: "流式" },
 ];
 
 const WEB_SESSION_EXPIRED_MESSAGE = "管理台会话已过期，请重新登录";
@@ -203,7 +205,7 @@ const EMPTY_API_KEY_FORM: ApiKeyFormState = {
 
 const EMPTY_CHANNEL_FORM: ChannelFormState = {
   name: "",
-  credentialId: "",
+  credentialIds: "",
   enabled: true,
   baseUrl: "",
   priority: "100",
@@ -215,7 +217,7 @@ export function AdminDashboard({
   initialApiKeys,
   initialChannels,
   initialCredentials,
-  initialRequestLogs,
+  initialRequestLogsPage,
   initialOverviewStats,
   initialNow,
 }: AdminDashboardProps) {
@@ -224,7 +226,9 @@ export function AdminDashboard({
   const [apiKeys, setApiKeys] = React.useState(initialApiKeys);
   const [channels, setChannels] = React.useState(initialChannels);
   const [credentials, setCredentials] = React.useState(initialCredentials);
-  const [requestLogs, setRequestLogs] = React.useState(initialRequestLogs);
+  const [requestLogs, setRequestLogs] = React.useState(
+    initialRequestLogsPage.data,
+  );
   const [overviewStats, setOverviewStats] =
     React.useState(initialOverviewStats);
   const [snapshotTime, setSnapshotTime] = React.useState(initialNow);
@@ -307,11 +311,9 @@ export function AdminDashboard({
     return stats;
   }
 
-  async function refreshRequestLogs() {
-    const logs = await getRequestLogs(100);
+  function handleRequestLogsLoaded(logs: AdminDashboardRequestLogRow[]) {
     setRequestLogs(logs);
     setSnapshotTime(Date.now());
-    return logs;
   }
 
   function handleApiKeyCreated(created: CreatedApiKey) {
@@ -354,7 +356,18 @@ export function AdminDashboard({
       current.filter((credential) => credential.id !== id),
     );
     setChannels((current) =>
-      current.filter((channel) => channel.credentialId !== id),
+      current
+        .map((channel) => {
+          const credentialIds = channel.credentialIds.filter(
+            (credentialId) => credentialId !== id,
+          );
+          return {
+            ...channel,
+            credentialId: credentialIds[0] || channel.credentialId,
+            credentialIds,
+          };
+        })
+        .filter((channel) => channel.credentialIds.length > 0),
     );
   }
 
@@ -588,6 +601,7 @@ export function AdminDashboard({
             {activeSection === "apiKeys" && (
               <ApiKeysSection
                 apiKeys={apiKeys}
+                channels={channels}
                 onCreated={handleApiKeyCreated}
                 onDeleted={handleApiKeyDeleted}
                 onUpdated={handleApiKeyUpdated}
@@ -612,8 +626,11 @@ export function AdminDashboard({
             )}
             {activeSection === "logs" && (
               <LogsSection
-                requestLogs={requestLogs}
-                onRefresh={refreshRequestLogs}
+                initialRequestLogsPage={{
+                  ...initialRequestLogsPage,
+                  data: requestLogs,
+                }}
+                onLoaded={handleRequestLogsLoaded}
               />
             )}
           </section>
@@ -820,8 +837,8 @@ function ApiKeyUsageCard({ rows }: { rows: ApiKeyUsageStatsRow[] }) {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {rows.slice(0, 10).map((row) => (
-                <TableRow key={row.key}>
+              {rows.slice(0, 10).map((row, index) => (
+                <TableRow key={`${row.key}:${index}`}>
                   <TableCell>
                     <div className="font-medium">{row.apiKeyName}</div>
                     <div className="font-mono text-xs text-muted-foreground">
@@ -893,8 +910,8 @@ function UsageStatsTableCard({
               </TableRow>
             </TableHeader>
             <TableBody>
-              {rows.slice(0, 10).map((row) => (
-                <TableRow key={row.key}>
+              {rows.slice(0, 10).map((row, index) => (
+                <TableRow key={`${row.key}:${index}`}>
                   <TableCell>
                     <div className="font-medium">{row.label || row.key}</div>
                     {row.subLabel && (
@@ -997,11 +1014,13 @@ function LatencyCell({
 
 function ApiKeysSection({
   apiKeys,
+  channels,
   onCreated,
   onDeleted,
   onUpdated,
 }: {
   apiKeys: PublicApiKey[];
+  channels: ChannelRecord[];
   onCreated: (apiKey: CreatedApiKey) => void;
   onDeleted: (id: string) => void;
   onUpdated: (apiKey: PublicApiKey) => void;
@@ -1148,6 +1167,7 @@ function ApiKeysSection({
       </Card>
 
       <ApiKeyFormDialog
+        channels={channels}
         mode="create"
         open={createOpen}
         onOpenChange={setCreateOpen}
@@ -1158,6 +1178,7 @@ function ApiKeysSection({
       />
       <ApiKeyFormDialog
         apiKey={editingApiKey}
+        channels={channels}
         mode="edit"
         open={Boolean(editingApiKey)}
         onOpenChange={(open) => {
@@ -1184,12 +1205,14 @@ function ApiKeysSection({
 
 function ApiKeyFormDialog({
   apiKey,
+  channels,
   mode,
   onOpenChange,
   onSaved,
   open,
 }: {
   apiKey?: PublicApiKey | null;
+  channels: ChannelRecord[];
   mode: "create" | "edit";
   onOpenChange: (open: boolean) => void;
   onSaved: (apiKey: PublicApiKey | CreatedApiKey) => void;
@@ -1200,11 +1223,12 @@ function ApiKeyFormDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl">
+      <DialogContent className="sm:max-w-3xl">
         {open && (
           <ApiKeyFormDialogBody
             key={`${mode}:${apiKey?.id || "new"}`}
             apiKey={apiKey}
+            channels={channels}
             initialForm={initialForm}
             mode={mode}
             onCancel={() => onOpenChange(false)}
@@ -1221,12 +1245,14 @@ function ApiKeyFormDialog({
 
 function ApiKeyFormDialogBody({
   apiKey,
+  channels,
   initialForm,
   mode,
   onCancel,
   onSaved,
 }: {
   apiKey?: PublicApiKey | null;
+  channels: ChannelRecord[];
   initialForm: ApiKeyFormState;
   mode: "create" | "edit";
   onCancel: () => void;
@@ -1263,7 +1289,7 @@ function ApiKeyFormDialogBody({
           完整密钥明文只会在创建成功后显示一次。编辑时不会重新生成明文密钥。
         </DialogDescription>
       </DialogHeader>
-      <ApiKeyFields form={form} onChange={setForm} />
+      <ApiKeyFields channels={channels} form={form} onChange={setForm} />
       <DialogFooter>
         <Button
           type="button"
@@ -1283,9 +1309,11 @@ function ApiKeyFormDialogBody({
 }
 
 function ApiKeyFields({
+  channels,
   form,
   onChange,
 }: {
+  channels: ChannelRecord[];
   form: ApiKeyFormState;
   onChange: React.Dispatch<React.SetStateAction<ApiKeyFormState>>;
 }) {
@@ -1393,17 +1421,190 @@ function ApiKeyFields({
         </Field>
 
         <Field>
-          <FieldLabel htmlFor="api-key-channels">通道白名单</FieldLabel>
-          <Textarea
-            id="api-key-channels"
-            className="min-h-24"
-            value={form.channelAllowlist}
-            placeholder="留空表示不限通道；可填写通道 ID"
-            onChange={(event) => update("channelAllowlist", event.target.value)}
+          <FieldLabel>通道白名单</FieldLabel>
+          <ChannelVisualSelector
+            channels={channels}
+            emptyLabel="不限通道"
+            selectedIds={parseList(form.channelAllowlist)}
+            onSelectedIdsChange={(ids) =>
+              update("channelAllowlist", ids.join("\n"))
+            }
           />
+          <FieldDescription>
+            不选任何通道表示这个密钥可以使用所有可用通道。
+          </FieldDescription>
         </Field>
       </FieldGroup>
     </FieldSet>
+  );
+}
+
+function CredentialVisualSelector({
+  credentials,
+  onSelectedIdsChange,
+  selectedIds,
+}: {
+  credentials: CodexCredentialRecord[];
+  selectedIds: string[];
+  onSelectedIdsChange: (ids: string[]) => void;
+}) {
+  const selectedIdSet = new Set(selectedIds);
+
+  function toggleCredential(id: string) {
+    onSelectedIdsChange(
+      selectedIdSet.has(id)
+        ? selectedIds.filter((selectedId) => selectedId !== id)
+        : [...selectedIds, id],
+    );
+  }
+
+  if (credentials.length === 0) {
+    return (
+      <Alert>
+        <UserRoundIcon />
+        <AlertTitle>暂无可选凭据</AlertTitle>
+        <AlertDescription>请先连接或上传 Codex 凭据。</AlertDescription>
+      </Alert>
+    );
+  }
+
+  return (
+    <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+      {credentials.map((credential) => {
+        const selected = selectedIdSet.has(credential.id);
+        const name = credential.email || credential.accountId || credential.id;
+        return (
+          <Button
+            key={credential.id}
+            type="button"
+            variant={selected ? "secondary" : "outline"}
+            className="h-auto justify-start whitespace-normal p-3 text-left"
+            onClick={() => toggleCredential(credential.id)}
+          >
+            <div className="grid min-w-0 flex-1 gap-2">
+              <div className="flex min-w-0 items-center justify-between gap-2">
+                <div className="flex min-w-0 items-center gap-2">
+                  {selected ? (
+                    <CheckCircle2Icon className="size-4 shrink-0 text-primary" />
+                  ) : (
+                    <UserRoundIcon className="size-4 shrink-0 text-muted-foreground" />
+                  )}
+                  <span className="truncate font-medium">{name}</span>
+                </div>
+                <Badge variant="outline" className="shrink-0">
+                  {codexPlanLabel(credential.planType)}
+                </Badge>
+              </div>
+              <div className="grid gap-1 text-xs text-muted-foreground">
+                <div className="truncate font-mono">{credential.id}</div>
+                <div>
+                  优先级 {formatNumber(credential.priority)} · 权重{" "}
+                  {formatNumber(credential.weight)} · 健康度{" "}
+                  {formatNumber(usageHealthScore(credential.usageHealth))}%
+                </div>
+              </div>
+            </div>
+          </Button>
+        );
+      })}
+    </div>
+  );
+}
+
+function ChannelVisualSelector({
+  channels,
+  emptyLabel,
+  onSelectedIdsChange,
+  selectedIds,
+}: {
+  channels: ChannelRecord[];
+  emptyLabel: string;
+  selectedIds: string[];
+  onSelectedIdsChange: (ids: string[]) => void;
+}) {
+  const uniqueChannels = uniqueChannelsById(channels);
+  const selectedIdSet = new Set(selectedIds);
+  const unrestricted = selectedIds.length === 0;
+
+  function toggleChannel(id: string) {
+    onSelectedIdsChange(
+      selectedIdSet.has(id)
+        ? selectedIds.filter((selectedId) => selectedId !== id)
+        : [...selectedIds, id],
+    );
+  }
+
+  if (uniqueChannels.length === 0) {
+    return (
+      <Alert>
+        <RouteIcon />
+        <AlertTitle>暂无可选通道</AlertTitle>
+        <AlertDescription>请先创建或导入通道。</AlertDescription>
+      </Alert>
+    );
+  }
+
+  return (
+    <div className="grid gap-2">
+      <Button
+        type="button"
+        variant={unrestricted ? "secondary" : "outline"}
+        className="h-auto justify-start p-3 text-left"
+        onClick={() => onSelectedIdsChange([])}
+      >
+        <div className="flex min-w-0 items-center gap-2">
+          {unrestricted ? (
+            <CheckCircle2Icon className="size-4 shrink-0 text-primary" />
+          ) : (
+            <RouteIcon className="size-4 shrink-0 text-muted-foreground" />
+          )}
+          <div>
+            <div className="font-medium">{emptyLabel}</div>
+            <div className="text-xs text-muted-foreground">
+              Relay 会在所有可用通道中自动路由。
+            </div>
+          </div>
+        </div>
+      </Button>
+
+      <div className="grid gap-2 sm:grid-cols-2">
+        {uniqueChannels.map((channel, index) => {
+          const selected = selectedIdSet.has(channel.id);
+          return (
+            <Button
+              key={`${channel.id}:${index}`}
+              type="button"
+              variant={selected ? "secondary" : "outline"}
+              className="h-auto justify-start whitespace-normal p-3 text-left"
+              onClick={() => toggleChannel(channel.id)}
+            >
+              <div className="grid min-w-0 flex-1 gap-2">
+                <div className="flex min-w-0 items-center justify-between gap-2">
+                  <div className="flex min-w-0 items-center gap-2">
+                    {selected ? (
+                      <CheckCircle2Icon className="size-4 shrink-0 text-primary" />
+                    ) : (
+                      <RouteIcon className="size-4 shrink-0 text-muted-foreground" />
+                    )}
+                    <span className="truncate font-medium">{channel.name}</span>
+                  </div>
+                  {renderChannelStatusBadge(channel.status)}
+                </div>
+                <div className="grid gap-1 text-xs text-muted-foreground">
+                  <div className="truncate font-mono">{channel.id}</div>
+                  <div>
+                    优先级 {formatNumber(channel.priority)} · 权重{" "}
+                    {formatNumber(channel.weight)} · 凭据{" "}
+                    {formatNumber(channel.credentialIds.length)} · 健康度{" "}
+                    {formatNumber(channel.healthScore)}%
+                  </div>
+                </div>
+              </div>
+            </Button>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -1565,6 +1766,7 @@ function CredentialsSection({
       toast.success("Codex token 已刷新");
     } catch (error) {
       toast.error(adminErrorMessage(error));
+      throw error;
     } finally {
       setPendingId(null);
     }
@@ -1647,6 +1849,10 @@ function CredentialsSection({
     () =>
       [...credentials].sort(
         (left, right) =>
+          Number(right.enabled) - Number(left.enabled) ||
+          right.priority - left.priority ||
+          usageHealthScore(right.usageHealth) -
+            usageHealthScore(left.usageHealth) ||
           codexPlanRank(right.planType) - codexPlanRank(left.planType),
       ),
     [credentials],
@@ -1735,6 +1941,7 @@ function CredentialsSection({
       toast.success("Codex 凭据已删除");
     } catch (error) {
       toast.error(adminErrorMessage(error));
+      throw error;
     } finally {
       setPendingId(null);
     }
@@ -1855,38 +2062,49 @@ function CredentialsSection({
                           </div>
                         </div>
                         <div className="flex shrink-0 justify-end gap-1.5">
-                          <Button
-                            type="button"
-                            size="icon-sm"
-                            variant="outline"
-                            disabled={pendingId === credential.id}
-                            onClick={() => refreshToken(credential)}
-                            title="刷新 token"
-                          >
-                            {pendingId === credential.id ? (
-                              <Spinner />
-                            ) : (
-                              <RefreshCwIcon />
-                            )}
-                          </Button>
-                          <CredentialDeleteDialog
+                          <CredentialSettingsDialog
                             credential={credential}
                             disabled={pendingId === credential.id}
-                            onConfirm={() => remove(credential)}
+                            onDeleted={() => remove(credential)}
+                            onRefreshToken={() => refreshToken(credential)}
+                            onSaved={onUpdated}
                           />
                         </div>
                       </div>
 
-                      <div className="flex items-center gap-2 text-sm">
-                        <span className="shrink-0 text-muted-foreground">
-                          状态：
-                        </span>
-                        {credential.usageHealth ? (
-                          <UsageHealthBadge
-                            status={credential.usageHealth.status}
-                          />
-                        ) : (
-                          <Badge variant="outline">未知</Badge>
+                      <div className="grid gap-2 text-sm">
+                        <div className="flex items-center gap-2">
+                          <span className="shrink-0 text-muted-foreground">
+                            凭据健康度：
+                          </span>
+                          {credential.usageHealth ? (
+                            <>
+                              <UsageHealthBadge
+                                status={credential.usageHealth.status}
+                              />
+                              <span className="tabular-nums text-muted-foreground">
+                                {formatNumber(credential.usageHealth.score)}%
+                              </span>
+                            </>
+                          ) : (
+                            <Badge variant="outline">未知</Badge>
+                          )}
+                        </div>
+                        {credential.usageHealth && (
+                          <div className="text-xs text-muted-foreground">
+                            最近{" "}
+                            {formatNumber(credential.usageHealth.windowSize)} 次
+                            · 成功{" "}
+                            {formatNumber(credential.usageHealth.successCount)}{" "}
+                            · 错误{" "}
+                            {formatNumber(credential.usageHealth.errorCount)}
+                          </div>
+                        )}
+                        {credential.cooldownUntil && (
+                          <div className="text-xs text-amber-600 dark:text-amber-300">
+                            凭据冷却至{" "}
+                            {formatNullableDate(credential.cooldownUntil)}
+                          </div>
                         )}
                       </div>
 
@@ -1934,6 +2152,121 @@ function CredentialsSection({
         onCompleted={onRefreshData}
       />
     </>
+  );
+}
+
+function CredentialRoutingControls({
+  credential,
+  disabled,
+  onSaved,
+}: {
+  credential: CodexCredentialRecord;
+  disabled: boolean;
+  onSaved: (credential: CodexCredentialRecord) => void;
+}) {
+  const [priority, setPriority] = React.useState(
+    credential.priority.toString(),
+  );
+  const [weight, setWeight] = React.useState(credential.weight.toString());
+  const [saving, setSaving] = React.useState(false);
+
+  const fastAvailable = isFastCredentialPlan(credential.planType);
+
+  async function saveRouting(patch: {
+    enabled?: boolean;
+    priority?: number;
+    weight?: number;
+    fastEnabled?: boolean;
+  }) {
+    setSaving(true);
+    try {
+      const updated = await updateCredentialRouting(credential.id, patch);
+      onSaved(updated);
+      toast.success("凭据路由配置已保存");
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="grid gap-2 rounded-lg border border-border/60 bg-muted/25 p-3 text-sm">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="font-medium">凭据路由</div>
+          <div className="text-xs text-muted-foreground">
+            通道内按凭据优先级、权重和健康度选择。
+          </div>
+        </div>
+        <Switch
+          checked={credential.enabled}
+          disabled={disabled || saving}
+          size="sm"
+          onCheckedChange={(checked) =>
+            saveRouting({ enabled: Boolean(checked) })
+          }
+        />
+      </div>
+      <div className="flex items-center justify-between gap-3 rounded-md border border-border/50 bg-background/50 p-2">
+        <div>
+          <div className="font-medium">Fast</div>
+          <div className="text-xs text-muted-foreground">
+            请求时注入 service_tier: priority，仅 Pro / Pro 20x 可用。
+          </div>
+        </div>
+        <Switch
+          checked={credential.fastEnabled && fastAvailable}
+          disabled={disabled || saving || !fastAvailable}
+          size="sm"
+          onCheckedChange={(checked) =>
+            saveRouting({ fastEnabled: Boolean(checked) })
+          }
+        />
+      </div>
+      {!fastAvailable && (
+        <div className="text-xs text-muted-foreground">
+          当前计划 {codexPlanLabel(credential.planType)} 不支持 Fast。
+        </div>
+      )}
+      <div className="grid gap-2 sm:grid-cols-[1fr_1fr_auto]">
+        <Input
+          aria-label="凭据优先级"
+          inputMode="numeric"
+          value={priority}
+          placeholder="优先级"
+          onChange={(event) => setPriority(event.target.value)}
+        />
+        <Input
+          aria-label="凭据权重"
+          inputMode="numeric"
+          value={weight}
+          placeholder="权重"
+          onChange={(event) => setWeight(event.target.value)}
+        />
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={disabled || saving}
+          onClick={() =>
+            saveRouting({
+              priority: integerValue(priority, credential.priority),
+              weight: Math.max(1, integerValue(weight, credential.weight)),
+            })
+          }
+        >
+          {saving && <Spinner data-icon="inline-start" />}
+          保存
+        </Button>
+      </div>
+      <div className="text-xs text-muted-foreground">
+        当前：优先级 {formatNumber(credential.priority)} · 权重{" "}
+        {formatNumber(credential.weight)} · Fast{" "}
+        {credential.fastEnabled && fastAvailable ? "开启" : "关闭"} · 最后使用{" "}
+        {formatNullableDate(credential.lastUsedAt)}
+      </div>
+    </div>
   );
 }
 
@@ -2188,7 +2521,187 @@ function QuotaProgressCell({
   );
 }
 
-function CredentialDeleteDialog({
+function CredentialSettingsDialog({
+  credential,
+  disabled,
+  onDeleted,
+  onRefreshToken,
+  onSaved,
+}: {
+  credential: CodexCredentialRecord;
+  disabled: boolean;
+  onDeleted: () => Promise<void>;
+  onRefreshToken: () => Promise<void>;
+  onSaved: (credential: CodexCredentialRecord) => void;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const [refreshingToken, setRefreshingToken] = React.useState(false);
+  const accountName = credential.email || credential.accountId || credential.id;
+
+  async function refreshTokenFromSettings() {
+    setRefreshingToken(true);
+    try {
+      await onRefreshToken();
+    } catch {
+      // Parent action already shows the concrete error toast.
+    } finally {
+      setRefreshingToken(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <Button
+        type="button"
+        size="icon-sm"
+        variant="outline"
+        disabled={disabled}
+        onClick={() => setOpen(true)}
+        title="凭据设置"
+      >
+        <SettingsIcon />
+      </Button>
+      <DialogContent className="sm:max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>凭据设置</DialogTitle>
+          <DialogDescription>
+            管理 {accountName} 的账号信息、凭据路由和危险操作。
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="grid gap-4">
+          <FieldSet>
+            <FieldLegend>账号设置</FieldLegend>
+            <FieldGroup>
+              <div className="grid gap-3 rounded-lg border border-border/60 bg-muted/25 p-3 text-sm sm:grid-cols-2">
+                <CredentialInfoItem label="邮箱" value={credential.email} />
+                <CredentialInfoItem
+                  label="账号 ID"
+                  value={credential.accountId}
+                />
+                <CredentialInfoItem
+                  label="计划"
+                  value={codexPlanLabel(credential.planType)}
+                />
+                <CredentialInfoItem
+                  label="凭据 ID"
+                  value={credential.id}
+                  mono
+                />
+                <CredentialInfoItem
+                  label="Token 过期时间"
+                  value={formatNullableDate(credential.expiresAt)}
+                />
+                <CredentialInfoItem
+                  label="最后刷新"
+                  value={formatNullableDate(credential.lastRefreshAt)}
+                />
+                <CredentialInfoItem
+                  label="最后使用"
+                  value={formatNullableDate(credential.lastUsedAt)}
+                />
+                <CredentialInfoItem
+                  label="冷却至"
+                  value={formatNullableDate(credential.cooldownUntil)}
+                />
+                <CredentialInfoItem
+                  label="路由状态"
+                  value={credential.enabled ? "已启用" : "已禁用"}
+                />
+                <CredentialInfoItem
+                  label="Fast"
+                  value={
+                    credential.fastEnabled &&
+                    isFastCredentialPlan(credential.planType)
+                      ? "已开启"
+                      : "未开启"
+                  }
+                />
+              </div>
+            </FieldGroup>
+          </FieldSet>
+
+          <CredentialRoutingControls
+            key={`${credential.id}:${credential.priority}:${credential.weight}:${credential.enabled}`}
+            credential={credential}
+            disabled={disabled}
+            onSaved={onSaved}
+          />
+
+          <FieldSet>
+            <FieldLegend>账号操作</FieldLegend>
+            <FieldGroup>
+              <div className="grid gap-3 rounded-lg border border-border/60 bg-muted/25 p-3 text-sm">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <div className="font-medium">刷新 Codex token</div>
+                    <div className="text-xs text-muted-foreground">
+                      使用保存的 refresh_token 更新访问 token，不会把 token
+                      明文返回浏览器。
+                    </div>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={disabled || refreshingToken}
+                    onClick={refreshTokenFromSettings}
+                  >
+                    {refreshingToken ? (
+                      <Spinner data-icon="inline-start" />
+                    ) : (
+                      <RefreshCwIcon data-icon="inline-start" />
+                    )}
+                    刷新 token
+                  </Button>
+                </div>
+
+                <Separator />
+
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <div className="font-medium text-destructive">删除凭据</div>
+                    <div className="text-xs text-muted-foreground">
+                      删除后会移除该凭据、额度缓存，并从多凭据通道中解绑。
+                    </div>
+                  </div>
+                  <CredentialDeleteSettingsAction
+                    credential={credential}
+                    disabled={disabled}
+                    onConfirm={onDeleted}
+                  />
+                </div>
+              </div>
+            </FieldGroup>
+          </FieldSet>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function CredentialInfoItem({
+  label,
+  mono = false,
+  value,
+}: {
+  label: string;
+  mono?: boolean;
+  value: React.ReactNode;
+}) {
+  return (
+    <div className="min-w-0">
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <div
+        className={`mt-1 truncate ${mono ? "font-mono text-xs" : "font-medium"}`}
+        title={typeof value === "string" ? value : undefined}
+      >
+        {value || <span className="text-muted-foreground">-</span>}
+      </div>
+    </div>
+  );
+}
+
+function CredentialDeleteSettingsAction({
   credential,
   disabled,
   onConfirm,
@@ -2205,6 +2718,8 @@ function CredentialDeleteDialog({
     try {
       await onConfirm();
       setOpen(false);
+    } catch {
+      // Parent action already shows the concrete error toast.
     } finally {
       setPending(false);
     }
@@ -2214,13 +2729,12 @@ function CredentialDeleteDialog({
     <AlertDialog open={open} onOpenChange={setOpen}>
       <Button
         type="button"
-        size="icon-sm"
         variant="destructive"
         disabled={disabled}
         onClick={() => setOpen(true)}
-        title="删除凭据"
       >
-        <Trash2Icon />
+        <Trash2Icon data-icon="inline-start" />
+        删除凭据
       </Button>
       <AlertDialogContent size="sm">
         <AlertDialogHeader>
@@ -2230,7 +2744,7 @@ function CredentialDeleteDialog({
           <AlertDialogTitle>删除 Codex 凭据？</AlertDialogTitle>
           <AlertDialogDescription>
             将删除 {credential.email || credential.accountId || credential.id}
-            。关联通道和额度缓存也可能受影响。
+            。此操作不可恢复。
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
@@ -2269,6 +2783,7 @@ function ChannelsSection({
   const credentialsById = new Map(
     credentials.map((credential) => [credential.id, credential]),
   );
+  const uniqueChannels = uniqueChannelsById(channels);
 
   async function toggleEnabled(channel: ChannelRecord, enabled: boolean) {
     setPendingId(channel.id);
@@ -2321,7 +2836,9 @@ function ChannelsSection({
           <AlertTitle>自动路由规则</AlertTitle>
           <AlertDescription>
             Relay
-            会先过滤已禁用、冷却中、凭据缺失和模型不匹配的通道；然后选择优先级最高的一组，并在同优先级内按权重加权随机。
+            会先过滤已禁用、冷却中、凭据缺失和模型不匹配的通道；通道健康度取最近
+            100 次请求成功率，凭据健康度取最近 50
+            次请求成功率。路由先按健康度分层，再按优先级和权重加权选择。
           </AlertDescription>
         </Alert>
 
@@ -2343,7 +2860,7 @@ function ChannelsSection({
             </CardAction>
           </CardHeader>
           <CardContent>
-            {channels.length === 0 ? (
+            {uniqueChannels.length === 0 ? (
               <Empty className="min-h-64">
                 <EmptyHeader>
                   <EmptyMedia variant="icon">
@@ -2379,12 +2896,12 @@ function ChannelsSection({
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {channels.map((channel) => {
-                    const credential = credentialsById.get(
-                      channel.credentialId,
-                    );
+                  {uniqueChannels.map((channel, index) => {
+                    const channelCredentials = channel.credentialIds
+                      .map((credentialId) => credentialsById.get(credentialId))
+                      .filter(Boolean) as CodexCredentialRecord[];
                     return (
-                      <TableRow key={channel.id}>
+                      <TableRow key={`${channel.id}:${index}`}>
                         <TableCell>
                           <div className="font-medium">{channel.name}</div>
                           <div className="max-w-80 truncate text-xs text-muted-foreground">
@@ -2413,7 +2930,28 @@ function ChannelsSection({
                           )}
                         </TableCell>
                         <TableCell>
-                          {credential?.email || (
+                          {channelCredentials.length > 0 ? (
+                            <div className="grid gap-1">
+                              {channelCredentials
+                                .slice(0, 2)
+                                .map((credential, index) => (
+                                  <div
+                                    key={`${credential.id}:${index}`}
+                                    className="truncate"
+                                  >
+                                    {credential.email ||
+                                      credential.accountId ||
+                                      credential.id}
+                                  </div>
+                                ))}
+                              {channelCredentials.length > 2 && (
+                                <div className="text-xs text-muted-foreground">
+                                  +{formatNumber(channelCredentials.length - 2)}{" "}
+                                  个凭据
+                                </div>
+                              )}
+                            </div>
+                          ) : (
                             <span className="text-muted-foreground">未知</span>
                           )}
                         </TableCell>
@@ -2425,14 +2963,28 @@ function ChannelsSection({
                         <TableCell>
                           <div className="min-w-28 space-y-1">
                             <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
-                              <span>分数</span>
+                              <span>
+                                最近{" "}
+                                {formatNumber(
+                                  channel.usageHealth?.windowSize || 100,
+                                )}{" "}
+                                次
+                              </span>
                               <span className="tabular-nums">
-                                {formatNumber(channel.healthScore)}
+                                {formatNumber(channel.healthScore)}%
                               </span>
                             </div>
                             <Progress
                               value={clamp(channel.healthScore, 0, 100)}
                             />
+                            {channel.usageHealth && (
+                              <div className="text-xs text-muted-foreground">
+                                成功{" "}
+                                {formatNumber(channel.usageHealth.successCount)}{" "}
+                                · 错误{" "}
+                                {formatNumber(channel.usageHealth.errorCount)}
+                              </div>
+                            )}
                           </div>
                         </TableCell>
                         <TableCell>
@@ -2517,12 +3069,12 @@ function ChannelFormDialog({
       ? channelToForm(channel)
       : {
           ...EMPTY_CHANNEL_FORM,
-          credentialId: credentials[0]?.id || "",
+          credentialIds: credentials[0]?.id || "",
         };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl">
+      <DialogContent className="sm:max-w-5xl">
         {open && (
           <ChannelFormDialogBody
             key={`${mode}:${channel?.id || credentials[0]?.id || "new"}`}
@@ -2562,8 +3114,8 @@ function ChannelFormDialogBody({
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!form.credentialId.trim()) {
-      toast.error("请选择 Codex 凭据");
+    if (parseList(form.credentialIds).length === 0) {
+      toast.error("请至少选择一个 Codex 凭据");
       return;
     }
     setPending(true);
@@ -2650,20 +3202,17 @@ function ChannelFields({
         </Field>
 
         <Field>
-          <FieldLabel htmlFor="channel-credential">绑定凭据</FieldLabel>
-          <select
-            id="channel-credential"
-            value={form.credentialId}
-            className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 py-1 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
-            onChange={(event) => update("credentialId", event.target.value)}
-          >
-            <option value="">选择 Codex 凭据</option>
-            {credentials.map((credential) => (
-              <option key={credential.id} value={credential.id}>
-                {credential.email || credential.accountId || credential.id}
-              </option>
-            ))}
-          </select>
+          <FieldLabel>绑定凭据</FieldLabel>
+          <CredentialVisualSelector
+            credentials={credentials}
+            selectedIds={parseList(form.credentialIds)}
+            onSelectedIdsChange={(ids) =>
+              update("credentialIds", ids.join("\n"))
+            }
+          />
+          <FieldDescription>
+            可选择多个凭据。通道内会按凭据优先级、权重和健康度自动选择实际发送请求的凭据。
+          </FieldDescription>
         </Field>
 
         <Field orientation="horizontal">
@@ -2788,93 +3337,97 @@ function ChannelDeleteDialog({
 }
 
 function LogsSection({
-  onRefresh,
-  requestLogs,
+  initialRequestLogsPage,
+  onLoaded,
 }: {
-  onRefresh: () => Promise<AdminDashboardRequestLogRow[]>;
-  requestLogs: AdminDashboardRequestLogRow[];
+  initialRequestLogsPage: RequestLogsPage;
+  onLoaded: (logs: AdminDashboardRequestLogRow[]) => void;
 }) {
-  const [query, setQuery] = React.useState("");
+  const [logsPage, setLogsPage] = React.useState<RequestLogsPage>(
+    initialRequestLogsPage,
+  );
+  const [queryInput, setQueryInput] = React.useState("");
+  const [activeQuery, setActiveQuery] = React.useState("");
   const [statusFilter, setStatusFilter] =
     React.useState<LogStatusFilter>("all");
-  const [refreshing, setRefreshing] = React.useState(false);
+  const [pageSize, setPageSize] = React.useState(initialRequestLogsPage.limit);
+  const [loading, setLoading] = React.useState(false);
 
-  const filteredLogs = React.useMemo(() => {
-    const normalizedQuery = query.trim().toLowerCase();
-    return requestLogs.filter((log) => {
-      if (statusFilter === "success" && log.status_code >= 400) {
-        return false;
-      }
-      if (statusFilter === "error" && log.status_code < 400) {
-        return false;
-      }
-      if (statusFilter === "stream" && !log.stream) {
-        return false;
-      }
-      if (!normalizedQuery) {
-        return true;
-      }
-      return [
-        log.method,
-        log.path,
-        log.request_type,
-        log.model,
-        log.api_key_name,
-        log.api_key_prefix,
-        log.channel_name,
-        log.credential_email,
-        log.error_code,
-        String(log.status_code),
-      ]
-        .filter(Boolean)
-        .some((value) => String(value).toLowerCase().includes(normalizedQuery));
-    });
-  }, [query, requestLogs, statusFilter]);
-
-  const totalTokens = filteredLogs.reduce(
-    (sum, log) => sum + log.total_tokens,
-    0,
+  const totalPages = Math.max(1, logsPage.totalPages);
+  const pageStart = logsPage.total > 0 ? logsPage.offset + 1 : 0;
+  const pageEnd = Math.min(
+    logsPage.offset + logsPage.data.length,
+    logsPage.total,
   );
-  const errorCount = filteredLogs.filter(
-    (log) => log.status_code >= 400,
-  ).length;
-  const avgLatency = filteredLogs.length
-    ? filteredLogs.reduce((sum, log) => sum + log.latency_ms, 0) /
-      filteredLogs.length
-    : 0;
 
-  async function refresh() {
-    setRefreshing(true);
+  async function loadLogs(
+    input: {
+      page?: number;
+      limit?: number;
+      query?: string;
+      status?: LogStatusFilter;
+      successMessage?: string;
+    } = {},
+  ) {
+    const nextPage = input.page ?? logsPage.page;
+    const nextLimit = input.limit ?? pageSize;
+    const nextQuery = input.query ?? activeQuery;
+    const nextStatus = input.status ?? statusFilter;
+    setLoading(true);
     try {
-      await onRefresh();
-      toast.success("请求日志已刷新");
+      const result = await getRequestLogsPage({
+        limit: nextLimit,
+        page: nextPage,
+        query: nextQuery,
+        status: nextStatus,
+      });
+      setLogsPage(result);
+      setActiveQuery(nextQuery);
+      setQueryInput(nextQuery);
+      setStatusFilter(nextStatus);
+      setPageSize(nextLimit);
+      onLoaded(result.data);
+      if (input.successMessage) {
+        toast.success(input.successMessage);
+      }
+      return result;
     } catch (error) {
       toast.error(adminErrorMessage(error));
+      return null;
     } finally {
-      setRefreshing(false);
+      setLoading(false);
     }
+  }
+
+  function search(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    void loadLogs({ page: 1, query: queryInput });
   }
 
   return (
     <div className="grid gap-4">
       <div className="grid gap-4 sm:grid-cols-3">
         <MetricCard
-          title="筛选后日志"
-          value={formatNumber(filteredLogs.length)}
-          description={`已加载 ${formatNumber(requestLogs.length)} 行`}
+          title="匹配日志"
+          value={formatNumber(logsPage.total)}
+          description={
+            logsPage.total > 0
+              ? `第 ${formatNumber(logsPage.page)}/${formatNumber(totalPages)} 页 · ${formatNumber(pageStart)}-${formatNumber(pageEnd)}`
+              : "没有匹配结果"
+          }
           icon={FileTextIcon}
         />
         <MetricCard
-          title="筛选后错误"
-          value={formatNumber(errorCount)}
-          description={`错误率 ${formatPercent(ratio(errorCount, filteredLogs.length))}`}
+          title="匹配错误"
+          value={formatNumber(logsPage.summary.errorCount)}
+          description={`错误率 ${formatPercent(ratio(logsPage.summary.errorCount, logsPage.total))}`}
           icon={AlertTriangleIcon}
-          tone={errorCount > 0 ? "warning" : "success"}
+          tone={logsPage.summary.errorCount > 0 ? "warning" : "success"}
         />
         <MetricCard
-          title="筛选后 Token"
-          value={formatNumber(totalTokens)}
-          description={`平均延迟 ${formatDuration(avgLatency)}`}
+          title="匹配 Token"
+          value={formatNumber(logsPage.summary.totalTokens)}
+          description={`平均延迟 ${formatDuration(logsPage.summary.avgLatencyMs)}`}
           icon={DatabaseIcon}
         />
       </div>
@@ -2883,16 +3436,21 @@ function LogsSection({
         <CardHeader>
           <CardTitle>请求日志</CardTitle>
           <CardDescription>
-            最近 100 条公开请求日志。可按状态和关键字在浏览器内筛选。
+            服务端分页查询全部请求日志，支持按状态和关键字搜索。
           </CardDescription>
           <CardAction>
             <Button
               type="button"
               variant="outline"
-              disabled={refreshing}
-              onClick={refresh}
+              disabled={loading}
+              onClick={() =>
+                void loadLogs({
+                  page: logsPage.page,
+                  successMessage: "请求日志已刷新",
+                })
+              }
             >
-              {refreshing ? (
+              {loading ? (
                 <Spinner data-icon="inline-start" />
               ) : (
                 <RefreshCwIcon data-icon="inline-start" />
@@ -2902,16 +3460,35 @@ function LogsSection({
           </CardAction>
         </CardHeader>
         <CardContent className="grid gap-4">
-          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-            <div className="relative w-full lg:max-w-md">
-              <SearchIcon className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder="搜索路径、模型、密钥、通道、错误..."
-                className="pl-8"
-              />
-            </div>
+          <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+            <form
+              className="flex w-full flex-col gap-2 sm:flex-row xl:max-w-2xl"
+              onSubmit={search}
+            >
+              <div className="relative min-w-0 flex-1">
+                <SearchIcon className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={queryInput}
+                  onChange={(event) => setQueryInput(event.target.value)}
+                  placeholder="搜索路径、模型、密钥、通道、凭据、错误、状态码..."
+                  className="pl-8"
+                />
+              </div>
+              <div className="flex gap-2">
+                <Button type="submit" disabled={loading}>
+                  <SearchIcon data-icon="inline-start" />
+                  搜索
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={loading || (!activeQuery && !queryInput)}
+                  onClick={() => void loadLogs({ page: 1, query: "" })}
+                >
+                  清空
+                </Button>
+              </div>
+            </form>
             <div className="flex flex-wrap gap-2">
               {LOG_STATUS_FILTERS.map((item) => (
                 <Button
@@ -2919,7 +3496,8 @@ function LogsSection({
                   type="button"
                   size="sm"
                   variant={statusFilter === item.id ? "secondary" : "outline"}
-                  onClick={() => setStatusFilter(item.id)}
+                  disabled={loading}
+                  onClick={() => void loadLogs({ page: 1, status: item.id })}
                 >
                   {item.label}
                 </Button>
@@ -2927,81 +3505,152 @@ function LogsSection({
             </div>
           </div>
 
-          {requestLogs.length === 0 ? (
+          {activeQuery && (
+            <div className="text-sm text-muted-foreground">
+              当前搜索：
+              <span className="font-medium text-foreground">{activeQuery}</span>
+            </div>
+          )}
+
+          {logsPage.total === 0 && !loading ? (
             <EmptyState
-              icon={FileTextIcon}
-              title="还没有请求日志"
-              description="创建 API 密钥并调用 Relay 接口后，这里会展示最近请求。"
-            />
-          ) : filteredLogs.length === 0 ? (
-            <EmptyState
-              icon={SearchIcon}
-              title="没有匹配的日志"
-              description="调整关键字或状态筛选条件后再试。"
+              icon={activeQuery ? SearchIcon : FileTextIcon}
+              title={
+                activeQuery || statusFilter !== "all"
+                  ? "没有匹配的日志"
+                  : "还没有请求日志"
+              }
+              description={
+                activeQuery || statusFilter !== "all"
+                  ? "调整关键字或状态筛选条件后再试。"
+                  : "创建 API 密钥并调用 Relay 接口后，这里会展示全部请求日志。"
+              }
             />
           ) : (
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>时间</TableHead>
-                  <TableHead>请求</TableHead>
-                  <TableHead>模型</TableHead>
-                  <TableHead>状态</TableHead>
-                  <TableHead>延迟</TableHead>
-                  <TableHead>密钥 / 通道</TableHead>
-                  <TableHead>Token</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {filteredLogs.map((log) => (
-                  <TableRow key={log.id}>
-                    <TableCell>
-                      <LocalDateTime value={log.started_at} />
-                    </TableCell>
-                    <TableCell>
-                      <div className="font-medium">
-                        {log.method} {log.path}
-                      </div>
-                      <div className="text-xs text-muted-foreground">
-                        {log.request_type}
-                        {log.stream ? " · 流式" : ""}
-                      </div>
-                    </TableCell>
-                    <TableCell>{log.model || "-"}</TableCell>
-                    <TableCell>
-                      <div className="flex flex-col gap-1">
-                        {renderStatusCodeBadge(log.status_code)}
-                        {log.error_code && (
-                          <span className="text-xs text-destructive">
-                            {log.error_code}
-                          </span>
-                        )}
-                      </div>
-                    </TableCell>
-                    <TableCell>{formatDuration(log.latency_ms)}</TableCell>
-                    <TableCell>
-                      <div>{log.api_key_name || "未知密钥"}</div>
-                      <div className="font-mono text-xs text-muted-foreground">
-                        {log.api_key_prefix || "-"}
-                      </div>
-                      <div className="mt-1 text-xs text-muted-foreground">
-                        {log.channel_name || "-"} ·{" "}
-                        {log.credential_email || "-"}
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <div className="font-medium">
-                        {formatNumber(log.total_tokens)}
-                      </div>
-                      <div className="text-xs text-muted-foreground">
-                        输入 {formatNumber(log.prompt_tokens)} / 输出{" "}
-                        {formatNumber(log.completion_tokens)}
-                      </div>
-                    </TableCell>
+            <div className="grid gap-4">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>时间</TableHead>
+                    <TableHead>请求</TableHead>
+                    <TableHead>模型</TableHead>
+                    <TableHead>状态</TableHead>
+                    <TableHead>延迟</TableHead>
+                    <TableHead>密钥 / 通道</TableHead>
+                    <TableHead>Token</TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+                </TableHeader>
+                <TableBody>
+                  {logsPage.data.map((log) => (
+                    <TableRow key={log.id}>
+                      <TableCell>
+                        <LocalDateTime value={log.started_at} />
+                      </TableCell>
+                      <TableCell>
+                        <div className="font-medium">
+                          {log.method} {log.path}
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          {log.request_type}
+                          {log.stream ? " · 流式" : ""}
+                        </div>
+                      </TableCell>
+                      <TableCell>{log.model || "-"}</TableCell>
+                      <TableCell>
+                        <div className="flex flex-col gap-1">
+                          {renderStatusCodeBadge(log.status_code)}
+                          {log.error_code && (
+                            <span className="text-xs text-destructive">
+                              {log.error_code}
+                            </span>
+                          )}
+                        </div>
+                      </TableCell>
+                      <TableCell>{formatDuration(log.latency_ms)}</TableCell>
+                      <TableCell>
+                        <div>{log.api_key_name || "未知密钥"}</div>
+                        <div className="font-mono text-xs text-muted-foreground">
+                          {log.api_key_prefix || "-"}
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {log.channel_name || "-"} ·{" "}
+                          {log.credential_email || "-"}
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <div className="font-medium">
+                          {formatNumber(log.total_tokens)}
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          输入 {formatNumber(log.prompt_tokens)} / 输出{" "}
+                          {formatNumber(log.completion_tokens)}
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+
+              <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                <div className="text-sm text-muted-foreground">
+                  显示 {formatNumber(pageStart)}-{formatNumber(pageEnd)} / 共{" "}
+                  {formatNumber(logsPage.total)} 条
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <select
+                    value={pageSize}
+                    className="h-8 rounded-lg border border-input bg-transparent px-2.5 py-1 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
+                    onChange={(event) =>
+                      void loadLogs({
+                        page: 1,
+                        limit: Number.parseInt(event.target.value, 10),
+                      })
+                    }
+                  >
+                    {[25, 50, 100, 200].map((size) => (
+                      <option key={size} value={size}>
+                        每页 {size}
+                      </option>
+                    ))}
+                  </select>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={loading || logsPage.page <= 1}
+                    onClick={() => void loadLogs({ page: 1 })}
+                  >
+                    首页
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={loading || logsPage.page <= 1}
+                    onClick={() => void loadLogs({ page: logsPage.page - 1 })}
+                  >
+                    上一页
+                  </Button>
+                  <Badge variant="outline">
+                    {formatNumber(logsPage.page)} / {formatNumber(totalPages)}
+                  </Badge>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={loading || logsPage.page >= totalPages}
+                    onClick={() => void loadLogs({ page: logsPage.page + 1 })}
+                  >
+                    下一页
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={loading || logsPage.page >= totalPages}
+                    onClick={() => void loadLogs({ page: totalPages })}
+                  >
+                    末页
+                  </Button>
+                </div>
+              </div>
+            </div>
           )}
         </CardContent>
       </Card>
@@ -3099,8 +3748,12 @@ function UsageListCard({
           />
         ) : (
           <div className="grid gap-4">
-            {rows.map((row) => (
-              <UsageListRow key={row.key} maxTokens={maxTokens} row={row} />
+            {rows.map((row, index) => (
+              <UsageListRow
+                key={`${row.key}:${index}`}
+                maxTokens={maxTokens}
+                row={row}
+              />
             ))}
           </div>
         )}
@@ -3282,8 +3935,8 @@ function renderStringList(values: string[], emptyLabel: string) {
 
   return (
     <div className="flex max-w-64 flex-wrap gap-1">
-      {values.slice(0, 3).map((value) => (
-        <Badge key={value} variant="outline">
+      {values.slice(0, 3).map((value, index) => (
+        <Badge key={`${value}:${index}`} variant="outline">
           {value}
         </Badge>
       ))}
@@ -3292,6 +3945,17 @@ function renderStringList(values: string[], emptyLabel: string) {
       )}
     </div>
   );
+}
+
+function uniqueChannelsById(channels: ChannelRecord[]) {
+  const seen = new Set<string>();
+  return channels.filter((channel) => {
+    if (seen.has(channel.id)) {
+      return false;
+    }
+    seen.add(channel.id);
+    return true;
+  });
 }
 
 function apiKeyToForm(apiKey: PublicApiKey): ApiKeyFormState {
@@ -3331,7 +3995,7 @@ function assertApiKey(apiKey: PublicApiKey | null | undefined) {
 function channelToForm(channel: ChannelRecord): ChannelFormState {
   return {
     name: channel.name,
-    credentialId: channel.credentialId,
+    credentialIds: channel.credentialIds.join("\n"),
     enabled: channel.enabled,
     baseUrl: channel.baseUrl,
     priority: channel.priority.toString(),
@@ -3341,9 +4005,11 @@ function channelToForm(channel: ChannelRecord): ChannelFormState {
 }
 
 function channelFormToPayload(form: ChannelFormState): ChannelPayload {
+  const credentialIds = parseList(form.credentialIds);
   return {
     name: form.name.trim(),
-    credentialId: form.credentialId.trim(),
+    credentialId: credentialIds[0],
+    credentialIds,
     enabled: form.enabled,
     baseUrl: form.baseUrl.trim(),
     priority: integerValue(form.priority, 100),
@@ -3515,6 +4181,20 @@ function codexPlanLabel(planType: string) {
     team: "Team",
   };
   return labels[normalized] || planType || "未知";
+}
+
+function usageHealthScore(health: CodexCredentialRecord["usageHealth"]) {
+  return clamp(health?.score ?? 100, 0, 100);
+}
+
+function isFastCredentialPlan(planType: string) {
+  const normalized = planType
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "");
+  return (
+    normalized === "pro" || normalized === "pro20" || normalized === "pro20x"
+  );
 }
 
 function codexPlanRank(planType: string) {

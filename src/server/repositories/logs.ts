@@ -247,6 +247,34 @@ export interface PublicRequestLogRow {
 }
 
 export function latestRequestLogs(limit = 20): PublicRequestLogRow[] {
+  return queryRequestLogs({ limit, offset: 0 }).data;
+}
+
+export type RequestLogStatusFilter = "all" | "success" | "error" | "stream";
+
+export interface RequestLogQueryInput {
+  limit?: number;
+  offset?: number;
+  query?: string;
+  status?: RequestLogStatusFilter;
+}
+
+export interface RequestLogQueryResult {
+  data: PublicRequestLogRow[];
+  limit: number;
+  offset: number;
+  total: number;
+  errorCount: number;
+  totalTokens: number;
+  avgLatencyMs: number;
+}
+
+export function queryRequestLogs(
+  input: RequestLogQueryInput = {},
+): RequestLogQueryResult {
+  const limit = Math.max(1, Math.floor(input.limit || 20));
+  const offset = Math.max(0, Math.floor(input.offset || 0));
+  const { where, params } = requestLogWhere(input);
   const rows = getLogDb()
     .prepare(
       `SELECT
@@ -255,12 +283,70 @@ export function latestRequestLogs(limit = 20): PublicRequestLogRow[] {
         channel_name, credential_email, prompt_tokens, completion_tokens,
         total_tokens, error_code
       FROM request_logs
+      ${where}
       ORDER BY started_at DESC
-      LIMIT ?`,
+      LIMIT ? OFFSET ?`,
     )
-    .all(limit) as Array<Record<string, unknown>>;
+    .all(...params, limit, offset) as Array<Record<string, unknown>>;
 
-  return attachApiKeyNames(rows).map(toPublicRequestLogRow);
+  const summary = getLogDb()
+    .prepare(
+      `SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS error_count,
+        COALESCE(SUM(total_tokens), 0) AS total_tokens,
+        COALESCE(AVG(latency_ms), 0) AS avg_latency_ms
+      FROM request_logs
+      ${where}`,
+    )
+    .get(...params) as Record<string, unknown> | undefined;
+
+  return {
+    data: attachApiKeyNames(rows).map(toPublicRequestLogRow),
+    limit,
+    offset,
+    total: numberValue(summary?.total),
+    errorCount: numberValue(summary?.error_count),
+    totalTokens: numberValue(summary?.total_tokens),
+    avgLatencyMs: Math.round(numberValue(summary?.avg_latency_ms)),
+  };
+}
+
+function requestLogWhere(input: RequestLogQueryInput) {
+  const conditions: string[] = [];
+  const params: string[] = [];
+  if (input.status === "success") {
+    conditions.push("status_code >= 200 AND status_code < 400");
+  } else if (input.status === "error") {
+    conditions.push("status_code >= 400");
+  } else if (input.status === "stream") {
+    conditions.push("stream = 1");
+  }
+
+  const query = String(input.query || "").trim();
+  if (query) {
+    const like = `%${query.toLowerCase()}%`;
+    conditions.push(
+      `(
+        lower(method) LIKE ? OR
+        lower(path) LIKE ? OR
+        lower(request_type) LIKE ? OR
+        lower(model) LIKE ? OR
+        lower(api_key_prefix) LIKE ? OR
+        lower(api_key_name) LIKE ? OR
+        lower(channel_name) LIKE ? OR
+        lower(credential_email) LIKE ? OR
+        lower(error_code) LIKE ? OR
+        CAST(status_code AS TEXT) LIKE ?
+      )`,
+    );
+    params.push(like, like, like, like, like, like, like, like, like, like);
+  }
+
+  return {
+    where: conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "",
+    params,
+  };
 }
 
 export function getAdminOverviewStats(): AdminOverviewStats {
@@ -279,6 +365,7 @@ export function getAdminOverviewStats(): AdminOverviewStats {
 }
 
 const DEFAULT_CREDENTIAL_USAGE_WINDOW_SIZE = 50;
+const DEFAULT_CHANNEL_USAGE_WINDOW_SIZE = 100;
 const CREDENTIAL_USAGE_NORMAL_THRESHOLD = 80;
 const CREDENTIAL_USAGE_WARNING_THRESHOLD = 50;
 
@@ -286,18 +373,37 @@ export function credentialUsageHealth(
   credentialIds: string[],
   windowSize = DEFAULT_CREDENTIAL_USAGE_WINDOW_SIZE,
 ): Record<string, CodexAccountUsageHealth> {
-  const uniqueIds = [
-    ...new Set(credentialIds.map((id) => id.trim()).filter(Boolean)),
-  ];
-  const normalizedWindowSize = Math.max(1, Math.floor(windowSize));
-  const healthByCredentialId: Record<string, CodexAccountUsageHealth> = {};
+  return requestWindowUsageHealth(
+    credentialIds,
+    "credential_id",
+    Math.max(1, Math.floor(windowSize)),
+  );
+}
+
+export function channelUsageHealth(
+  channelIds: string[],
+  windowSize = DEFAULT_CHANNEL_USAGE_WINDOW_SIZE,
+): Record<string, CodexAccountUsageHealth> {
+  return requestWindowUsageHealth(
+    channelIds,
+    "channel_id",
+    Math.max(1, Math.floor(windowSize)),
+  );
+}
+
+function requestWindowUsageHealth(
+  ids: string[],
+  columnName: "credential_id" | "channel_id",
+  windowSize: number,
+): Record<string, CodexAccountUsageHealth> {
+  const uniqueIds = [...new Set(ids.map((id) => id.trim()).filter(Boolean))];
+  const healthById: Record<string, CodexAccountUsageHealth> = {};
 
   for (const id of uniqueIds) {
-    healthByCredentialId[id] =
-      unusedCredentialUsageHealth(normalizedWindowSize);
+    healthById[id] = unusedUsageHealth(windowSize);
   }
   if (uniqueIds.length === 0) {
-    return healthByCredentialId;
+    return healthById;
   }
 
   const placeholders = uniqueIds.map(() => "?").join(", ");
@@ -305,51 +411,46 @@ export function credentialUsageHealth(
     .prepare(
       `WITH ranked AS (
         SELECT
-          credential_id,
+          ${columnName} AS target_id,
           started_at,
           status_code,
           error_code,
           ROW_NUMBER() OVER (
-            PARTITION BY credential_id
+            PARTITION BY ${columnName}
             ORDER BY started_at DESC
           ) AS row_number
         FROM request_logs
-        WHERE credential_id IN (${placeholders})
+        WHERE ${columnName} IN (${placeholders})
       )
-      SELECT credential_id, started_at, status_code, error_code
+      SELECT target_id, started_at, status_code, error_code
       FROM ranked
       WHERE row_number <= ?
-      ORDER BY credential_id, started_at DESC`,
+      ORDER BY target_id, started_at DESC`,
     )
-    .all(...uniqueIds, normalizedWindowSize) as Array<Record<string, unknown>>;
+    .all(...uniqueIds, windowSize) as Array<Record<string, unknown>>;
 
-  const rowsByCredentialId = new Map<string, Array<Record<string, unknown>>>();
+  const rowsById = new Map<string, Array<Record<string, unknown>>>();
   for (const row of rows) {
-    const credentialId = String(row.credential_id || "");
-    if (!credentialId) {
+    const id = String(row.target_id || "");
+    if (!id) {
       continue;
     }
-    const currentRows = rowsByCredentialId.get(credentialId) || [];
+    const currentRows = rowsById.get(id) || [];
     currentRows.push(row);
-    rowsByCredentialId.set(credentialId, currentRows);
+    rowsById.set(id, currentRows);
   }
 
   for (const id of uniqueIds) {
-    healthByCredentialId[id] = calculateCredentialUsageHealth(
-      rowsByCredentialId.get(id) || [],
-      normalizedWindowSize,
-    );
+    healthById[id] = calculateUsageHealth(rowsById.get(id) || [], windowSize);
   }
 
-  return healthByCredentialId;
+  return healthById;
 }
 
-function unusedCredentialUsageHealth(
-  windowSize: number,
-): CodexAccountUsageHealth {
+function unusedUsageHealth(windowSize: number): CodexAccountUsageHealth {
   return {
     status: "unused",
-    score: 0,
+    score: 100,
     requestCount: 0,
     successCount: 0,
     errorCount: 0,
@@ -360,12 +461,12 @@ function unusedCredentialUsageHealth(
   };
 }
 
-function calculateCredentialUsageHealth(
+function calculateUsageHealth(
   rows: Array<Record<string, unknown>>,
   windowSize: number,
 ): CodexAccountUsageHealth {
   if (rows.length === 0) {
-    return unusedCredentialUsageHealth(windowSize);
+    return unusedUsageHealth(windowSize);
   }
   const requestCount = rows.length;
   const successCount = rows.filter((row) =>

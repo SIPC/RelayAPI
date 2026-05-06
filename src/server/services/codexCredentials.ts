@@ -9,10 +9,12 @@ import {
   deleteCodexCredential,
   getCodexCredentialWithTokens,
   listCodexCredentials,
+  updateCodexCredential,
   upsertCodexCredential,
 } from "@/src/server/repositories/codexCredentials";
 import { credentialUsageHealth } from "@/src/server/repositories/logs";
 import {
+  detachCredentialFromChannels,
   getChannelByCredentialId,
   insertChannel,
 } from "@/src/server/repositories/channels";
@@ -209,7 +211,54 @@ export async function listPublicCodexCredentials() {
   }));
 }
 
+export function patchCodexCredentialRouting(
+  id: string,
+  input: {
+    enabled?: boolean;
+    priority?: number;
+    weight?: number;
+    fastEnabled?: boolean;
+  },
+) {
+  const existing = getCodexCredentialWithTokens(id);
+  if (!existing) {
+    throw new HttpError(
+      404,
+      "codex_credential_not_found",
+      "Codex credential not found",
+    );
+  }
+  const fastEnabled =
+    input.fastEnabled !== undefined ? Boolean(input.fastEnabled) : undefined;
+  if (fastEnabled && !isFastServiceTierPlan(existing.planType)) {
+    throw new HttpError(
+      400,
+      "fast_service_tier_not_available",
+      "Fast service tier is only available for Pro / Pro 20x credentials",
+    );
+  }
+  const updated = updateCodexCredential(id, {
+    ...(input.enabled !== undefined ? { enabled: Boolean(input.enabled) } : {}),
+    ...(input.priority !== undefined
+      ? { priority: normalizeInteger(input.priority, 100) }
+      : {}),
+    ...(input.weight !== undefined
+      ? { weight: Math.max(1, normalizeInteger(input.weight, 1)) }
+      : {}),
+    ...(fastEnabled !== undefined ? { fastEnabled } : {}),
+  });
+  if (!updated) {
+    throw new HttpError(
+      404,
+      "codex_credential_not_found",
+      "Codex credential not found",
+    );
+  }
+  return publicCredential(updated);
+}
+
 export async function removeCodexCredential(id: string) {
+  detachCredentialFromChannels(id);
   if (!deleteCodexCredential(id)) {
     throw new HttpError(
       404,
@@ -531,9 +580,16 @@ function publicCredential(
     email: credential.email,
     accountId: credential.accountId,
     planType: credential.planType,
+    enabled: credential.enabled,
+    priority: credential.priority,
+    weight: credential.weight,
+    fastEnabled: credential.fastEnabled,
     usageHealth: credentialUsageHealth([credential.id])[credential.id],
     expiresAt: credential.expiresAt,
     lastRefreshAt: credential.lastRefreshAt,
+    lastUsedAt: credential.lastUsedAt,
+    cooldownUntil: credential.cooldownUntil,
+    lastError: credential.lastError,
     createdAt: credential.createdAt,
     updatedAt: credential.updatedAt,
     metadata: credential.metadata,
@@ -631,6 +687,21 @@ function numberValue(value: unknown) {
     return Number.isFinite(parsed) ? parsed : 0;
   }
   return 0;
+}
+
+function normalizeInteger(value: unknown, fallback: number) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.floor(parsed) : fallback;
+}
+
+function isFastServiceTierPlan(planType: string) {
+  const normalized = planType
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "");
+  return (
+    normalized === "pro" || normalized === "pro20" || normalized === "pro20x"
+  );
 }
 
 function objectValue(value: unknown) {

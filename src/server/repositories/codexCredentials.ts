@@ -20,8 +20,12 @@ type CodexCredentialRow = {
   account_id: string;
   plan_type: string;
   token_envelope: string;
+  enabled: number;
+  priority: number;
+  weight: number;
   expires_at: string | null;
   last_refresh_at: string | null;
+  last_used_at: string | null;
   metadata_json: string;
   created_at: string;
   updated_at: string;
@@ -33,6 +37,9 @@ export interface SaveCodexCredentialInput {
   accountId: string;
   planType: string;
   tokens: CodexTokenBundle;
+  enabled?: boolean;
+  priority?: number;
+  weight?: number;
   metadata?: Record<string, unknown>;
 }
 
@@ -74,13 +81,17 @@ export function upsertCodexCredential(input: SaveCodexCredentialInput) {
     .prepare(
       `INSERT INTO codex_credentials (
         id, provider, email, account_id, plan_type, token_envelope,
-        expires_at, last_refresh_at, metadata_json, created_at, updated_at
-      ) VALUES (?, 'codex', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        enabled, priority, weight, expires_at, last_refresh_at, last_used_at,
+        metadata_json, created_at, updated_at
+      ) VALUES (?, 'codex', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         email = excluded.email,
         account_id = excluded.account_id,
         plan_type = excluded.plan_type,
         token_envelope = excluded.token_envelope,
+        enabled = excluded.enabled,
+        priority = excluded.priority,
+        weight = excluded.weight,
         expires_at = excluded.expires_at,
         last_refresh_at = excluded.last_refresh_at,
         metadata_json = excluded.metadata_json,
@@ -92,13 +103,75 @@ export function upsertCodexCredential(input: SaveCodexCredentialInput) {
       input.accountId,
       input.planType,
       encryptJson(input.tokens),
+      (input.enabled ?? existing?.enabled ?? true) ? 1 : 0,
+      input.priority ?? existing?.priority ?? 100,
+      Math.max(1, input.weight ?? existing?.weight ?? 1),
       input.tokens.expired || null,
       input.tokens.last_refresh || null,
-      jsonStringify(input.metadata || {}),
+      existing?.lastUsedAt || null,
+      jsonStringify({
+        ...(existing?.metadata || {}),
+        ...(input.metadata || {}),
+      }),
       createdAt,
       now,
     );
   return getCodexCredentialWithTokens(input.id);
+}
+
+export function updateCodexCredential(
+  id: string,
+  patch: Partial<
+    Pick<
+      CodexCredentialRecord,
+      | "enabled"
+      | "priority"
+      | "weight"
+      | "fastEnabled"
+      | "lastUsedAt"
+      | "cooldownUntil"
+      | "lastError"
+      | "metadata"
+    >
+  >,
+) {
+  const existing = getCodexCredentialWithTokens(id);
+  if (!existing) {
+    return null;
+  }
+  const next = { ...existing, ...patch };
+  const metadata = {
+    ...next.metadata,
+    fast_service_tier: next.fastEnabled,
+    cooldown_until: next.cooldownUntil,
+    last_error: next.lastError,
+  };
+  getMainDb()
+    .prepare(
+      `UPDATE codex_credentials SET
+        enabled = ?, priority = ?, weight = ?, last_used_at = ?,
+        metadata_json = ?, updated_at = ?
+      WHERE id = ?`,
+    )
+    .run(
+      next.enabled ? 1 : 0,
+      next.priority,
+      Math.max(1, next.weight),
+      next.lastUsedAt,
+      jsonStringify(metadata),
+      new Date().toISOString(),
+      id,
+    );
+  return getCodexCredentialWithTokens(id);
+}
+
+export function markCodexCredentialUsed(id: string) {
+  const now = new Date().toISOString();
+  getMainDb()
+    .prepare(
+      "UPDATE codex_credentials SET last_used_at = ?, updated_at = ? WHERE id = ?",
+    )
+    .run(now, now, id);
 }
 
 export function deleteCodexCredential(id: string) {
@@ -111,18 +184,33 @@ export function deleteCodexCredential(id: string) {
 function toCodexCredentialRecord(
   row: CodexCredentialRow,
 ): CodexCredentialRecord {
+  const metadata = safeJsonParse<Record<string, unknown>>(
+    row.metadata_json,
+    {},
+  );
   return {
     id: row.id,
     provider: "codex",
     email: row.email,
     accountId: row.account_id,
     planType: row.plan_type,
+    enabled: row.enabled === 1,
+    priority: row.priority,
+    weight: row.weight,
+    fastEnabled: metadata.fast_service_tier === true,
     expiresAt: row.expires_at,
     lastRefreshAt: row.last_refresh_at,
+    lastUsedAt: row.last_used_at,
+    cooldownUntil: stringOrNull(metadata.cooldown_until),
+    lastError: stringOrNull(metadata.last_error),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    metadata: safeJsonParse<Record<string, unknown>>(row.metadata_json, {}),
+    metadata,
   };
+}
+
+function stringOrNull(value: unknown) {
+  return typeof value === "string" && value.trim() ? value : null;
 }
 
 function toCodexCredentialWithTokens(

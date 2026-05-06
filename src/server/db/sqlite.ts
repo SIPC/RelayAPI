@@ -117,8 +117,12 @@ function migrateMainDb(db: DatabaseSync) {
         account_id TEXT NOT NULL DEFAULT '',
         plan_type TEXT NOT NULL DEFAULT '',
         token_envelope TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+        priority INTEGER NOT NULL DEFAULT 100,
+        weight INTEGER NOT NULL DEFAULT 1,
         expires_at TEXT,
         last_refresh_at TEXT,
+        last_used_at TEXT,
         metadata_json TEXT NOT NULL DEFAULT '{}',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -148,6 +152,18 @@ function migrateMainDb(db: DatabaseSync) {
         ON channels(credential_id);
       CREATE INDEX IF NOT EXISTS idx_channels_routing
         ON channels(enabled, status, priority, weight);
+
+      CREATE TABLE IF NOT EXISTS channel_credentials (
+        channel_id TEXT NOT NULL,
+        credential_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (channel_id, credential_id),
+        FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+        FOREIGN KEY (credential_id) REFERENCES codex_credentials(id) ON DELETE CASCADE
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS idx_channel_credentials_credential
+        ON channel_credentials(credential_id);
 
       CREATE TABLE IF NOT EXISTS codex_quota_cache (
         credential_id TEXT PRIMARY KEY,
@@ -195,6 +211,46 @@ function migrateMainDb(db: DatabaseSync) {
         ON oauth_pending_states(expires_at);
     `,
   );
+
+  applyMigration(db, "004_routing_credentials", (database) => {
+    addColumnIfMissing(
+      database,
+      "codex_credentials",
+      "enabled",
+      "INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1))",
+    );
+    addColumnIfMissing(
+      database,
+      "codex_credentials",
+      "priority",
+      "INTEGER NOT NULL DEFAULT 100",
+    );
+    addColumnIfMissing(
+      database,
+      "codex_credentials",
+      "weight",
+      "INTEGER NOT NULL DEFAULT 1",
+    );
+    addColumnIfMissing(database, "codex_credentials", "last_used_at", "TEXT");
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS channel_credentials (
+        channel_id TEXT NOT NULL,
+        credential_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (channel_id, credential_id),
+        FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+        FOREIGN KEY (credential_id) REFERENCES codex_credentials(id) ON DELETE CASCADE
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS idx_channel_credentials_credential
+        ON channel_credentials(credential_id);
+
+      INSERT OR IGNORE INTO channel_credentials (channel_id, credential_id, created_at)
+      SELECT id, credential_id, created_at
+      FROM channels
+      WHERE credential_id IS NOT NULL AND credential_id <> '';
+    `);
+  });
 }
 
 function migrateLogDb(db: DatabaseSync) {
@@ -233,6 +289,8 @@ function migrateLogDb(db: DatabaseSync) {
         ON request_logs(api_key_id, started_at);
       CREATE INDEX IF NOT EXISTS idx_request_logs_channel
         ON request_logs(channel_id, started_at);
+      CREATE INDEX IF NOT EXISTS idx_request_logs_credential
+        ON request_logs(credential_id, started_at);
 
       CREATE TABLE IF NOT EXISTS usage_records (
         id TEXT PRIMARY KEY,
@@ -305,6 +363,12 @@ function migrateLogDb(db: DatabaseSync) {
     addColumnIfMissing(database, "request_logs", "api_key_name", "TEXT");
     addColumnIfMissing(database, "usage_records", "api_key_name", "TEXT");
   });
+
+  applyMigration(
+    db,
+    "003_request_logs_credential_index",
+    "CREATE INDEX IF NOT EXISTS idx_request_logs_credential ON request_logs(credential_id, started_at);",
+  );
 }
 
 function addColumnIfMissing(

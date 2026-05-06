@@ -52,7 +52,11 @@ export async function codexFetch(
         stream: input.stream,
         sourceHeaders: input.sourceHeaders,
       }),
-      body: JSON.stringify(prepareCodexPayloadForUpstream(payload)),
+      body: JSON.stringify(
+        prepareCodexPayloadForUpstream(payload, {
+          fastServiceTier: shouldUsePriorityServiceTier(credential),
+        }),
+      ),
       signal: AbortSignal.timeout(serverConfig.requestTimeoutMs),
     },
   );
@@ -134,11 +138,17 @@ function canonicalHeaderName(name: string) {
     .join("-");
 }
 
-export function prepareCodexPayloadForUpstream(payload: unknown) {
+export function prepareCodexPayloadForUpstream(
+  payload: unknown,
+  options: { fastServiceTier?: boolean } = {},
+) {
   if (!isRecord(payload)) {
     return payload;
   }
   const upstreamPayload = cloneJsonObject(payload);
+  if (options.fastServiceTier) {
+    upstreamPayload.service_tier = "priority";
+  }
   applyModelThinkingSuffix(upstreamPayload);
   return upstreamPayload;
 }
@@ -744,6 +754,25 @@ export function isSpawnAgentTool(toolName: string) {
     normalized.endsWith("__spawn_agent") ||
     normalized.endsWith("/spawn_agent") ||
     normalized.endsWith("-spawn_agent")
+  );
+}
+
+function shouldUsePriorityServiceTier(credential: {
+  fastEnabled?: boolean;
+  planType?: string;
+}) {
+  return Boolean(
+    credential.fastEnabled && isFastServiceTierPlan(credential.planType || ""),
+  );
+}
+
+function isFastServiceTierPlan(planType: string) {
+  const normalized = planType
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "");
+  return (
+    normalized === "pro" || normalized === "pro20" || normalized === "pro20x"
   );
 }
 

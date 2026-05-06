@@ -65,6 +65,23 @@ export type AdminDashboardRequestLogRow = {
   error_code: string | null;
 };
 
+export type RequestLogStatusFilter = "all" | "success" | "error" | "stream";
+
+export type RequestLogsPage = {
+  object: "list";
+  data: AdminDashboardRequestLogRow[];
+  limit: number;
+  page: number;
+  offset: number;
+  total: number;
+  totalPages: number;
+  summary: {
+    errorCount: number;
+    totalTokens: number;
+    avgLatencyMs: number;
+  };
+};
+
 export type ApiKeyPayload = {
   name?: string;
   scopes?: string[];
@@ -80,6 +97,7 @@ export type ChannelPayload = {
   name?: string;
   baseUrl?: string;
   credentialId?: string;
+  credentialIds?: string[];
   enabled?: boolean;
   priority?: number;
   weight?: number;
@@ -242,6 +260,21 @@ export function importCredentialJson(
   );
 }
 
+export function updateCredentialRouting(
+  id: string,
+  payload: {
+    enabled?: boolean;
+    priority?: number;
+    weight?: number;
+    fastEnabled?: boolean;
+  },
+) {
+  return adminRequest<CodexCredentialRecord>(
+    `/api/admin/codex/credentials/${encodePath(id)}`,
+    { method: "PATCH", body: payload },
+  );
+}
+
 export function deleteCredential(id: string) {
   return adminRequest<AdminDeleteResponse>(
     `/api/admin/codex/credentials/${encodePath(id)}`,
@@ -300,11 +333,31 @@ export function getOverview() {
   return adminRequest<AdminOverviewStats>("/api/admin/overview");
 }
 
+export function getRequestLogsPage(
+  options: {
+    limit?: number;
+    page?: number;
+    query?: string;
+    status?: RequestLogStatusFilter;
+  } = {},
+) {
+  const params = new URLSearchParams({
+    limit: String(options.limit ?? 50),
+    page: String(options.page ?? 1),
+  });
+  if (options.query?.trim()) {
+    params.set("query", options.query.trim());
+  }
+  if (options.status && options.status !== "all") {
+    params.set("status", options.status);
+  }
+  return adminRequest<RequestLogsPage>(
+    `/api/admin/request-logs?${params.toString()}`,
+  );
+}
+
 export async function getRequestLogs(limit = 100) {
-  const params = new URLSearchParams({ limit: String(limit) });
-  const result = await adminRequest<
-    AdminListResponse<AdminDashboardRequestLogRow>
-  >(`/api/admin/request-logs?${params.toString()}`);
+  const result = await getRequestLogsPage({ limit, page: 1 });
   return result.data;
 }
 

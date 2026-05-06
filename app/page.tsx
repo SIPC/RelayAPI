@@ -4,7 +4,7 @@ import { AdminDashboard } from "@/components/admin-dashboard";
 import { WebAccessLogin } from "@/components/auth/web-access-login";
 import {
   getAdminOverviewStats,
-  latestRequestLogs,
+  queryRequestLogs,
 } from "@/src/server/repositories/logs";
 import { listApiKeyPublicRecords } from "@/src/server/services/apiKeys";
 import { listChannelRecords } from "@/src/server/services/channels";
@@ -52,7 +52,7 @@ export default async function Home() {
   const apiKeys = listApiKeyPublicRecords();
   const codexCredentials = await listPublicCodexCredentials();
   const channels = listChannelRecords();
-  const requestLogs = latestRequestLogs(100) as RequestLogRow[];
+  const requestLogs = queryRequestLogs({ limit: 50, offset: 0 });
   const overviewStats = getAdminOverviewStats() as AdminOverviewStats;
   const initialNow = new Date().getTime();
 
@@ -61,7 +61,23 @@ export default async function Home() {
       initialApiKeys={apiKeys}
       initialChannels={channels}
       initialCredentials={codexCredentials}
-      initialRequestLogs={requestLogs}
+      initialRequestLogsPage={{
+        object: "list",
+        data: requestLogs.data as RequestLogRow[],
+        limit: requestLogs.limit,
+        page: 1,
+        offset: requestLogs.offset,
+        total: requestLogs.total,
+        totalPages: Math.max(
+          1,
+          Math.ceil(requestLogs.total / requestLogs.limit),
+        ),
+        summary: {
+          errorCount: requestLogs.errorCount,
+          totalTokens: requestLogs.totalTokens,
+          avgLatencyMs: requestLogs.avgLatencyMs,
+        },
+      }}
       initialOverviewStats={overviewStats}
       initialNow={initialNow}
     />
