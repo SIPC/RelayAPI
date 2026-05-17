@@ -54,6 +54,15 @@ export function listCodexCredentials(): CodexCredentialRecord[] {
   return rows.map((row: CodexCredentialRow) => toCodexCredentialRecord(row));
 }
 
+export function listCodexCredentialsWithTokens(): CodexCredentialWithTokens[] {
+  const rows = getMainDb()
+    .prepare("SELECT * FROM codex_credentials ORDER BY created_at DESC")
+    .all() as CodexCredentialRow[];
+  return rows.map((row: CodexCredentialRow) =>
+    toCodexCredentialWithTokens(row),
+  );
+}
+
 export function getCodexCredentialById(
   id: string,
 ): CodexCredentialRecord | null {

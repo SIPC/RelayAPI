@@ -359,6 +359,13 @@ export function refreshCredential(id: string) {
   );
 }
 
+export function downloadCredentialsExport(id?: string) {
+  const path = id
+    ? `/api/admin/codex/credentials/${encodePath(id)}/export`
+    : "/api/admin/codex/credentials/export";
+  return downloadAdminFile(path);
+}
+
 export function getCredentialQuota(
   id: string,
   options: { refresh?: boolean; raw?: boolean } = {},
@@ -566,6 +573,47 @@ function toAdminApiError(response: Response, parsed: unknown) {
     ),
     details: error?.details,
   });
+}
+
+async function downloadAdminFile(url: string) {
+  const response = await fetch(url, { credentials: "same-origin" });
+  if (!response.ok) {
+    const parsed = await parseResponseBody(response);
+    const error = toAdminApiError(response, parsed);
+    notifyWebAuthExpired(error);
+    throw error;
+  }
+
+  const blob = await response.blob();
+  const filename = responseFilename(response) || "relayapi-export.json";
+  const href = URL.createObjectURL(blob);
+  try {
+    const link = document.createElement("a");
+    link.href = href;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  } finally {
+    URL.revokeObjectURL(href);
+  }
+}
+
+function responseFilename(response: Response) {
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded);
+    } catch {
+      return encoded;
+    }
+  }
+  const quoted = disposition.match(/filename="([^\"]+)"/i)?.[1];
+  if (quoted) {
+    return quoted;
+  }
+  return disposition.match(/filename=([^;]+)/i)?.[1]?.trim();
 }
 
 function encodePath(value: string) {

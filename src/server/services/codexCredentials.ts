@@ -10,6 +10,7 @@ import {
   deleteCodexCredential,
   getCodexCredentialWithTokens,
   listCodexCredentials,
+  listCodexCredentialsWithTokens,
   updateCodexCredential,
   upsertCodexCredential,
 } from "@/src/server/repositories/codexCredentials";
@@ -282,6 +283,31 @@ export async function refreshCodexCredential(id: string) {
   return publicCredential(await refreshCodexCredentialWithTokens(id));
 }
 
+export async function exportCodexCredentials() {
+  await importLegacyCredentialsOnce();
+  return {
+    type: "relayapi_codex_credentials_export",
+    version: 1,
+    exported_at: new Date().toISOString(),
+    credentials: listCodexCredentialsWithTokens().map(
+      exportCodexCredentialJson,
+    ),
+  };
+}
+
+export async function exportCodexCredential(id: string) {
+  await importLegacyCredentialsOnce();
+  const credential = getCodexCredentialWithTokens(id);
+  if (!credential) {
+    throw new HttpError(
+      404,
+      "codex_credential_not_found",
+      "Codex credential not found",
+    );
+  }
+  return exportCodexCredentialJson(credential);
+}
+
 export function importCodexCredentialFromJson(
   input: unknown,
   options: { filename?: string } = {},
@@ -340,17 +366,45 @@ export function importCodexCredentialFromJson(
   const id =
     stringValue(parsed.id) || createCredentialId({ email, accountId, tokens });
 
+  const proxy = Object.hasOwn(parsed, "proxy")
+    ? normalizeCredentialProxyPatch(parsed.proxy, null)
+    : undefined;
+  const enabled = booleanValue(parsed.enabled);
+  const disabled = booleanValue(parsed.disabled);
+  const fastEnabled = booleanValue(parsed.fast_enabled ?? parsed.fastEnabled);
+  const useGlobalProxy = booleanValue(
+    parsed.use_global_proxy ?? parsed.useGlobalProxy,
+  );
+  const metadata = objectValue(parsed.metadata);
+
   const saved = upsertCodexCredential({
     id,
     email,
     accountId,
     planType,
     tokens,
+    proxy,
+    ...(enabled !== undefined
+      ? { enabled }
+      : disabled !== undefined
+        ? { enabled: !disabled }
+        : {}),
+    ...(parsed.priority !== undefined
+      ? { priority: normalizeInteger(parsed.priority, 100) }
+      : {}),
+    ...(parsed.weight !== undefined
+      ? { weight: Math.max(1, normalizeInteger(parsed.weight, 1)) }
+      : {}),
     metadata: {
+      ...(metadata || {}),
       imported_from: "web_upload",
       import_filename: options.filename,
       imported_at: new Date().toISOString(),
       source_disabled: parsed.disabled,
+      ...(fastEnabled !== undefined ? { fast_service_tier: fastEnabled } : {}),
+      ...(useGlobalProxy !== undefined
+        ? { use_global_proxy: useGlobalProxy }
+        : {}),
     },
   });
   if (!saved) {
@@ -573,6 +627,35 @@ async function importLegacyCredentialsOnce() {
   }
 }
 
+function exportCodexCredentialJson(credential: CodexCredentialWithTokens) {
+  return {
+    type: "codex",
+    id: credential.id,
+    email: credential.email,
+    account_id: credential.accountId,
+    accountId: credential.accountId,
+    plan_type: credential.planType,
+    planType: credential.planType,
+    access_token: credential.tokens.access_token,
+    refresh_token: credential.tokens.refresh_token,
+    id_token: credential.tokens.id_token,
+    expired: credential.tokens.expired,
+    last_refresh: credential.tokens.last_refresh,
+    enabled: credential.enabled,
+    disabled: !credential.enabled,
+    priority: credential.priority,
+    weight: credential.weight,
+    fast_enabled: credential.fastEnabled,
+    fastEnabled: credential.fastEnabled,
+    use_global_proxy: credential.useGlobalProxy,
+    useGlobalProxy: credential.useGlobalProxy,
+    proxy: credential.proxy,
+    metadata: credential.metadata,
+    created_at: credential.createdAt,
+    updated_at: credential.updatedAt,
+  };
+}
+
 function publicCredential(
   credential: CodexCredentialWithTokens,
 ): CodexCredentialRecord {
@@ -689,6 +772,25 @@ function parseMaybeJson<T>(text: string) {
 
 function stringValue(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function booleanValue(value: unknown) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    return value !== 0;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes", "on", "enabled"].includes(normalized)) {
+      return true;
+    }
+    if (["false", "0", "no", "off", "disabled"].includes(normalized)) {
+      return false;
+    }
+  }
+  return undefined;
 }
 
 function numberValue(value: unknown) {

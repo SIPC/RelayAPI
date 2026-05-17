@@ -10,6 +10,7 @@ import {
   CopyIcon,
   Clock3Icon,
   DatabaseIcon,
+  DownloadIcon,
   FileTextIcon,
   GaugeIcon,
   KeyRoundIcon,
@@ -95,6 +96,7 @@ import {
   deleteApiKey,
   deleteChannel,
   deleteCredential,
+  downloadCredentialsExport,
   finishCodexOAuth,
   getCredentialQuota,
   getDashboardSnapshot,
@@ -2245,6 +2247,7 @@ function CredentialsSection({
   const [oauthOpen, setOauthOpen] = React.useState(false);
   const [pendingId, setPendingId] = React.useState<string | null>(null);
   const [uploadingCredential, setUploadingCredential] = React.useState(false);
+  const [exportingCredentials, setExportingCredentials] = React.useState(false);
   const credentialFileInputRef = React.useRef<HTMLInputElement>(null);
   const [quotaLoadingIds, setQuotaLoadingIds] = React.useState<Set<string>>(
     () => new Set(),
@@ -2445,6 +2448,18 @@ function CredentialsSection({
     }
   }
 
+  async function exportAllCredentials() {
+    setExportingCredentials(true);
+    try {
+      await downloadCredentialsExport();
+      toast.success("Codex 凭据导出已开始");
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setExportingCredentials(false);
+    }
+  }
+
   async function remove(credential: CodexCredentialRecord) {
     setPendingId(credential.id);
     try {
@@ -2474,10 +2489,24 @@ function CredentialsSection({
         <CardHeader>
           <CardTitle>Codex 凭据</CardTitle>
           <CardDescription>
-            连接 Codex 账号、刷新 token、查看额度。Token 明文不会返回浏览器。
+            连接 Codex 账号、刷新 token、查看额度。日常列表不会返回 token
+            明文；显式导出备份会下载包含 token 明文的 JSON。
           </CardDescription>
           <CardAction>
             <div className="flex flex-wrap items-center justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={credentials.length === 0 || exportingCredentials}
+                onClick={exportAllCredentials}
+              >
+                {exportingCredentials ? (
+                  <Spinner data-icon="inline-start" />
+                ) : (
+                  <DownloadIcon data-icon="inline-start" />
+                )}
+                导出全部
+              </Button>
               <Button
                 type="button"
                 variant="outline"
@@ -3317,6 +3346,7 @@ function CredentialSettingsDialog({
 }) {
   const [open, setOpen] = React.useState(false);
   const [refreshingToken, setRefreshingToken] = React.useState(false);
+  const [exporting, setExporting] = React.useState(false);
   const accountName = credential.email || credential.accountId || credential.id;
 
   async function refreshTokenFromSettings() {
@@ -3327,6 +3357,18 @@ function CredentialSettingsDialog({
       // Parent action already shows the concrete error toast.
     } finally {
       setRefreshingToken(false);
+    }
+  }
+
+  async function exportCredentialFromSettings() {
+    setExporting(true);
+    try {
+      await downloadCredentialsExport(credential.id);
+      toast.success("Codex 凭据导出已开始");
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setExporting(false);
     }
   }
 
@@ -3448,6 +3490,30 @@ function CredentialSettingsDialog({
                       <RefreshCwIcon data-icon="inline-start" />
                     )}
                     刷新 token
+                  </Button>
+                </div>
+
+                <Separator />
+
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <div className="font-medium">导出凭据</div>
+                    <div className="text-xs text-muted-foreground">
+                      下载可重新导入的 JSON 备份，包含 token 明文和代理密码。
+                    </div>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={disabled || exporting}
+                    onClick={exportCredentialFromSettings}
+                  >
+                    {exporting ? (
+                      <Spinner data-icon="inline-start" />
+                    ) : (
+                      <DownloadIcon data-icon="inline-start" />
+                    )}
+                    导出此凭据
                   </Button>
                 </div>
 
