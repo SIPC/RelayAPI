@@ -14,6 +14,17 @@ import type {
   UsageStatsRow,
 } from "@/src/shared/types/entities";
 
+const ADMIN_OVERVIEW_CACHE_TTL_MS = 15_000;
+const OVERVIEW_GROUP_LIMIT = 100;
+const OVERVIEW_DAILY_WINDOW_DAYS = 30;
+const LATENCY_SAMPLE_LIMIT = 1_000;
+const FIRST_TOKEN_SAMPLE_LIMIT = 500;
+
+let adminOverviewCache: {
+  expiresAt: number;
+  value: AdminOverviewStats;
+} | null = null;
+
 export interface RequestLogInput {
   startedAt: string;
   completedAt?: string;
@@ -34,6 +45,25 @@ export interface RequestLogInput {
   usage?: UsageSnapshot;
   errorCode?: string | null;
   errorMessage?: string | null;
+}
+
+export interface PruneRequestLogsInput {
+  summaryRetentionDays: number;
+  detailRetentionDays: number;
+  vacuum?: boolean;
+}
+
+export interface PruneRequestLogsResult {
+  summaryRetentionDays: number;
+  detailRetentionDays: number;
+  summaryCutoff: string;
+  detailCutoff: string;
+  deletedRequestLogDetails: number;
+  deletedRequestLogs: number;
+  deletedUsageRecords: number;
+  deletedUsageDailyBuckets: number;
+  deletedChannelHealthEvents: number;
+  vacuumed: boolean;
 }
 
 export interface RequestLogDetailInput {
@@ -243,6 +273,97 @@ export function appendUsageRecord(input: {
     );
 }
 
+export function pruneRequestLogs(
+  input: PruneRequestLogsInput,
+): PruneRequestLogsResult {
+  const summaryRetentionDays = normalizeRetentionDays(
+    input.summaryRetentionDays,
+  );
+  const detailRetentionDays = normalizeRetentionDays(input.detailRetentionDays);
+  const summaryCutoff = retentionCutoff(summaryRetentionDays);
+  const detailCutoff = retentionCutoff(detailRetentionDays);
+  const db = getLogDb();
+  const deleted = {
+    requestLogDetails: 0,
+    requestLogs: 0,
+    usageRecords: 0,
+    usageDailyBuckets: 0,
+    channelHealthEvents: 0,
+  };
+
+  db.exec("BEGIN");
+  try {
+    deleted.requestLogDetails += changedRows(
+      db
+        .prepare("DELETE FROM request_log_details WHERE created_at < ?")
+        .run(detailCutoff),
+    );
+    deleted.requestLogDetails += changedRows(
+      db
+        .prepare(
+          `DELETE FROM request_log_details
+           WHERE request_log_id IN (
+             SELECT id FROM request_logs WHERE started_at < ?
+           )`,
+        )
+        .run(summaryCutoff),
+    );
+    deleted.requestLogs = changedRows(
+      db
+        .prepare("DELETE FROM request_logs WHERE started_at < ?")
+        .run(summaryCutoff),
+    );
+    deleted.usageRecords = changedRows(
+      db
+        .prepare("DELETE FROM usage_records WHERE created_at < ?")
+        .run(summaryCutoff),
+    );
+    deleted.usageDailyBuckets = changedRows(
+      db
+        .prepare("DELETE FROM usage_daily_buckets WHERE bucket_date < ?")
+        .run(summaryCutoff.slice(0, 10)),
+    );
+    deleted.requestLogDetails += changedRows(
+      db
+        .prepare(
+          `DELETE FROM request_log_details
+           WHERE NOT EXISTS (
+             SELECT 1 FROM request_logs
+             WHERE request_logs.id = request_log_details.request_log_id
+           )`,
+        )
+        .run(),
+    );
+    deleted.channelHealthEvents = changedRows(
+      db
+        .prepare("DELETE FROM channel_health_events WHERE created_at < ?")
+        .run(summaryCutoff),
+    );
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+
+  if (input.vacuum) {
+    db.exec("VACUUM");
+  }
+
+  adminOverviewCache = null;
+  return {
+    summaryRetentionDays,
+    detailRetentionDays,
+    summaryCutoff,
+    detailCutoff,
+    deletedRequestLogDetails: deleted.requestLogDetails,
+    deletedRequestLogs: deleted.requestLogs,
+    deletedUsageRecords: deleted.usageRecords,
+    deletedUsageDailyBuckets: deleted.usageDailyBuckets,
+    deletedChannelHealthEvents: deleted.channelHealthEvents,
+    vacuumed: Boolean(input.vacuum),
+  };
+}
+
 export function appendChannelHealthEvent(input: {
   channelId: string;
   channelName?: string;
@@ -363,7 +484,7 @@ export interface PublicRequestLogDetail {
 }
 
 export function latestRequestLogs(limit = 20): PublicRequestLogRow[] {
-  return queryRequestLogs({ limit, offset: 0 }).data;
+  return queryRequestLogs({ limit, offset: 0, skipTotal: true }).data;
 }
 
 export type RequestLogStatusFilter = "all" | "success" | "error" | "stream";
@@ -373,6 +494,8 @@ export interface RequestLogQueryInput {
   offset?: number;
   query?: string;
   status?: RequestLogStatusFilter;
+  includeSummary?: boolean;
+  skipTotal?: boolean;
 }
 
 export interface RequestLogQueryResult {
@@ -445,10 +568,35 @@ export function queryRequestLogs(
     )
     .all(...params, limit, offset) as Array<Record<string, unknown>>;
 
+  const publicRows = attachApiKeyNames(rows).map(toPublicRequestLogRow);
+  const pageSummary = input.includeSummary
+    ? summarizeRequestLogs(where, params)
+    : summarizeRequestLogRows(publicRows);
+
+  return {
+    data: publicRows,
+    limit,
+    offset,
+    total: input.skipTotal
+      ? publicRows.length
+      : countRequestLogs(where, params),
+    errorCount: pageSummary.errorCount,
+    totalTokens: pageSummary.totalTokens,
+    avgLatencyMs: pageSummary.avgLatencyMs,
+  };
+}
+
+function countRequestLogs(where: string, params: string[]) {
+  const row = getLogDb()
+    .prepare(`SELECT COUNT(*) AS total FROM request_logs ${where}`)
+    .get(...params) as Record<string, unknown> | undefined;
+  return numberValue(row?.total);
+}
+
+function summarizeRequestLogs(where: string, params: string[]) {
   const summary = getLogDb()
     .prepare(
       `SELECT
-        COUNT(*) AS total,
         SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS error_count,
         COALESCE(SUM(total_tokens), 0) AS total_tokens,
         COALESCE(AVG(latency_ms), 0) AS avg_latency_ms
@@ -456,15 +604,22 @@ export function queryRequestLogs(
       ${where}`,
     )
     .get(...params) as Record<string, unknown> | undefined;
-
   return {
-    data: attachApiKeyNames(rows).map(toPublicRequestLogRow),
-    limit,
-    offset,
-    total: numberValue(summary?.total),
     errorCount: numberValue(summary?.error_count),
     totalTokens: numberValue(summary?.total_tokens),
     avgLatencyMs: Math.round(numberValue(summary?.avg_latency_ms)),
+  };
+}
+
+function summarizeRequestLogRows(rows: PublicRequestLogRow[]) {
+  const errorCount = rows.filter((row) => row.status_code >= 400).length;
+  const totalTokens = rows.reduce((total, row) => total + row.total_tokens, 0);
+  const totalLatencyMs = rows.reduce((total, row) => total + row.latency_ms, 0);
+  return {
+    errorCount,
+    totalTokens,
+    avgLatencyMs:
+      rows.length > 0 ? Math.round(totalLatencyMs / rows.length) : 0,
   };
 }
 
@@ -506,8 +661,13 @@ function requestLogWhere(input: RequestLogQueryInput) {
 }
 
 export function getAdminOverviewStats(): AdminOverviewStats {
+  const now = Date.now();
+  if (adminOverviewCache && adminOverviewCache.expiresAt > now) {
+    return adminOverviewCache.value;
+  }
+
   const totals = getOverviewTotals();
-  return {
+  const value = {
     generatedAt: new Date().toISOString(),
     totals,
     byApiKey: getApiKeyUsageStats(),
@@ -518,6 +678,11 @@ export function getAdminOverviewStats(): AdminOverviewStats {
     byRequestType: getGroupedUsageStats("request_type", "request_type"),
     byDay: getDailyUsageStats(),
   };
+  adminOverviewCache = {
+    expiresAt: now + ADMIN_OVERVIEW_CACHE_TTL_MS,
+    value,
+  };
+  return value;
 }
 
 const DEFAULT_CREDENTIAL_USAGE_WINDOW_SIZE = 50;
@@ -562,45 +727,28 @@ function requestWindowUsageHealth(
     return healthById;
   }
 
-  const placeholders = uniqueIds.map(() => "?").join(", ");
-  const rows = getLogDb()
-    .prepare(
-      `WITH ranked AS (
-        SELECT
-          ${columnName} AS target_id,
-          started_at,
-          status_code,
-          error_code,
-          ROW_NUMBER() OVER (
-            PARTITION BY ${columnName}
-            ORDER BY started_at DESC
-          ) AS row_number
-        FROM request_logs
-        WHERE ${columnName} IN (${placeholders})
-      )
-      SELECT target_id, started_at, status_code, error_code
-      FROM ranked
-      WHERE row_number <= ?
-      ORDER BY target_id, started_at DESC`,
-    )
-    .all(...uniqueIds, windowSize) as Array<Record<string, unknown>>;
-
-  const rowsById = new Map<string, Array<Record<string, unknown>>>();
-  for (const row of rows) {
-    const id = String(row.target_id || "");
-    if (!id) {
-      continue;
-    }
-    const currentRows = rowsById.get(id) || [];
-    currentRows.push(row);
-    rowsById.set(id, currentRows);
-  }
+  const statement = getLogDb().prepare(
+    `SELECT ${columnName} AS target_id, started_at, status_code, error_code
+     FROM request_logs INDEXED BY ${requestLogWindowIndex(columnName)}
+     WHERE ${columnName} = ?
+     ORDER BY started_at DESC
+     LIMIT ?`,
+  );
 
   for (const id of uniqueIds) {
-    healthById[id] = calculateUsageHealth(rowsById.get(id) || [], windowSize);
+    const rows = statement.all(id, windowSize) as Array<
+      Record<string, unknown>
+    >;
+    healthById[id] = calculateUsageHealth(rows, windowSize);
   }
 
   return healthById;
+}
+
+function requestLogWindowIndex(columnName: "credential_id" | "channel_id") {
+  return columnName === "credential_id"
+    ? "idx_request_logs_credential"
+    : "idx_request_logs_channel";
 }
 
 function unusedUsageHealth(windowSize: number): CodexAccountUsageHealth {
@@ -678,6 +826,7 @@ function getOverviewTotals(): AdminOverviewTotals {
     .get() as Record<string, unknown> | undefined;
   const requestCount = numberValue(row?.request_count);
   const totalTokens = numberValue(row?.total_tokens);
+  const firstTokenLatency = firstTokenLatencyStats();
   return {
     requestCount,
     successCount: numberValue(row?.success_count),
@@ -688,6 +837,7 @@ function getOverviewTotals(): AdminOverviewTotals {
     totalTokens,
     avgLatencyMs: Math.round(numberValue(row?.avg_latency_ms)),
     p95LatencyMs: percentileLatency(),
+    ...firstTokenLatency,
     avgTokensPerRequest: average(totalTokens, requestCount),
     tokensPerSecond: throughput(totalTokens, row?.total_latency_ms),
     distinctApiKeyCount: numberValue(row?.distinct_api_key_count),
@@ -699,13 +849,18 @@ function getOverviewTotals(): AdminOverviewTotals {
 }
 
 function getApiKeyUsageStats(): ApiKeyUsageStatsRow[] {
+  const overviewWindowStart = overviewRecentStartedAt();
   const rows = getLogDb()
     .prepare(
       `${aggregateSelect("api_key_id", "api_key_prefix")}
+       WHERE started_at >= ?
        GROUP BY COALESCE(api_key_id, ''), COALESCE(api_key_prefix, '')
-       ORDER BY total_tokens DESC, request_count DESC`,
+       ORDER BY total_tokens DESC, request_count DESC
+       LIMIT ?`,
     )
-    .all() as Array<Record<string, unknown>>;
+    .all(overviewWindowStart, OVERVIEW_GROUP_LIMIT) as Array<
+    Record<string, unknown>
+  >;
   const keysById = apiKeysById();
   const todayTokensByKey = todayTokensByApiKey();
   const stats = rows.map((row) => {
@@ -770,6 +925,7 @@ function getApiKeyUsageStats(): ApiKeyUsageStatsRow[] {
 }
 
 function getApiKeyModelUsageStats(): ApiKeyModelUsageStatsRow[] {
+  const recentStartedAt = overviewRecentStartedAt();
   const rows = getLogDb()
     .prepare(
       `SELECT
@@ -789,10 +945,14 @@ function getApiKeyModelUsageStats(): ApiKeyModelUsageStatsRow[] {
         MIN(started_at) AS first_request_at,
         MAX(started_at) AS last_request_at
       FROM request_logs
+      WHERE started_at >= ?
       GROUP BY COALESCE(api_key_id, ''), COALESCE(api_key_prefix, ''), COALESCE(model, '')
-      ORDER BY total_tokens DESC, request_count DESC`,
+      ORDER BY total_tokens DESC, request_count DESC
+      LIMIT ?`,
     )
-    .all() as Array<Record<string, unknown>>;
+    .all(recentStartedAt, OVERVIEW_GROUP_LIMIT) as Array<
+    Record<string, unknown>
+  >;
   const keysById = apiKeysById();
   return rows.map((row) => {
     const apiKeyId = nullableString(row.api_key_id);
@@ -835,13 +995,18 @@ function getGroupedUsageStats(
   keyColumn: string,
   labelColumn: string,
 ): UsageStatsRow[] {
+  const recentStartedAt = overviewRecentStartedAt();
   const rows = getLogDb()
     .prepare(
       `${aggregateSelect(keyColumn, labelColumn)}
+       WHERE started_at >= ?
        GROUP BY COALESCE(${keyColumn}, ''), COALESCE(${labelColumn}, '')
-       ORDER BY total_tokens DESC, request_count DESC`,
+       ORDER BY total_tokens DESC, request_count DESC
+       LIMIT ?`,
     )
-    .all() as Array<Record<string, unknown>>;
+    .all(recentStartedAt, OVERVIEW_GROUP_LIMIT) as Array<
+    Record<string, unknown>
+  >;
   return rows.map((row) =>
     toUsageStatsRow(row, {
       emptyLabel: "未记录",
@@ -851,6 +1016,7 @@ function getGroupedUsageStats(
 }
 
 function getDailyUsageStats(): DailyUsageStatsRow[] {
+  const recentStartedAt = overviewRecentStartedAt();
   const rows = getLogDb()
     .prepare(
       `SELECT
@@ -867,15 +1033,21 @@ function getDailyUsageStats(): DailyUsageStatsRow[] {
         MIN(started_at) AS first_request_at,
         MAX(started_at) AS last_request_at
       FROM request_logs
+      WHERE started_at >= ?
       GROUP BY substr(started_at, 1, 10)
-      ORDER BY date DESC`,
+      ORDER BY date DESC
+      LIMIT ?`,
     )
-    .all() as Array<Record<string, unknown>>;
+    .all(recentStartedAt, OVERVIEW_DAILY_WINDOW_DAYS) as Array<
+    Record<string, unknown>
+  >;
   return rows.map((row) => {
     const requestCount = numberValue(row.request_count);
     const totalTokens = numberValue(row.total_tokens);
+    const date = String(row.date || "");
+    const firstTokenLatency = firstTokenLatencyStats({ day: date });
     return {
-      date: String(row.date || ""),
+      date,
       requestCount,
       successCount: numberValue(row.success_count),
       errorCount: numberValue(row.error_count),
@@ -884,7 +1056,8 @@ function getDailyUsageStats(): DailyUsageStatsRow[] {
       completionTokens: numberValue(row.completion_tokens),
       totalTokens,
       avgLatencyMs: Math.round(numberValue(row.avg_latency_ms)),
-      p95LatencyMs: percentileLatency({ day: String(row.date || "") }),
+      p95LatencyMs: percentileLatency({ day: date }),
+      ...firstTokenLatency,
       avgTokensPerRequest: average(totalTokens, requestCount),
       tokensPerSecond: throughput(totalTokens, row.total_latency_ms),
     };
@@ -928,6 +1101,8 @@ function emptyUsageStatsRow(input: {
     totalTokens: 0,
     avgLatencyMs: 0,
     p95LatencyMs: 0,
+    avgFirstTokenLatencyMs: 0,
+    p95FirstTokenLatencyMs: 0,
     avgTokensPerRequest: 0,
     tokensPerSecond: 0,
     firstRequestAt: null,
@@ -970,6 +1145,11 @@ function toUsageStatsRow(
       groupColumn: options.groupColumn,
       filters: options.filters,
     }),
+    ...firstTokenLatencyStats({
+      groupKey: nullableString(row.group_key),
+      groupColumn: options.groupColumn,
+      filters: options.filters,
+    }),
     avgTokensPerRequest: average(totalTokens, requestCount),
     tokensPerSecond: throughput(totalTokens, row.total_latency_ms),
     firstRequestAt,
@@ -985,32 +1165,125 @@ function percentileLatency(
     filters?: Array<{ column: string; value: string }>;
   } = {},
 ) {
-  const conditions: string[] = [];
-  const params: string[] = [];
-  if (input.day) {
-    conditions.push("substr(started_at, 1, 10) = ?");
-    params.push(input.day);
-  }
-  if (input.groupColumn) {
-    conditions.push(`COALESCE(${input.groupColumn}, '') = ?`);
-    params.push(input.groupKey || "");
-  }
-  for (const filter of input.filters || []) {
-    conditions.push(`COALESCE(${filter.column}, '') = ?`);
-    params.push(filter.value);
-  }
-  const where =
-    conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const { where, params } = latencyWhereClause(input);
   const rows = getLogDb()
     .prepare(
-      `SELECT latency_ms FROM request_logs ${where} ORDER BY latency_ms ASC`,
+      `SELECT latency_ms
+       FROM (
+         SELECT latency_ms
+         FROM request_logs
+         ${where}
+         ORDER BY started_at DESC
+         LIMIT ?
+       )
+       ORDER BY latency_ms ASC`,
     )
-    .all(...params) as Array<{ latency_ms: number }>;
+    .all(...params, LATENCY_SAMPLE_LIMIT) as Array<{ latency_ms: number }>;
   if (rows.length === 0) {
     return 0;
   }
   const index = Math.min(rows.length - 1, Math.ceil(rows.length * 0.95) - 1);
   return numberValue(rows[index]?.latency_ms);
+}
+
+function firstTokenLatencyStats(
+  input: {
+    day?: string;
+    groupColumn?: string;
+    groupKey?: string | null;
+    filters?: Array<{ column: string; value: string }>;
+  } = {},
+) {
+  const { where, params } = latencyWhereClause(input);
+  const rows = getLogDb()
+    .prepare(
+      `WITH recent_requests AS (
+         SELECT
+           id, started_at, api_key_id, model, channel_id, credential_id,
+           request_type
+         FROM request_logs
+         ${where}
+         ORDER BY started_at DESC
+         LIMIT ?
+       )
+       SELECT COALESCE(
+         MAX(CASE WHEN json_extract(value, '$.name') = 'stream_first_token' THEN json_extract(value, '$.startedAtMs') END),
+         MAX(CASE WHEN json_extract(value, '$.name') = 'stream_first_chunk' THEN json_extract(value, '$.startedAtMs') END)
+       ) AS latency_ms
+       FROM recent_requests
+       INNER JOIN request_log_details ON request_log_details.request_log_id = recent_requests.id,
+       json_each(request_log_details.stage_timings_json)
+       GROUP BY recent_requests.id
+       HAVING latency_ms IS NOT NULL`,
+    )
+    .all(...params, FIRST_TOKEN_SAMPLE_LIMIT) as Array<{ latency_ms: number }>;
+  if (rows.length === 0) {
+    return {
+      avgFirstTokenLatencyMs: 0,
+      p95FirstTokenLatencyMs: 0,
+    };
+  }
+  const values = rows
+    .map((row) => numberValue(row.latency_ms))
+    .sort((left, right) => left - right);
+  const index = Math.min(
+    values.length - 1,
+    Math.ceil(values.length * 0.95) - 1,
+  );
+  return {
+    avgFirstTokenLatencyMs: Math.round(
+      values.reduce((total, value) => total + value, 0) / values.length,
+    ),
+    p95FirstTokenLatencyMs: values[index] || 0,
+  };
+}
+
+function latencyWhereClause(
+  input: {
+    day?: string;
+    groupColumn?: string;
+    groupKey?: string | null;
+    filters?: Array<{ column: string; value: string }>;
+    timingName?: string;
+  } = {},
+  tableAlias?: string,
+) {
+  const column = (name: string) => {
+    const safeName = safeLatencyColumnName(name);
+    return tableAlias ? `${tableAlias}.${safeName}` : safeName;
+  };
+  const conditions: string[] = [];
+  const params: string[] = [];
+  if (input.day) {
+    conditions.push(`substr(${column("started_at")}, 1, 10) = ?`);
+    params.push(input.day);
+  } else {
+    conditions.push(`${column("started_at")} >= ?`);
+    params.push(overviewRecentStartedAt());
+  }
+  if (input.groupColumn) {
+    conditions.push(`COALESCE(${column(input.groupColumn)}, '') = ?`);
+    params.push(input.groupKey || "");
+  }
+  for (const filter of input.filters || []) {
+    conditions.push(`COALESCE(${column(filter.column)}, '') = ?`);
+    params.push(filter.value);
+  }
+  if (input.timingName) {
+    conditions.push("json_extract(value, '$.name') = ?");
+    params.push(input.timingName);
+  }
+  return {
+    where: conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "",
+    params,
+  };
+}
+
+function safeLatencyColumnName(name: string) {
+  if (!/^[a-z_]+$/i.test(name)) {
+    throw new Error("Invalid latency column name");
+  }
+  return name;
 }
 
 function apiKeysById() {
@@ -1041,6 +1314,27 @@ function todayTokensByApiKey() {
   return new Map(
     rows.map((row) => [String(row.api_key_id), numberValue(row.total_tokens)]),
   );
+}
+
+function changedRows(result: { changes: number | bigint }) {
+  return Number(result.changes || 0);
+}
+
+function normalizeRetentionDays(days: number) {
+  if (!Number.isFinite(days)) {
+    throw new Error("Retention days must be finite");
+  }
+  return Math.max(1, Math.floor(days));
+}
+
+function retentionCutoff(days: number) {
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+function overviewRecentStartedAt() {
+  return new Date(Date.now() - OVERVIEW_DAILY_WINDOW_DAYS * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
 }
 
 function average(total: number, count: number) {

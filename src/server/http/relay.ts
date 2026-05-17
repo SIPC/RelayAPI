@@ -1,6 +1,7 @@
 import "server-only";
 
 import { createModelsResponse } from "@/src/server/codex/models";
+import { CodexResponsesSseFramer } from "@/src/server/codex/sse";
 import {
   chatCompletionsToCodex,
   codexFetch,
@@ -37,7 +38,7 @@ import type {
   UsageSnapshot,
 } from "@/src/shared/types/entities";
 
-const DETAIL_TEXT_LIMIT = 5 * 1024 * 1024;
+const DETAIL_TEXT_LIMIT = 512 * 1024;
 const SENSITIVE_HEADER_NAMES = new Set([
   "authorization",
   "cookie",
@@ -193,6 +194,9 @@ export async function handleOpenAIResponses(request: Request) {
       upstreamBody: result.text,
       timing,
     });
+    if (!result.response.ok) {
+      return upstreamErrorResponse(result.response.status);
+    }
     return Response.json(raw, { status: result.response.status });
   } catch (error) {
     if (channel) {
@@ -220,6 +224,7 @@ export async function handleOpenAIResponsesCompact(request: Request) {
     upstreamPath: "/responses/compact",
     requestType: "responses.compact",
     streamFromPayload: false,
+    exposeUpstreamErrors: false,
     normalizePayload: normalizeCompactPayload,
   });
 }
@@ -229,6 +234,7 @@ export async function handleRawCodexResponses(request: Request) {
     upstreamPath: "/responses",
     requestType: "codex.responses.raw",
     streamFromPayload: true,
+    exposeUpstreamErrors: true,
     normalizePayload: (payload) => payload,
   });
 }
@@ -238,6 +244,7 @@ export async function handleRawCodexCompact(request: Request) {
     upstreamPath: "/responses/compact",
     requestType: "codex.responses.compact.raw",
     streamFromPayload: false,
+    exposeUpstreamErrors: true,
     normalizePayload: (payload) => payload,
   });
 }
@@ -309,11 +316,7 @@ export async function handleChatCompletions(request: Request) {
           upstreamBody: errorText,
           timing,
         });
-        const headers = copyUpstreamHeaders(response.headers);
-        return new Response(errorText, {
-          status: response.status,
-          headers,
-        });
+        return upstreamErrorResponse(response.status);
       }
       const headers = new Headers({
         "Content-Type": "text/event-stream; charset=utf-8",
@@ -329,6 +332,9 @@ export async function handleChatCompletions(request: Request) {
             {
               fallbackModel: model,
               toolNameMaps,
+              onFirstToken: () => {
+                timing.mark("stream_first_token", "收到首字输出");
+              },
               onCompleted: (usage) => {
                 recordChannelSuccess(channel!);
                 appendSuccessLog({
@@ -416,13 +422,7 @@ export async function handleChatCompletions(request: Request) {
         upstreamBody: result.text,
         timing,
       });
-      return new Response(
-        result.text || JSON.stringify({ error: { message: "Upstream error" } }),
-        {
-          status: result.response.status,
-          headers: copyUpstreamHeaders(result.response.headers),
-        },
-      );
+      return upstreamErrorResponse(result.response.status);
     }
     const raw = timing.time(
       "parse_upstream_response",
@@ -484,6 +484,7 @@ async function handleRawCodexProxy(
     upstreamPath: "/responses" | "/responses/compact";
     requestType: string;
     streamFromPayload: boolean;
+    exposeUpstreamErrors: boolean;
     normalizePayload: (
       payload: Record<string, unknown>,
     ) => Record<string, unknown>;
@@ -526,6 +527,7 @@ async function handleRawCodexProxy(
         fallbackContentType: "text/event-stream; charset=utf-8",
         requestBody: rawPayload,
         forwardedBody: payload,
+        exposeUpstreamErrors: input.exposeUpstreamErrors,
         timing,
       });
     }
@@ -570,6 +572,9 @@ async function handleRawCodexProxy(
       upstreamBody: result.text,
       timing,
     });
+    if (!result.response.ok && !input.exposeUpstreamErrors) {
+      return upstreamErrorResponse(result.response.status);
+    }
     return new Response(result.text, {
       status: result.response.status,
       headers: withDefaultContentType(
@@ -610,6 +615,7 @@ async function forwardCodexStream(input: {
   fallbackContentType: string;
   requestBody?: unknown;
   forwardedBody?: unknown;
+  exposeUpstreamErrors?: boolean;
   timing?: StageTimer;
 }) {
   const model =
@@ -624,9 +630,11 @@ async function forwardCodexStream(input: {
       timing: input.timing,
     },
   );
-  const headers = withDefaultContentType(
-    copyUpstreamHeaders(response.headers),
-    input.fallbackContentType,
+  const headers = withStreamingHeaders(
+    withDefaultContentType(
+      copyUpstreamHeaders(response.headers),
+      input.fallbackContentType,
+    ),
   );
   if (!response.ok) {
     const errorText = input.timing
@@ -660,7 +668,10 @@ async function forwardCodexStream(input: {
       upstreamBody: errorText,
       timing: input.timing,
     });
-    return new Response(errorText, { status: response.status, headers });
+    if (input.exposeUpstreamErrors) {
+      return new Response(errorText, { status: response.status, headers });
+    }
+    return upstreamErrorResponse(response.status);
   }
   const fullLog = getFullRequestLoggingSetting();
   const upstreamCapture = createTextCapture();
@@ -671,26 +682,60 @@ async function forwardCodexStream(input: {
           fullLog ? upstreamCapture : null,
           input.timing,
         ),
-        (usage) => {
-          recordChannelSuccess(input.channel);
-          appendSuccessLog({
-            request: input.request,
-            startedAt: input.startedAt,
-            start: input.start,
-            apiKey: input.apiKey,
-            channel: input.channel,
-            credentialEmail: credential.email,
-            requestType: input.requestType,
-            stream: true,
-            model,
-            statusCode: response.status,
-            usage,
-            requestBody: input.requestBody,
-            forwardedBody: upstreamPayload,
-            upstreamHeaders: response.headers,
-            upstreamBody: upstreamCapture.text,
-            timing: input.timing,
-          });
+        {
+          onCompleted: (usage) => {
+            recordChannelSuccess(input.channel);
+            appendSuccessLog({
+              request: input.request,
+              startedAt: input.startedAt,
+              start: input.start,
+              apiKey: input.apiKey,
+              channel: input.channel,
+              credentialEmail: credential.email,
+              requestType: input.requestType,
+              stream: true,
+              model,
+              statusCode: response.status,
+              usage,
+              requestBody: input.requestBody,
+              forwardedBody: upstreamPayload,
+              upstreamHeaders: response.headers,
+              upstreamBody: upstreamCapture.text,
+              timing: input.timing,
+            });
+          },
+          onError: (error, usage) => {
+            const message =
+              error instanceof Error ? error.message : String(error);
+            recordChannelFailure(input.channel, {
+              statusCode: 502,
+              message,
+            });
+            appendSuccessLog({
+              request: input.request,
+              startedAt: input.startedAt,
+              start: input.start,
+              apiKey: input.apiKey,
+              channel: input.channel,
+              credentialEmail: credential.email,
+              requestType: input.requestType,
+              stream: true,
+              model,
+              statusCode: 502,
+              usage,
+              errorCode: "stream_error",
+              errorMessage: message.slice(0, 500),
+              requestBody: input.requestBody,
+              forwardedBody: upstreamPayload,
+              upstreamHeaders: response.headers,
+              upstreamBody: upstreamCapture.text,
+              error,
+              timing: input.timing,
+            });
+          },
+          onFirstToken: () => {
+            input.timing?.mark("stream_first_token", "收到首字输出");
+          },
         },
       )
     : null;
@@ -699,59 +744,142 @@ async function forwardCodexStream(input: {
 
 function createCodexUsageMeterStream(
   upstreamBody: ReadableStream<Uint8Array>,
-  onCompleted: (usage: UsageSnapshot) => void,
+  handlers: {
+    onCompleted: (usage: UsageSnapshot) => void;
+    onError: (error: unknown, usage: UsageSnapshot) => void;
+    onFirstToken?: () => void;
+  },
 ) {
   const decoder = new TextDecoder();
-  let buffer = "";
+  const encoder = new TextEncoder();
+  const framer = new CodexResponsesSseFramer();
   let usage = emptyUsage();
+  let firstTokenReported = false;
+  let upstreamCompleted = false;
+  let completionReported = false;
+
+  function reportFirstTokenOnce() {
+    if (firstTokenReported) {
+      return;
+    }
+    firstTokenReported = true;
+    handlers.onFirstToken?.();
+  }
+
+  function reportCompletedOnce() {
+    if (completionReported) {
+      return;
+    }
+    completionReported = true;
+    handlers.onCompleted(usage);
+  }
+
+  function reportErrorOnce(error: unknown) {
+    if (completionReported) {
+      return;
+    }
+    completionReported = true;
+    handlers.onError(error, usage);
+  }
+
+  function processText(
+    text: string,
+    controller: TransformStreamDefaultController<Uint8Array>,
+  ) {
+    for (const frame of framer.push(text)) {
+      handleCodexStreamFrame(
+        frame.event,
+        (nextUsage) => {
+          usage = nextUsage;
+        },
+        reportFirstTokenOnce,
+        () => {
+          upstreamCompleted = true;
+        },
+      );
+      controller.enqueue(encoder.encode(frame.frame));
+    }
+  }
+
   return upstreamBody.pipeThrough(
     new TransformStream<Uint8Array, Uint8Array>({
       transform(chunk, controller) {
-        controller.enqueue(chunk);
-        buffer = collectUsageFromSseText(
-          buffer + decoder.decode(chunk, { stream: true }),
-          (nextUsage) => {
-            usage = nextUsage;
-          },
-        );
+        processText(decoder.decode(chunk, { stream: true }), controller);
       },
-      flush() {
+      flush(controller) {
         const tail = decoder.decode();
         if (tail) {
-          buffer = collectUsageFromSseText(buffer + tail, (nextUsage) => {
-            usage = nextUsage;
-          });
+          processText(tail, controller);
         }
-        onCompleted(usage);
+        for (const frame of framer.flush()) {
+          handleCodexStreamFrame(
+            frame.event,
+            (nextUsage) => {
+              usage = nextUsage;
+            },
+            reportFirstTokenOnce,
+            () => {
+              upstreamCompleted = true;
+            },
+          );
+          controller.enqueue(encoder.encode(frame.frame));
+        }
+        if (upstreamCompleted) {
+          reportCompletedOnce();
+          return;
+        }
+        const error = new Error(
+          "Upstream stream ended before response.completed; refusing to mark a truncated Codex stream as successful",
+        );
+        reportErrorOnce(error);
+        controller.enqueue(encoder.encode(codexStreamErrorFrame(error)));
       },
     }),
   );
 }
 
-function collectUsageFromSseText(
-  text: string,
+function handleCodexStreamFrame(
+  event: Record<string, unknown> | null,
   onUsage: (usage: UsageSnapshot) => void,
+  onFirstToken: () => void,
+  onCompleted: () => void,
 ) {
-  const lines = text.split(/\r?\n/);
-  const rest = lines.pop() || "";
-  for (const line of lines) {
-    if (!line.startsWith("data:")) {
-      continue;
-    }
-    const data = line.slice(5).trim();
-    if (!data || data === "[DONE]") {
-      continue;
-    }
-    try {
-      const event = JSON.parse(data) as Record<string, unknown>;
-      if (event.type === "response.completed") {
-        onUsage(extractUsageFromCodexResponse(event.response || event));
-      }
-    } catch {
-      // Ignore non-JSON SSE lines.
-    }
+  if (!event) {
+    return;
   }
-  return rest;
+  if (
+    (event.type === "response.output_text.delta" ||
+      event.type === "response.reasoning_summary_text.delta") &&
+    typeof event.delta === "string" &&
+    event.delta.length > 0
+  ) {
+    onFirstToken();
+  }
+  if (event.type === "response.completed") {
+    onUsage(extractUsageFromCodexResponse(event.response || event));
+    onCompleted();
+  }
+}
+
+function codexStreamErrorFrame(error: unknown) {
+  const payload = {
+    error: {
+      message: publicCodexStreamErrorMessage(error),
+      type: "stream_error",
+      code: "upstream_stream_incomplete",
+    },
+  };
+  return `\nevent: error\ndata: ${JSON.stringify(payload)}\n\n`;
+}
+
+function publicCodexStreamErrorMessage(error: unknown) {
+  if (
+    error instanceof Error &&
+    error.message.includes("Upstream stream ended before response.completed")
+  ) {
+    return "Upstream stream ended before completion";
+  }
+  return "Upstream stream error";
 }
 
 function appendSuccessLog(input: {
@@ -1045,10 +1173,30 @@ async function readJsonObject(request: Request) {
   return parsed as Record<string, unknown>;
 }
 
+function upstreamErrorResponse(status: number) {
+  const safeStatus = status >= 400 && status <= 599 ? status : 502;
+  return Response.json(
+    {
+      error: {
+        code: "upstream_error",
+        message: "Upstream request failed",
+      },
+    },
+    { status: safeStatus },
+  );
+}
+
 function withDefaultContentType(headers: Headers, contentType: string) {
   if (!headers.get("content-type")) {
     headers.set("Content-Type", contentType);
   }
+  return headers;
+}
+
+function withStreamingHeaders(headers: Headers) {
+  headers.set("Cache-Control", "no-cache, no-transform");
+  headers.set("Connection", "keep-alive");
+  headers.set("X-Accel-Buffering", "no");
   return headers;
 }
 

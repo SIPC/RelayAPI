@@ -69,13 +69,123 @@ async function doProxyFetch(
 
   const headers = new Headers();
   response.headers.forEach((value, name) => headers.append(name, value));
-  const body = response.body as BodyInit | null;
+  const body = response.body
+    ? wrapProxyBodyStream(
+        response.body as unknown as NodeReadableBody,
+        proxyKey,
+      )
+    : null;
 
   return new Response(body, {
     status: response.status,
     statusText: response.statusText,
     headers,
   });
+}
+
+type NodeReadableBody = {
+  on(event: "data", listener: (chunk: unknown) => void): NodeReadableBody;
+  once(event: "end" | "close", listener: () => void): NodeReadableBody;
+  once(event: "error", listener: (error: unknown) => void): NodeReadableBody;
+  off?(event: string, listener: (...args: never[]) => void): NodeReadableBody;
+  destroy?(error?: Error): void;
+  resume?(): void;
+};
+
+function wrapProxyBodyStream(
+  body: NodeReadableBody,
+  proxyKey: string,
+): ReadableStream<Uint8Array> {
+  let ended = false;
+  let canceled = false;
+  let cleaned = false;
+  let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
+
+  function cleanup() {
+    if (cleaned) {
+      return;
+    }
+    cleaned = true;
+    body.off?.("data", onData as (...args: never[]) => void);
+    body.off?.("end", onEnd as (...args: never[]) => void);
+    body.off?.("close", onClose as (...args: never[]) => void);
+    body.off?.("error", onError as (...args: never[]) => void);
+  }
+
+  function onData(chunk: unknown) {
+    try {
+      controllerRef?.enqueue(toUint8Array(chunk));
+    } catch {
+      canceled = true;
+      cleanup();
+      body.destroy?.();
+    }
+  }
+
+  function onEnd() {
+    ended = true;
+    cleanup();
+    try {
+      controllerRef?.close();
+    } catch {
+      // The downstream response may already be closed by the client.
+    }
+  }
+
+  function onClose() {
+    if (ended || canceled) {
+      cleanup();
+      return;
+    }
+    const error = new Error(
+      "Proxy response body closed before upstream stream completed",
+    );
+    cleanup();
+    destroyProxyAgent(proxyKey);
+    controllerRef?.error(error);
+  }
+
+  function onError(error: unknown) {
+    cleanup();
+    if (isRetryableProxyError(error)) {
+      destroyProxyAgent(proxyKey);
+    }
+    controllerRef?.error(error);
+  }
+
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controllerRef = controller;
+      body.on("data", onData);
+      body.once("end", onEnd);
+      body.once("close", onClose);
+      body.once("error", onError);
+      body.resume?.();
+    },
+    cancel(reason) {
+      canceled = true;
+      cleanup();
+      body.destroy?.(
+        reason instanceof Error ? reason : new Error("Proxy response canceled"),
+      );
+    },
+  });
+}
+
+function toUint8Array(value: unknown) {
+  if (value instanceof Uint8Array) {
+    return value;
+  }
+  if (value instanceof ArrayBuffer) {
+    return new Uint8Array(value);
+  }
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (typeof value === "string") {
+    return new TextEncoder().encode(value);
+  }
+  return new Uint8Array();
 }
 
 function getProxyAgent(proxyKey: string) {
@@ -86,10 +196,10 @@ function getProxyAgent(proxyKey: string) {
   }
 
   const agent = new SocksProxyAgent(proxyKey, {
-    keepAlive: true,
-    keepAliveMsecs: 15_000,
+    // SOCKS tunnels for long-lived SSE streams are more stable when sockets
+    // are not reused after GOST/NAT/upstream half-closes an idle connection.
+    keepAlive: false,
     maxSockets: 64,
-    maxFreeSockets: 8,
     timeout: 120_000,
   });
   proxyAgents.set(proxyKey, { agent, lastUsedAt: Date.now() });
@@ -133,9 +243,14 @@ function isRetryableProxyError(error: unknown) {
 
   const message = String(current.message || "").toLowerCase();
   if (
+    message.includes("premature close") ||
+    message.includes("premature socket close") ||
+    message.includes("socket hang up") ||
+    message.includes("other side closed") ||
     message.includes("socket") ||
     message.includes("timed out") ||
     message.includes("econnreset") ||
+    message.includes("aborted") ||
     message.includes("network")
   ) {
     return true;

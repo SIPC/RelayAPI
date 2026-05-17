@@ -2,6 +2,7 @@ import "server-only";
 
 import crypto from "node:crypto";
 import { serverConfig } from "@/src/server/config/env";
+import { parseCodexSseFrames } from "@/src/server/codex/sse";
 import { proxiedFetch } from "@/src/server/net/proxy";
 import { ensureFreshCredential } from "@/src/server/services/codexCredentials";
 import { getGlobalProxySetting } from "@/src/server/services/settings";
@@ -17,6 +18,18 @@ const HOP_BY_HOP_HEADERS = new Set([
   "trailer",
   "transfer-encoding",
   "upgrade",
+]);
+
+const SENSITIVE_UPSTREAM_RESPONSE_HEADERS = new Set([
+  "authorization",
+  "chatgpt-account-id",
+  "cookie",
+  "openai-api-key",
+  "session-id",
+  "session_id",
+  "set-cookie",
+  "set-cookie2",
+  "x-api-key",
 ]);
 
 const THINKING_SUFFIX_LEVELS = new Set([
@@ -155,10 +168,8 @@ function buildCodexHeaders(
     "Content-Type": "application/json",
     Authorization: `Bearer ${credential.tokens.access_token}`,
     Accept: input.stream ? "text/event-stream" : "application/json",
-    Connection: "Keep-Alive",
-    "User-Agent":
-      input.sourceHeaders.get("user-agent") || serverConfig.userAgent,
-    Originator: input.sourceHeaders.get("originator") || "codex-tui",
+    "User-Agent": serverConfig.userAgent,
+    Originator: "codex-tui",
   };
   for (const name of [
     "version",
@@ -204,6 +215,7 @@ export function prepareCodexPayloadForUpstream(
     upstreamPayload.service_tier = "priority";
   }
   applyModelThinkingSuffix(upstreamPayload);
+  normalizeRawCodexPayloadForUpstream(upstreamPayload);
   return upstreamPayload;
 }
 
@@ -293,6 +305,9 @@ export function copyUpstreamHeaders(headers: Headers) {
   for (const [name, value] of headers.entries()) {
     const lower = name.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lower)) {
+      continue;
+    }
+    if (SENSITIVE_UPSTREAM_RESPONSE_HEADERS.has(lower)) {
       continue;
     }
     if (lower === "content-length" || lower === "content-encoding") {
@@ -580,16 +595,9 @@ export function parseCodexSseResponse(text: string) {
   const outputItemsByIndex = new Map<number, unknown>();
   const outputItemsFallback: unknown[] = [];
   let completed: Record<string, unknown> | null = null;
-  for (const line of String(text || "").split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("data:")) {
-      continue;
-    }
-    const data = trimmed.slice(5).trim();
-    if (!data || data === "[DONE]") {
-      continue;
-    }
-    const event = parseMaybeJson<Record<string, unknown>>(data);
+
+  for (const frame of parseCodexSseFrames(text)) {
+    const event = frame.event;
     if (!event) {
       continue;
     }
@@ -605,6 +613,7 @@ export function parseCodexSseResponse(text: string) {
       completed = isRecord(event.response) ? event.response : event;
     }
   }
+
   const output = orderedOutputItems(outputItemsByIndex, outputItemsFallback);
   if (!completed) {
     return output.length > 0 ? { object: "response", output } : null;
@@ -847,6 +856,19 @@ function isFastServiceTierPlan(planType: string) {
   );
 }
 
+function normalizeRawCodexPayloadForUpstream(payload: Record<string, unknown>) {
+  if (payload.instructions === undefined || payload.instructions === null) {
+    payload.instructions = "";
+  }
+  delete payload.stream_options;
+  delete payload.prompt_cache_retention;
+  delete payload.safety_identifier;
+  normalizeReasoningForCodex(payload);
+  if (payload.service_tier && payload.service_tier !== "priority") {
+    delete payload.service_tier;
+  }
+}
+
 function stripUnsupportedCodexFields(
   payload: Record<string, unknown>,
   input: { allowStore: boolean },
@@ -868,15 +890,74 @@ function stripUnsupportedCodexFields(
   delete payload.truncation;
   delete payload.prompt_cache_retention;
   delete payload.safety_identifier;
-  if (isRecord(payload.reasoning)) {
-    delete payload.reasoning.summary;
-    if (Object.keys(payload.reasoning).length === 0) {
-      delete payload.reasoning;
-    }
-  }
+  normalizeReasoningForCodex(payload);
   if (payload.service_tier && payload.service_tier !== "priority") {
     delete payload.service_tier;
   }
+}
+
+function normalizeReasoningForCodex(payload: Record<string, unknown>) {
+  if (payload.reasoning === true) {
+    payload.reasoning = { effort: "medium" };
+    return;
+  }
+  if (payload.reasoning === false) {
+    payload.reasoning = { effort: "none" };
+    return;
+  }
+  if (!isRecord(payload.reasoning)) {
+    delete payload.reasoning;
+    return;
+  }
+
+  const reasoning = payload.reasoning;
+  const effort = normalizeReasoningEffort(reasoning.effort);
+  const enabledEffort = reasoningEnabledToEffort(reasoning.enabled);
+  const normalizedEffort = effort || enabledEffort;
+
+  if (normalizedEffort) {
+    payload.reasoning = { effort: normalizedEffort };
+  } else {
+    delete payload.reasoning;
+  }
+}
+
+function normalizeReasoningEffort(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return budgetToCodexEffort(value);
+  }
+  const raw = stringValue(value).toLowerCase();
+  if (!raw) {
+    return "";
+  }
+  if (THINKING_SUFFIX_LEVELS.has(raw)) {
+    return raw;
+  }
+  if (/^\d+$/.test(raw)) {
+    const budget = Number.parseInt(raw, 10);
+    return Number.isFinite(budget) ? budgetToCodexEffort(budget) : "";
+  }
+  return "";
+}
+
+function reasoningEnabledToEffort(value: unknown) {
+  if (value === true) {
+    return "medium";
+  }
+  if (value === false) {
+    return "none";
+  }
+  if (typeof value !== "string") {
+    return "";
+  }
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return "medium";
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return "none";
+  }
+  return "";
 }
 
 function cloneJsonObject(value: unknown): Record<string, unknown> {

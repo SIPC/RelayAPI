@@ -53,7 +53,11 @@ export default async function Home() {
   const apiKeys = listApiKeyPublicRecords();
   const codexCredentials = await listPublicCodexCredentials();
   const channels = listChannelRecords();
-  const requestLogs = queryRequestLogs({ limit: 50, offset: 0 });
+  const requestLogs = queryRequestLogs({
+    limit: 50,
+    offset: 0,
+    skipTotal: true,
+  });
   const overviewStats = getAdminOverviewStats() as AdminOverviewStats;
   const globalSettings = getPublicGlobalSettings();
   const initialNow = new Date().getTime();
@@ -70,10 +74,7 @@ export default async function Home() {
         page: 1,
         offset: requestLogs.offset,
         total: requestLogs.total,
-        totalPages: Math.max(
-          1,
-          Math.ceil(requestLogs.total / requestLogs.limit),
-        ),
+        totalPages: 1,
         summary: {
           errorCount: requestLogs.errorCount,
           totalTokens: requestLogs.totalTokens,

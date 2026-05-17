@@ -29,16 +29,18 @@ export function errorToResponse(error: unknown) {
         error: {
           code: error.code,
           message: error.message,
-          details: error.details,
         },
       },
       { status: error.status },
     );
   }
-  const message =
-    error instanceof Error ? error.message : "Internal Server Error";
   return Response.json(
-    { error: { code: "internal_error", message } },
+    {
+      error: {
+        code: "internal_error",
+        message: "Internal Server Error",
+      },
+    },
     { status: 500 },
   );
 }

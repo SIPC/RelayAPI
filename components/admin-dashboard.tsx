@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { Line, LineChart } from "recharts";
 import { toast } from "sonner";
 import {
   ActivityIcon,
@@ -104,6 +105,7 @@ import {
   listChannels,
   listCredentials,
   logoutWebSession,
+  pruneRequestLogs,
   refreshCredential,
   updateGlobalSettings,
   startCodexOAuth,
@@ -165,6 +167,25 @@ type MetricCardProps = {
   description: string;
   icon: LucideIcon;
   tone?: "default" | "success" | "warning" | "danger";
+};
+
+type TrendDirection = "up" | "down" | "flat";
+type TrendTone = "positive" | "negative" | "neutral";
+
+type TrendPoint = {
+  date: string;
+  value: number;
+};
+
+type TrendMetricCardProps = {
+  title: string;
+  value: string;
+  description: string;
+  changeLabel: string;
+  direction: TrendDirection;
+  tone: TrendTone;
+  data: TrendPoint[];
+  icon: LucideIcon;
 };
 
 type ApiKeyFormState = {
@@ -659,7 +680,7 @@ export function AdminDashboard({
             )}
             {activeSection === "settings" && (
               <SettingsSection
-                key={`${globalSettings.proxySource}:${globalSettings.proxy?.enabled}:${globalSettings.proxy?.type}:${globalSettings.proxy?.host}:${globalSettings.proxy?.port}:${globalSettings.proxy?.username}:${globalSettings.proxy?.passwordSet}:${globalSettings.fullRequestLoggingEnabled}:${globalSettings.updatedAt}`}
+                key={`${globalSettings.proxySource}:${globalSettings.proxy?.enabled}:${globalSettings.proxy?.type}:${globalSettings.proxy?.host}:${globalSettings.proxy?.port}:${globalSettings.proxy?.username}:${globalSettings.proxy?.passwordSet}:${globalSettings.fullRequestLoggingEnabled}:${globalSettings.requestLogRetentionDays}:${globalSettings.requestLogDetailRetentionDays}:${globalSettings.updatedAt}`}
                 settings={globalSettings}
                 onSaved={setGlobalSettings}
               />
@@ -693,6 +714,15 @@ function SettingsSection({
   const [saving, setSaving] = React.useState(false);
   const [clearing, setClearing] = React.useState(false);
   const [loggingSaving, setLoggingSaving] = React.useState(false);
+  const [retentionSaving, setRetentionSaving] = React.useState(false);
+  const [pruning, setPruning] = React.useState(false);
+  const [retentionForm, setRetentionForm] = React.useState(() => ({
+    requestLogRetentionDays: String(settings.requestLogRetentionDays ?? 90),
+    requestLogDetailRetentionDays: String(
+      settings.requestLogDetailRetentionDays ?? 14,
+    ),
+    vacuum: false,
+  }));
   const proxy = settings.proxy;
 
   function patchForm(patch: Partial<CredentialProxyFormState>) {
@@ -796,7 +826,83 @@ function SettingsSection({
     }
   }
 
+  async function saveRetentionSettings() {
+    const requestLogRetentionDays = integerValue(
+      retentionForm.requestLogRetentionDays,
+      settings.requestLogRetentionDays ?? 90,
+    );
+    const requestLogDetailRetentionDays = integerValue(
+      retentionForm.requestLogDetailRetentionDays,
+      settings.requestLogDetailRetentionDays ?? 14,
+    );
+    if (!isValidRetentionDays(requestLogRetentionDays)) {
+      toast.error("概要日志保留天数必须在 1 到 3650 之间");
+      return;
+    }
+    if (!isValidRetentionDays(requestLogDetailRetentionDays)) {
+      toast.error("详细日志保留天数必须在 1 到 3650 之间");
+      return;
+    }
+
+    setRetentionSaving(true);
+    try {
+      const updated = await updateGlobalSettings({
+        requestLogRetentionDays,
+        requestLogDetailRetentionDays,
+      });
+      onSaved(updated);
+      setRetentionForm((current) => ({
+        ...current,
+        requestLogRetentionDays: String(updated.requestLogRetentionDays ?? 90),
+        requestLogDetailRetentionDays: String(
+          updated.requestLogDetailRetentionDays ?? 14,
+        ),
+      }));
+      toast.success("日志保留策略已保存");
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setRetentionSaving(false);
+    }
+  }
+
+  async function pruneLogsNow() {
+    const summaryRetentionDays = integerValue(
+      retentionForm.requestLogRetentionDays,
+      settings.requestLogRetentionDays ?? 90,
+    );
+    const detailRetentionDays = integerValue(
+      retentionForm.requestLogDetailRetentionDays,
+      settings.requestLogDetailRetentionDays ?? 14,
+    );
+    if (!isValidRetentionDays(summaryRetentionDays)) {
+      toast.error("概要日志保留天数必须在 1 到 3650 之间");
+      return;
+    }
+    if (!isValidRetentionDays(detailRetentionDays)) {
+      toast.error("详细日志保留天数必须在 1 到 3650 之间");
+      return;
+    }
+
+    setPruning(true);
+    try {
+      const result = await pruneRequestLogs({
+        summaryRetentionDays,
+        detailRetentionDays,
+        vacuum: retentionForm.vacuum,
+      });
+      toast.success(
+        `日志清理完成：概要 ${formatNumber(result.deletedRequestLogs)} 条，详情 ${formatNumber(result.deletedRequestLogDetails)} 条`,
+      );
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setPruning(false);
+    }
+  }
+
   const pending = saving || clearing;
+  const retentionPending = retentionSaving || pruning;
 
   return (
     <div className="grid gap-6">
@@ -835,6 +941,96 @@ function SettingsSection({
                   void updateFullRequestLogging(Boolean(checked))
                 }
               />
+            </div>
+          </div>
+
+          <div className="grid gap-3 rounded-lg border border-border/60 bg-muted/25 p-3 text-sm">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+              <div className="space-y-1">
+                <div className="font-medium">日志保留与清理</div>
+                <div className="text-xs text-muted-foreground">
+                  概要日志会影响总览统计；详细日志包含请求/响应体，建议保留更短时间。
+                  清理只删除早于保留天数的数据。
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-2 lg:justify-end">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={retentionPending}
+                  onClick={saveRetentionSettings}
+                >
+                  {retentionSaving && <Spinner data-icon="inline-start" />}
+                  保存策略
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="destructive"
+                  disabled={retentionPending}
+                  onClick={pruneLogsNow}
+                >
+                  {pruning && <Spinner data-icon="inline-start" />}
+                  立即清理
+                </Button>
+              </div>
+            </div>
+
+            <div className="grid gap-2 sm:grid-cols-2">
+              <label className="grid gap-1 text-xs text-muted-foreground">
+                概要日志保留天数
+                <Input
+                  disabled={retentionPending}
+                  inputMode="numeric"
+                  value={retentionForm.requestLogRetentionDays}
+                  onChange={(event) =>
+                    setRetentionForm((current) => ({
+                      ...current,
+                      requestLogRetentionDays: event.target.value,
+                    }))
+                  }
+                />
+              </label>
+              <label className="grid gap-1 text-xs text-muted-foreground">
+                详细日志保留天数
+                <Input
+                  disabled={retentionPending}
+                  inputMode="numeric"
+                  value={retentionForm.requestLogDetailRetentionDays}
+                  onChange={(event) =>
+                    setRetentionForm((current) => ({
+                      ...current,
+                      requestLogDetailRetentionDays: event.target.value,
+                    }))
+                  }
+                />
+              </label>
+            </div>
+
+            <label className="flex items-start gap-2 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                className="mt-0.5 size-4 accent-primary"
+                checked={retentionForm.vacuum}
+                disabled={retentionPending}
+                onChange={(event) =>
+                  setRetentionForm((current) => ({
+                    ...current,
+                    vacuum: event.target.checked,
+                  }))
+                }
+              />
+              <span>
+                清理后执行 VACUUM
+                释放磁盘空间。大日志库可能耗时较久，期间会阻塞日志库写入。
+              </span>
+            </label>
+
+            <div className="text-xs text-muted-foreground">
+              当前策略：概要{" "}
+              {formatNumber(settings.requestLogRetentionDays ?? 90)} 天 · 详细{" "}
+              {formatNumber(settings.requestLogDetailRetentionDays ?? 14)} 天
             </div>
           </div>
 
@@ -989,8 +1185,7 @@ function OverviewSection({
   onRefresh: () => Promise<AdminOverviewStats>;
 }) {
   const [refreshing, setRefreshing] = React.useState(false);
-  const { totals } = overviewStats;
-  const successRate = ratio(totals.successCount, totals.requestCount);
+  const trendMetrics = buildOverviewTrendMetrics(overviewStats.byDay);
   const topModels = overviewStats.byModel.slice(0, 5);
   const topApiKeys = overviewStats.byApiKey.slice(0, 5);
   const recentDays = overviewStats.byDay.slice(0, 7);
@@ -1031,34 +1226,9 @@ function OverviewSection({
         </Button>
       </div>
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <MetricCard
-          title="总请求数"
-          value={formatNumber(totals.requestCount)}
-          description={`${formatNumber(totals.streamCount)} 个流式 · ${formatNumber(totals.errorCount)} 个错误`}
-          icon={ActivityIcon}
-          tone={totals.errorCount > 0 ? "warning" : "default"}
-        />
-        <MetricCard
-          title="成功率"
-          value={formatPercent(successRate)}
-          description={`${formatNumber(totals.successCount)} 成功 / ${formatNumber(totals.requestCount)} 总计`}
-          icon={ShieldCheckIcon}
-          tone={
-            successRate === null || successRate >= 95 ? "success" : "warning"
-          }
-        />
-        <MetricCard
-          title="Token 总量"
-          value={formatNumber(totals.totalTokens)}
-          description={`${formatNumber(totals.promptTokens)} 输入 · ${formatNumber(totals.completionTokens)} 输出`}
-          icon={DatabaseIcon}
-        />
-        <MetricCard
-          title="延迟"
-          value={formatDuration(totals.avgLatencyMs)}
-          description={`p95 ${formatDuration(totals.p95LatencyMs)} · ${formatNumber(Math.round(totals.tokensPerSecond))} token/秒`}
-          icon={Clock3Icon}
-        />
+        {trendMetrics.map((metric) => (
+          <TrendMetricCard key={metric.title} {...metric} />
+        ))}
       </div>
 
       <div className="grid gap-4 md:grid-cols-3">
@@ -1299,11 +1469,11 @@ function TokenCell({
 }) {
   return (
     <div>
-      <div className="font-medium">{formatNumber(row.totalTokens)}</div>
+      <div className="font-medium">{formatTokenNumber(row.totalTokens)}</div>
       <div className="text-xs text-muted-foreground">
-        P {formatNumber(row.promptTokens)} · C{" "}
-        {formatNumber(row.completionTokens)} · 平均{" "}
-        {formatNumber(Math.round(row.avgTokensPerRequest))}
+        P {formatTokenNumber(row.promptTokens)} · C{" "}
+        {formatTokenNumber(row.completionTokens)} · 平均{" "}
+        {formatTokenNumber(Math.round(row.avgTokensPerRequest))}
       </div>
     </div>
   );
@@ -1317,9 +1487,9 @@ function LimitCell({ row }: { row: ApiKeyUsageStatsRow }) {
   return (
     <div className="min-w-32 space-y-1">
       <div className="flex items-center justify-between gap-3 text-xs">
-        <span>{formatNumber(row.todayTokens)}</span>
+        <span>{formatTokenNumber(row.todayTokens)}</span>
         <span className="text-muted-foreground">
-          每日 {formatNumber(row.tokenLimitDaily)}
+          每日 {formatTokenNumber(row.tokenLimitDaily)}
         </span>
       </div>
       <Progress value={clamp(row.tokenLimitUtilization || 0, 0, 100)} />
@@ -1337,7 +1507,7 @@ function LatencyCell({
       <div className="font-medium">{formatDuration(row.avgLatencyMs)}</div>
       <div className="text-xs text-muted-foreground">
         p95 {formatDuration(row.p95LatencyMs)} ·{" "}
-        {formatNumber(Math.round(row.tokensPerSecond))} token/秒
+        {formatTokenNumber(Math.round(row.tokensPerSecond))} token/秒
       </div>
     </div>
   );
@@ -1467,7 +1637,7 @@ function ApiKeysSection({
                     <TableCell>
                       {apiKey.tokenLimitDaily === null
                         ? "不限制"
-                        : formatNumber(apiKey.tokenLimitDaily)}
+                        : formatTokenNumber(apiKey.tokenLimitDaily)}
                     </TableCell>
                     <TableCell>
                       {formatNullableDate(apiKey.lastUsedAt)}
@@ -4125,7 +4295,7 @@ function LogsSection({
         />
         <MetricCard
           title="匹配 Token"
-          value={formatNumber(logsPage.summary.totalTokens)}
+          value={formatTokenNumber(logsPage.summary.totalTokens)}
           description={`平均延迟 ${formatDuration(logsPage.summary.avgLatencyMs)}`}
           icon={DatabaseIcon}
         />
@@ -4279,11 +4449,11 @@ function LogsSection({
                       </TableCell>
                       <TableCell>
                         <div className="font-medium">
-                          {formatNumber(log.total_tokens)}
+                          {formatTokenNumber(log.total_tokens)}
                         </div>
                         <div className="text-xs text-muted-foreground">
-                          输入 {formatNumber(log.prompt_tokens)} / 输出{" "}
-                          {formatNumber(log.completion_tokens)}
+                          输入 {formatTokenNumber(log.prompt_tokens)} / 输出{" "}
+                          {formatTokenNumber(log.completion_tokens)}
                         </div>
                       </TableCell>
                       <TableCell>
@@ -4624,6 +4794,238 @@ function formatDetailValue(value: unknown) {
   }
 }
 
+const OVERVIEW_TREND_DAYS = 7;
+
+type DailyUsageRow = AdminOverviewStats["byDay"][number];
+
+function buildOverviewTrendMetrics(
+  rows: AdminOverviewStats["byDay"],
+): TrendMetricCardProps[] {
+  const days = usageDateWindow(rows, OVERVIEW_TREND_DAYS);
+  const today = days[days.length - 1] ?? emptyDailyUsageRow(todayDateKey());
+  const yesterday =
+    days[days.length - 2] ?? emptyDailyUsageRow(addUtcDays(today.date, -1));
+  const requestChange = percentChange(
+    today.requestCount,
+    yesterday.requestCount,
+  );
+  const tokenChange = percentChange(today.totalTokens, yesterday.totalTokens);
+  const latencyChange = percentChange(
+    today.avgFirstTokenLatencyMs,
+    yesterday.avgFirstTokenLatencyMs,
+  );
+  const todaySuccessRate = dailySuccessRate(today);
+  const yesterdaySuccessRate = dailySuccessRate(yesterday);
+  const successPointChange = todaySuccessRate - yesterdaySuccessRate;
+  const successDirection = directionFromDelta(successPointChange);
+
+  return [
+    {
+      title: "今日请求数",
+      value: formatCompactNumber(today.requestCount),
+      description: `${formatNumber(today.streamCount)} 个流式 · ${formatNumber(today.errorCount)} 个错误`,
+      changeLabel: formatChangePercent(requestChange.value),
+      direction: requestChange.direction,
+      tone: directionTone(requestChange.direction),
+      data: days.map((row) => ({ date: row.date, value: row.requestCount })),
+      icon: ActivityIcon,
+    },
+    {
+      title: "今日成功率",
+      value: formatPercent(todaySuccessRate),
+      description: `${formatNumber(today.successCount)} 成功 / ${formatNumber(today.requestCount)} 总计`,
+      changeLabel: formatPointChange(successPointChange),
+      direction: successDirection,
+      tone: directionTone(successDirection),
+      data: days.map((row) => ({
+        date: row.date,
+        value: dailySuccessRate(row),
+      })),
+      icon: ShieldCheckIcon,
+    },
+    {
+      title: "今日 Token",
+      value: formatTokenNumber(today.totalTokens),
+      description: `输入 ${formatTokenNumber(today.promptTokens)} · 输出 ${formatTokenNumber(today.completionTokens)}`,
+      changeLabel: formatChangePercent(tokenChange.value),
+      direction: tokenChange.direction,
+      tone: directionTone(tokenChange.direction),
+      data: days.map((row) => ({ date: row.date, value: row.totalTokens })),
+      icon: DatabaseIcon,
+    },
+    {
+      title: "今日首字延迟",
+      value: formatDuration(today.avgFirstTokenLatencyMs),
+      description: `p95 ${formatDuration(today.p95FirstTokenLatencyMs)} · ${formatTokenNumber(Math.round(today.tokensPerSecond))} token/秒`,
+      changeLabel: formatChangePercent(latencyChange.value),
+      direction: latencyChange.direction,
+      tone: directionTone(latencyChange.direction, { lowerIsBetter: true }),
+      data: days.map((row) => ({
+        date: row.date,
+        value: row.avgFirstTokenLatencyMs,
+      })),
+      icon: Clock3Icon,
+    },
+  ];
+}
+
+function usageDateWindow(rows: AdminOverviewStats["byDay"], days: number) {
+  const byDate = new Map(rows.map((row) => [row.date, row]));
+  const today = todayDateKey();
+  return Array.from({ length: days }, (_, index) => {
+    const date = addUtcDays(today, index - days + 1);
+    return byDate.get(date) ?? emptyDailyUsageRow(date);
+  });
+}
+
+function emptyDailyUsageRow(date: string): DailyUsageRow {
+  return {
+    date,
+    requestCount: 0,
+    successCount: 0,
+    errorCount: 0,
+    streamCount: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    avgLatencyMs: 0,
+    p95LatencyMs: 0,
+    avgFirstTokenLatencyMs: 0,
+    p95FirstTokenLatencyMs: 0,
+    avgTokensPerRequest: 0,
+    tokensPerSecond: 0,
+  };
+}
+
+function todayDateKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function addUtcDays(dateKey: string, deltaDays: number) {
+  const date = new Date(`${dateKey}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + deltaDays);
+  return date.toISOString().slice(0, 10);
+}
+
+function dailySuccessRate(row: DailyUsageRow) {
+  return ratio(row.successCount, row.requestCount) ?? 0;
+}
+
+function percentChange(current: number, previous: number) {
+  if (!Number.isFinite(current) || !Number.isFinite(previous)) {
+    return { value: 0, direction: "flat" as const };
+  }
+  if (previous === 0) {
+    return {
+      value: current > 0 ? 100 : 0,
+      direction: current > 0 ? ("up" as const) : ("flat" as const),
+    };
+  }
+  const value = ((current - previous) / Math.abs(previous)) * 100;
+  return { value, direction: directionFromDelta(value) };
+}
+
+function directionFromDelta(value: number): TrendDirection {
+  if (!Number.isFinite(value) || Math.abs(value) < 0.05) {
+    return "flat";
+  }
+  return value > 0 ? "up" : "down";
+}
+
+function directionTone(
+  direction: TrendDirection,
+  options: { lowerIsBetter?: boolean } = {},
+): TrendTone {
+  if (direction === "flat") {
+    return "neutral";
+  }
+  if (options.lowerIsBetter) {
+    return direction === "down" ? "positive" : "negative";
+  }
+  return direction === "up" ? "positive" : "negative";
+}
+
+function formatChangePercent(value: number) {
+  if (!Number.isFinite(value)) {
+    return "0.0%";
+  }
+  return `${Math.abs(value).toFixed(1)}%`;
+}
+
+function formatPointChange(value: number) {
+  if (!Number.isFinite(value)) {
+    return "0.0pct";
+  }
+  return `${Math.abs(value).toFixed(1)}pct`;
+}
+
+function TrendMetricCard({
+  title,
+  value,
+  description,
+  changeLabel,
+  direction,
+  tone,
+  data,
+  icon: Icon,
+}: TrendMetricCardProps) {
+  const directionIcon =
+    direction === "up" ? "↑" : direction === "down" ? "↓" : "→";
+  const toneClasses: Record<TrendTone, string> = {
+    positive: "text-emerald-600 dark:text-emerald-400",
+    negative: "text-destructive",
+    neutral: "text-muted-foreground",
+  };
+
+  return (
+    <Card className="gap-1 overflow-hidden py-3">
+      <CardHeader className="pb-0">
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0 space-y-1">
+            <CardDescription className="flex items-center gap-1.5 text-sm">
+              <Icon className="size-3.5" />
+              {title}
+            </CardDescription>
+            <CardTitle className="text-3xl leading-none font-semibold tracking-tight tabular-nums sm:text-4xl">
+              {value}
+            </CardTitle>
+            <p className="truncate text-xs text-muted-foreground">
+              {description}
+            </p>
+          </div>
+          <div
+            className={`shrink-0 text-sm font-semibold tabular-nums ${toneClasses[tone]}`}
+          >
+            {directionIcon} {changeLabel}
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="pt-0">
+        <div className={`h-10 w-full min-w-0 ${toneClasses[tone]}`}>
+          <LineChart
+            accessibilityLayer
+            width={320}
+            height={40}
+            data={data}
+            margin={{ top: 6, right: 4, bottom: 2, left: 4 }}
+            className="h-10 w-full"
+          >
+            <Line
+              type="monotone"
+              dataKey="value"
+              stroke="currentColor"
+              strokeWidth={2.2}
+              dot={false}
+              activeDot={false}
+              isAnimationActive={false}
+            />
+          </LineChart>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 function MetricCard({
   title,
   value,
@@ -4750,7 +5152,7 @@ function UsageListRow({
           </div>
         </div>
         <div className="text-right text-sm font-medium tabular-nums">
-          {formatNumber(row.totalTokens)}
+          {formatTokenNumber(row.totalTokens)}
           <div className="text-xs font-normal text-muted-foreground">
             tokens
           </div>
@@ -4794,7 +5196,7 @@ function DailyUsageCard({ rows }: { rows: AdminOverviewStats["byDay"] }) {
                       </div>
                     </div>
                     <div className="text-sm font-medium tabular-nums">
-                      {formatNumber(row.totalTokens)}
+                      {formatTokenNumber(row.totalTokens)}
                     </div>
                   </div>
                   <Progress value={clamp(progressValue, 0, 100)} />
@@ -5074,6 +5476,10 @@ function integerValue(value: string, fallback: number) {
   return Number.isFinite(parsed) ? Math.floor(parsed) : fallback;
 }
 
+function isValidRetentionDays(value: number) {
+  return Number.isFinite(value) && value >= 1 && value <= 3650;
+}
+
 function localDateTimeToIso(value: string) {
   if (!value.trim()) {
     return null;
@@ -5301,6 +5707,42 @@ function formatNumber(value: number) {
   }
   return new Intl.NumberFormat("zh-CN", {
     maximumFractionDigits: 0,
+  }).format(value);
+}
+
+function formatCompactNumber(value: number) {
+  if (!Number.isFinite(value)) {
+    return "0";
+  }
+  return new Intl.NumberFormat("zh-CN", {
+    maximumFractionDigits: value >= 1000 ? 1 : 0,
+    notation: "compact",
+  }).format(value);
+}
+
+function formatTokenNumber(value: number) {
+  if (!Number.isFinite(value)) {
+    return "0";
+  }
+  const absValue = Math.abs(value);
+  if (absValue >= 1_000_000_000) {
+    return `${formatScaledNumber(value / 1_000_000_000)}B`;
+  }
+  if (absValue >= 1_000_000) {
+    return `${formatScaledNumber(value / 1_000_000)}M`;
+  }
+  if (absValue >= 1_000) {
+    return `${formatScaledNumber(value / 1_000)}K`;
+  }
+  return formatNumber(value);
+}
+
+function formatScaledNumber(value: number) {
+  const absValue = Math.abs(value);
+  const maximumFractionDigits = absValue >= 100 ? 0 : absValue >= 10 ? 1 : 2;
+  return new Intl.NumberFormat("en-US", {
+    maximumFractionDigits,
+    minimumFractionDigits: 0,
   }).format(value);
 }
 

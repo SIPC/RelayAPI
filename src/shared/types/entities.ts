@@ -123,6 +123,8 @@ export interface GlobalSettingsRecord {
   proxy: PublicCredentialProxyConfig | null;
   proxySource: "database" | "environment" | "none";
   fullRequestLoggingEnabled: boolean;
+  requestLogRetentionDays: number | null;
+  requestLogDetailRetentionDays: number | null;
   updatedAt: string | null;
 }
 
@@ -190,6 +192,8 @@ export interface UsageStatsRow {
   totalTokens: number;
   avgLatencyMs: number;
   p95LatencyMs: number;
+  avgFirstTokenLatencyMs: number;
+  p95FirstTokenLatencyMs: number;
   avgTokensPerRequest: number;
   tokensPerSecond: number;
   firstRequestAt: string | null;
@@ -224,6 +228,8 @@ export interface DailyUsageStatsRow {
   totalTokens: number;
   avgLatencyMs: number;
   p95LatencyMs: number;
+  avgFirstTokenLatencyMs: number;
+  p95FirstTokenLatencyMs: number;
   avgTokensPerRequest: number;
   tokensPerSecond: number;
 }
@@ -238,6 +244,8 @@ export interface AdminOverviewTotals {
   totalTokens: number;
   avgLatencyMs: number;
   p95LatencyMs: number;
+  avgFirstTokenLatencyMs: number;
+  p95FirstTokenLatencyMs: number;
   avgTokensPerRequest: number;
   tokensPerSecond: number;
   distinctApiKeyCount: number;

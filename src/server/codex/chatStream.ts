@@ -35,8 +35,10 @@ interface ChatStreamState {
   lastToolCall: ToolCallStreamState | null;
   hasEmittedToolCall: boolean;
   upstreamCompleted: boolean;
+  firstTokenReported: boolean;
   done: boolean;
   usage: UsageSnapshot;
+  onFirstToken?: () => void;
 }
 
 export function createOpenAIChatSseStream(
@@ -44,6 +46,7 @@ export function createOpenAIChatSseStream(
   input: {
     fallbackModel: string;
     toolNameMaps: ToolNameMaps | null;
+    onFirstToken?: () => void;
     onCompleted?: (usage: UsageSnapshot) => void;
     onError?: (error: unknown, usage: UsageSnapshot) => void;
   },
@@ -61,8 +64,10 @@ export function createOpenAIChatSseStream(
     lastToolCall: null,
     hasEmittedToolCall: false,
     upstreamCompleted: false,
+    firstTokenReported: false,
     done: false,
     usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    onFirstToken: input.onFirstToken,
   };
   let buffer = "";
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -114,6 +119,10 @@ export function createOpenAIChatSseStream(
               encoder,
               state,
             );
+          }
+
+          if (canceled) {
+            return;
           }
 
           const tail = decoder.decode();
@@ -251,6 +260,7 @@ function handleCodexEventAsOpenAIChat(
     }
     case "response.reasoning_summary_text.delta":
       if (typeof event.delta === "string") {
+        reportFirstTokenOnce(state);
         writeOpenAIChatChunk(controller, encoder, state, {
           role: "assistant",
           reasoning_content: event.delta,
@@ -265,6 +275,7 @@ function handleCodexEventAsOpenAIChat(
       return;
     case "response.output_text.delta":
       if (typeof event.delta === "string") {
+        reportFirstTokenOnce(state);
         writeOpenAIChatChunk(controller, encoder, state, {
           role: "assistant",
           content: event.delta,
@@ -341,6 +352,14 @@ function handleCodexEventAsOpenAIChat(
     default:
       return;
   }
+}
+
+function reportFirstTokenOnce(state: ChatStreamState) {
+  if (state.firstTokenReported) {
+    return;
+  }
+  state.firstTokenReported = true;
+  state.onFirstToken?.();
 }
 
 function upsertToolCallFromCodexEvent(
@@ -622,10 +641,9 @@ function writeOpenAIChatStreamError(
   encoder: TextEncoder,
   error: unknown,
 ) {
-  const message = error instanceof Error ? error.message : String(error);
   const payload = {
     error: {
-      message,
+      message: publicStreamErrorMessage(error),
       type: "stream_error",
       code: "upstream_stream_incomplete",
     },
@@ -635,6 +653,16 @@ function writeOpenAIChatStreamError(
     encoder.encode(`data: ${JSON.stringify(payload)}\n\n`),
   );
   safeEnqueue(controller, encoder.encode("data: [DONE]\n\n"));
+}
+
+function publicStreamErrorMessage(error: unknown) {
+  if (
+    error instanceof Error &&
+    error.message.includes("Upstream stream ended before response.completed")
+  ) {
+    return "Upstream stream ended before completion";
+  }
+  return "Upstream stream error";
 }
 
 function writeOpenAIChatDone(

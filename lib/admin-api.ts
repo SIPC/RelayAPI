@@ -197,6 +197,19 @@ export type CodexQuotaReport = {
   raw?: unknown;
 };
 
+export type PruneRequestLogsResponse = {
+  summaryRetentionDays: number;
+  detailRetentionDays: number;
+  summaryCutoff: string;
+  detailCutoff: string;
+  deletedRequestLogDetails: number;
+  deletedRequestLogs: number;
+  deletedUsageRecords: number;
+  deletedUsageDailyBuckets: number;
+  deletedChannelHealthEvents: number;
+  vacuumed: boolean;
+};
+
 export type AdminDashboardSnapshot = {
   apiKeys: PublicApiKey[];
   channels: ChannelRecord[];
@@ -393,6 +406,8 @@ export function getGlobalSettings() {
 export function updateGlobalSettings(payload: {
   proxy?: CredentialProxyPayload;
   fullRequestLoggingEnabled?: boolean;
+  requestLogRetentionDays?: number;
+  requestLogDetailRetentionDays?: number;
 }) {
   return adminRequest<GlobalSettingsRecord>("/api/admin/settings", {
     method: "PATCH",
@@ -403,6 +418,20 @@ export function updateGlobalSettings(payload: {
 export function getRequestLogDetail(id: string) {
   return adminRequest<RequestLogDetail>(
     `/api/admin/request-logs/${encodePath(id)}`,
+  );
+}
+
+export function pruneRequestLogs(payload: {
+  summaryRetentionDays: number;
+  detailRetentionDays: number;
+  vacuum?: boolean;
+}) {
+  return adminRequest<PruneRequestLogsResponse>(
+    "/api/admin/request-logs/prune",
+    {
+      method: "POST",
+      body: payload,
+    },
   );
 }
 

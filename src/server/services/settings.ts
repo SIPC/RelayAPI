@@ -18,6 +18,14 @@ import type {
 
 const GLOBAL_PROXY_SETTING_KEY = "global_proxy";
 const FULL_REQUEST_LOGGING_SETTING_KEY = "full_request_logging";
+const REQUEST_LOG_RETENTION_DAYS_SETTING_KEY = "request_log_retention_days";
+const REQUEST_LOG_DETAIL_RETENTION_DAYS_SETTING_KEY =
+  "request_log_detail_retention_days";
+
+const DEFAULT_REQUEST_LOG_RETENTION_DAYS = 90;
+const DEFAULT_REQUEST_LOG_DETAIL_RETENTION_DAYS = 14;
+const MIN_RETENTION_DAYS = 1;
+const MAX_RETENTION_DAYS = 3650;
 
 export function getGlobalProxySetting(): CredentialProxyConfig | null {
   const stored = readStoredGlobalProxy();
@@ -27,15 +35,20 @@ export function getGlobalProxySetting(): CredentialProxyConfig | null {
 export function getPublicGlobalSettings(): GlobalSettingsRecord {
   const stored = readStoredGlobalProxy();
   const fullRequestLoggingEnabled = getFullRequestLoggingSetting();
+  const retentionSettings = getRequestLogRetentionSettings();
+  const updatedAt = latestUpdatedAt(
+    getSettingUpdatedAt(GLOBAL_PROXY_SETTING_KEY),
+    getSettingUpdatedAt(FULL_REQUEST_LOGGING_SETTING_KEY),
+    getSettingUpdatedAt(REQUEST_LOG_RETENTION_DAYS_SETTING_KEY),
+    getSettingUpdatedAt(REQUEST_LOG_DETAIL_RETENTION_DAYS_SETTING_KEY),
+  );
   if (stored) {
     return {
       proxy: publicProxy(stored),
       proxySource: "database",
       fullRequestLoggingEnabled,
-      updatedAt: latestUpdatedAt(
-        getSettingUpdatedAt(GLOBAL_PROXY_SETTING_KEY),
-        getSettingUpdatedAt(FULL_REQUEST_LOGGING_SETTING_KEY),
-      ),
+      ...retentionSettings,
+      updatedAt,
     };
   }
   if (serverConfig.globalProxy) {
@@ -43,20 +56,24 @@ export function getPublicGlobalSettings(): GlobalSettingsRecord {
       proxy: publicProxy(serverConfig.globalProxy),
       proxySource: "environment",
       fullRequestLoggingEnabled,
-      updatedAt: getSettingUpdatedAt(FULL_REQUEST_LOGGING_SETTING_KEY),
+      ...retentionSettings,
+      updatedAt,
     };
   }
   return {
     proxy: null,
     proxySource: "none",
     fullRequestLoggingEnabled,
-    updatedAt: getSettingUpdatedAt(FULL_REQUEST_LOGGING_SETTING_KEY),
+    ...retentionSettings,
+    updatedAt,
   };
 }
 
 export function patchGlobalSettings(input: {
   proxy?: unknown;
   fullRequestLoggingEnabled?: unknown;
+  requestLogRetentionDays?: unknown;
+  requestLogDetailRetentionDays?: unknown;
 }) {
   if (Object.hasOwn(input, "proxy")) {
     const proxy = normalizeProxyInput(input.proxy, readStoredGlobalProxy());
@@ -72,11 +89,64 @@ export function patchGlobalSettings(input: {
       input.fullRequestLoggingEnabled ? "1" : "0",
     );
   }
+  if (Object.hasOwn(input, "requestLogRetentionDays")) {
+    upsertSettingValue(
+      REQUEST_LOG_RETENTION_DAYS_SETTING_KEY,
+      String(normalizeRetentionDays(input.requestLogRetentionDays)),
+    );
+  }
+  if (Object.hasOwn(input, "requestLogDetailRetentionDays")) {
+    upsertSettingValue(
+      REQUEST_LOG_DETAIL_RETENTION_DAYS_SETTING_KEY,
+      String(normalizeRetentionDays(input.requestLogDetailRetentionDays)),
+    );
+  }
   return getPublicGlobalSettings();
 }
 
 export function getFullRequestLoggingSetting() {
   return getSettingValue(FULL_REQUEST_LOGGING_SETTING_KEY) === "1";
+}
+
+export function getRequestLogRetentionSettings() {
+  return {
+    requestLogRetentionDays: readRetentionDays(
+      REQUEST_LOG_RETENTION_DAYS_SETTING_KEY,
+      DEFAULT_REQUEST_LOG_RETENTION_DAYS,
+    ),
+    requestLogDetailRetentionDays: readRetentionDays(
+      REQUEST_LOG_DETAIL_RETENTION_DAYS_SETTING_KEY,
+      DEFAULT_REQUEST_LOG_DETAIL_RETENTION_DAYS,
+    ),
+  };
+}
+
+function readRetentionDays(key: string, fallback: number) {
+  const value = getSettingValue(key);
+  if (value === undefined) {
+    return fallback;
+  }
+  return normalizeRetentionDays(value);
+}
+
+function normalizeRetentionDays(value: unknown) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw new HttpError(
+      400,
+      "invalid_log_retention_days",
+      "Log retention days must be a finite number",
+    );
+  }
+  const days = Math.floor(parsed);
+  if (days < MIN_RETENTION_DAYS || days > MAX_RETENTION_DAYS) {
+    throw new HttpError(
+      400,
+      "invalid_log_retention_days",
+      `Log retention days must be between ${MIN_RETENTION_DAYS} and ${MAX_RETENTION_DAYS}`,
+    );
+  }
+  return days;
 }
 
 function readStoredGlobalProxy() {

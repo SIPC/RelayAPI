@@ -40,7 +40,12 @@ export function listChannels(): ChannelRecord[] {
   const rows = getMainDb()
     .prepare("SELECT * FROM channels ORDER BY priority DESC, created_at ASC")
     .all() as ChannelRow[];
-  return rows.map((row: ChannelRow) => toChannelRecord(row));
+  const credentialIdsByChannelId = channelCredentialIdsByChannelId(
+    rows.map((row) => row.id),
+  );
+  return rows.map((row: ChannelRow) =>
+    toChannelRecord(row, credentialIdsByChannelId.get(row.id)),
+  );
 }
 
 export function getChannelById(id: string): ChannelRecord | null {
@@ -189,16 +194,38 @@ export function getChannelCredentialIds(
   channelId: string,
   fallbackCredentialId?: string,
 ) {
+  const ids = channelCredentialIdsByChannelId([channelId]).get(channelId) || [];
+  return ids.length > 0 || !fallbackCredentialId ? ids : [fallbackCredentialId];
+}
+
+function channelCredentialIdsByChannelId(channelIds: string[]) {
+  const uniqueIds = [...new Set(channelIds.filter(Boolean))];
+  const result = new Map<string, string[]>();
+  for (const channelId of uniqueIds) {
+    result.set(channelId, []);
+  }
+  if (uniqueIds.length === 0) {
+    return result;
+  }
+
+  const placeholders = uniqueIds.map(() => "?").join(", ");
   const rows = getMainDb()
     .prepare(
-      `SELECT credential_id
+      `SELECT channel_id, credential_id
        FROM channel_credentials
-       WHERE channel_id = ?
-       ORDER BY created_at ASC, credential_id ASC`,
+       WHERE channel_id IN (${placeholders})
+       ORDER BY channel_id ASC, created_at ASC, credential_id ASC`,
     )
-    .all(channelId) as Array<{ credential_id: string }>;
-  const ids = rows.map((row) => row.credential_id).filter(Boolean);
-  return ids.length > 0 || !fallbackCredentialId ? ids : [fallbackCredentialId];
+    .all(...uniqueIds) as Array<{ channel_id: string; credential_id: string }>;
+  for (const row of rows) {
+    if (!row.credential_id) {
+      continue;
+    }
+    const ids = result.get(row.channel_id) || [];
+    ids.push(row.credential_id);
+    result.set(row.channel_id, ids);
+  }
+  return result;
 }
 
 export function setChannelCredentialIds(
@@ -221,14 +248,20 @@ export function setChannelCredentialIds(
   }
 }
 
-function toChannelRecord(row: ChannelRow): ChannelRecord {
+function toChannelRecord(
+  row: ChannelRow,
+  credentialIds = getChannelCredentialIds(row.id, row.credential_id),
+): ChannelRecord {
   return {
     id: row.id,
     name: row.name,
     provider: "codex",
     baseUrl: row.base_url,
     credentialId: row.credential_id,
-    credentialIds: getChannelCredentialIds(row.id, row.credential_id),
+    credentialIds:
+      credentialIds.length > 0
+        ? credentialIds
+        : [row.credential_id].filter(Boolean),
     enabled: row.enabled === 1,
     priority: row.priority,
     weight: row.weight,

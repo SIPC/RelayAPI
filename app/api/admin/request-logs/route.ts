@@ -1,4 +1,6 @@
 import { errorToResponse } from "@/src/server/http/errors";
+import { pruneRequestLogs } from "@/src/server/repositories/logs";
+import { getRequestLogRetentionSettings } from "@/src/server/services/settings";
 import {
   queryRequestLogs,
   type RequestLogStatusFilter,
@@ -10,12 +12,16 @@ export const dynamic = "force-dynamic";
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
+const AUTO_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+let lastAutoPruneAttemptAt = 0;
 
 // Web admin routes require the startup Web access key session.
 // Request log rows include public API key prefixes and channel metadata only.
 export async function GET(request: Request) {
   try {
     requireWebRequest(request);
+    maybeAutoPruneRequestLogs();
     const searchParams = new URL(request.url).searchParams;
     const limit = normalizeLimit(searchParams.get("limit"));
     const page = normalizePage(searchParams.get("page"));
@@ -26,6 +32,7 @@ export async function GET(request: Request) {
       offset: (page - 1) * limit,
       query,
       status,
+      includeSummary: searchParams.get("summary") === "full",
     });
     return Response.json({
       object: "list",
@@ -44,6 +51,19 @@ export async function GET(request: Request) {
   } catch (error) {
     return errorToResponse(error);
   }
+}
+
+function maybeAutoPruneRequestLogs() {
+  const now = Date.now();
+  if (now - lastAutoPruneAttemptAt < AUTO_PRUNE_INTERVAL_MS) {
+    return;
+  }
+  lastAutoPruneAttemptAt = now;
+  const settings = getRequestLogRetentionSettings();
+  pruneRequestLogs({
+    summaryRetentionDays: settings.requestLogRetentionDays ?? 90,
+    detailRetentionDays: settings.requestLogDetailRetentionDays ?? 14,
+  });
 }
 
 function normalizeLimit(value: string | null) {

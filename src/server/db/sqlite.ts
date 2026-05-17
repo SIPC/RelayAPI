@@ -405,6 +405,8 @@ function migrateLogDb(db: DatabaseSync) {
 
       CREATE INDEX IF NOT EXISTS idx_request_log_details_updated
         ON request_log_details(updated_at);
+      CREATE INDEX IF NOT EXISTS idx_request_log_details_created
+        ON request_log_details(created_at);
     `,
   );
 
@@ -416,6 +418,25 @@ function migrateLogDb(db: DatabaseSync) {
       "TEXT",
     );
   });
+
+  applyMigration(
+    db,
+    "006_request_log_dashboard_indexes",
+    `
+      CREATE INDEX IF NOT EXISTS idx_request_logs_status_started
+        ON request_logs(status_code, started_at);
+      CREATE INDEX IF NOT EXISTS idx_request_logs_model_started
+        ON request_logs(model, started_at);
+      CREATE INDEX IF NOT EXISTS idx_request_logs_request_type_started
+        ON request_logs(request_type, started_at);
+      CREATE INDEX IF NOT EXISTS idx_request_logs_started_latency
+        ON request_logs(started_at, latency_ms);
+      CREATE INDEX IF NOT EXISTS idx_usage_daily_buckets_updated
+        ON usage_daily_buckets(updated_at);
+      CREATE INDEX IF NOT EXISTS idx_channel_health_events_created
+        ON channel_health_events(created_at);
+    `,
+  );
 }
 
 function addColumnIfMissing(
