@@ -177,6 +177,7 @@ export interface UsageSnapshot {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  cachedTokens: number;
 }
 
 export interface UsageStatsRow {
@@ -190,6 +191,8 @@ export interface UsageStatsRow {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  cachedTokens: number;
+  cacheHitRate: number;
   avgLatencyMs: number;
   p95LatencyMs: number;
   avgFirstTokenLatencyMs: number;
@@ -226,6 +229,8 @@ export interface DailyUsageStatsRow {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  cachedTokens: number;
+  cacheHitRate: number;
   avgLatencyMs: number;
   p95LatencyMs: number;
   avgFirstTokenLatencyMs: number;
@@ -242,6 +247,8 @@ export interface AdminOverviewTotals {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  cachedTokens: number;
+  cacheHitRate: number;
   avgLatencyMs: number;
   p95LatencyMs: number;
   avgFirstTokenLatencyMs: number;

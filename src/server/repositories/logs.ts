@@ -88,11 +88,7 @@ export interface RequestLogDetailInput {
 }
 
 export function appendRequestLog(input: RequestLogInput) {
-  const usage = input.usage || {
-    promptTokens: 0,
-    completionTokens: 0,
-    totalTokens: 0,
-  };
+  const usage = normalizeUsageSnapshot(input.usage);
   const completedAt = input.completedAt || new Date().toISOString();
   const id = randomId("reqlog");
   getLogDb()
@@ -101,8 +97,9 @@ export function appendRequestLog(input: RequestLogInput) {
         id, started_at, completed_at, method, path, request_type, stream,
         model, status_code, latency_ms, api_key_id, api_key_prefix,
         api_key_name, channel_id, channel_name, credential_id, credential_email,
-        prompt_tokens, completion_tokens, total_tokens, error_code, error_message
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        prompt_tokens, completion_tokens, total_tokens, cached_tokens,
+        error_code, error_message
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       id,
@@ -125,6 +122,7 @@ export function appendRequestLog(input: RequestLogInput) {
       usage.promptTokens,
       usage.completionTokens,
       usage.totalTokens,
+      usage.cachedTokens,
       input.errorCode || null,
       input.errorMessage || null,
     );
@@ -226,8 +224,8 @@ export function appendUsageRecord(input: {
       `INSERT INTO usage_records (
         id, created_at, api_key_id, api_key_prefix, api_key_name,
         channel_id, channel_name, credential_id, credential_email, model,
-        prompt_tokens, completion_tokens, total_tokens
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        prompt_tokens, completion_tokens, total_tokens, cached_tokens
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       randomId("usage"),
@@ -243,6 +241,7 @@ export function appendUsageRecord(input: {
       input.usage.promptTokens,
       input.usage.completionTokens,
       input.usage.totalTokens,
+      input.usage.cachedTokens,
     );
 
   const day = input.createdAt.slice(0, 10);
@@ -250,13 +249,15 @@ export function appendUsageRecord(input: {
     .prepare(
       `INSERT INTO usage_daily_buckets (
         bucket_date, api_key_id, channel_id, credential_id, model,
-        prompt_tokens, completion_tokens, total_tokens, request_count, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        prompt_tokens, completion_tokens, total_tokens, cached_tokens,
+        request_count, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
       ON CONFLICT(bucket_date, api_key_id, channel_id, credential_id, model)
       DO UPDATE SET
         prompt_tokens = prompt_tokens + excluded.prompt_tokens,
         completion_tokens = completion_tokens + excluded.completion_tokens,
         total_tokens = total_tokens + excluded.total_tokens,
+        cached_tokens = cached_tokens + excluded.cached_tokens,
         request_count = request_count + 1,
         updated_at = excluded.updated_at`,
     )
@@ -269,6 +270,7 @@ export function appendUsageRecord(input: {
       input.usage.promptTokens,
       input.usage.completionTokens,
       input.usage.totalTokens,
+      input.usage.cachedTokens,
       input.createdAt,
     );
 }
@@ -451,6 +453,8 @@ export interface PublicRequestLogRow {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  cached_tokens: number;
+  cache_hit_rate: number;
   error_code: string | null;
 }
 
@@ -505,6 +509,8 @@ export interface RequestLogQueryResult {
   total: number;
   errorCount: number;
   totalTokens: number;
+  cachedTokens: number;
+  cacheHitRate: number;
   avgLatencyMs: number;
 }
 
@@ -515,7 +521,8 @@ export function getRequestLogDetail(id: string): PublicRequestLogDetail | null {
         id, started_at, completed_at, method, path, request_type, stream,
         model, status_code, latency_ms, api_key_id, api_key_prefix,
         api_key_name, channel_name, credential_email, prompt_tokens,
-        completion_tokens, total_tokens, error_code, error_message
+        completion_tokens, total_tokens, cached_tokens, error_code,
+        error_message
       FROM request_logs
       WHERE id = ?`,
     )
@@ -560,7 +567,7 @@ export function queryRequestLogs(
         id, started_at, method, path, request_type, stream, model,
         status_code, latency_ms, api_key_id, api_key_prefix, api_key_name,
         channel_name, credential_email, prompt_tokens, completion_tokens,
-        total_tokens, error_code
+        total_tokens, cached_tokens, error_code
       FROM request_logs
       ${where}
       ORDER BY started_at DESC
@@ -582,6 +589,8 @@ export function queryRequestLogs(
       : countRequestLogs(where, params),
     errorCount: pageSummary.errorCount,
     totalTokens: pageSummary.totalTokens,
+    cachedTokens: pageSummary.cachedTokens,
+    cacheHitRate: pageSummary.cacheHitRate,
     avgLatencyMs: pageSummary.avgLatencyMs,
   };
 }
@@ -598,26 +607,43 @@ function summarizeRequestLogs(where: string, params: string[]) {
     .prepare(
       `SELECT
         SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS error_count,
+        COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
         COALESCE(SUM(total_tokens), 0) AS total_tokens,
+        COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
         COALESCE(AVG(latency_ms), 0) AS avg_latency_ms
       FROM request_logs
       ${where}`,
     )
     .get(...params) as Record<string, unknown> | undefined;
+  const promptTokens = numberValue(summary?.prompt_tokens);
+  const totalTokens = numberValue(summary?.total_tokens);
+  const cachedTokens = numberValue(summary?.cached_tokens);
   return {
     errorCount: numberValue(summary?.error_count),
-    totalTokens: numberValue(summary?.total_tokens),
+    totalTokens,
+    cachedTokens,
+    cacheHitRate: cacheHitRate(cachedTokens, promptTokens),
     avgLatencyMs: Math.round(numberValue(summary?.avg_latency_ms)),
   };
 }
 
 function summarizeRequestLogRows(rows: PublicRequestLogRow[]) {
   const errorCount = rows.filter((row) => row.status_code >= 400).length;
+  const promptTokens = rows.reduce(
+    (total, row) => total + row.prompt_tokens,
+    0,
+  );
   const totalTokens = rows.reduce((total, row) => total + row.total_tokens, 0);
+  const cachedTokens = rows.reduce(
+    (total, row) => total + row.cached_tokens,
+    0,
+  );
   const totalLatencyMs = rows.reduce((total, row) => total + row.latency_ms, 0);
   return {
     errorCount,
     totalTokens,
+    cachedTokens,
+    cacheHitRate: cacheHitRate(cachedTokens, promptTokens),
     avgLatencyMs:
       rows.length > 0 ? Math.round(totalLatencyMs / rows.length) : 0,
   };
@@ -814,6 +840,7 @@ function getOverviewTotals(): AdminOverviewTotals {
         COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
         COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
         COALESCE(SUM(total_tokens), 0) AS total_tokens,
+        COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
         COALESCE(AVG(latency_ms), 0) AS avg_latency_ms,
         COALESCE(SUM(latency_ms), 0) AS total_latency_ms,
         COUNT(DISTINCT NULLIF(api_key_id, '')) AS distinct_api_key_count,
@@ -825,16 +852,20 @@ function getOverviewTotals(): AdminOverviewTotals {
     )
     .get() as Record<string, unknown> | undefined;
   const requestCount = numberValue(row?.request_count);
+  const promptTokens = numberValue(row?.prompt_tokens);
   const totalTokens = numberValue(row?.total_tokens);
+  const cachedTokens = numberValue(row?.cached_tokens);
   const firstTokenLatency = firstTokenLatencyStats();
   return {
     requestCount,
     successCount: numberValue(row?.success_count),
     errorCount: numberValue(row?.error_count),
     streamCount: numberValue(row?.stream_count),
-    promptTokens: numberValue(row?.prompt_tokens),
+    promptTokens,
     completionTokens: numberValue(row?.completion_tokens),
     totalTokens,
+    cachedTokens,
+    cacheHitRate: cacheHitRate(cachedTokens, promptTokens),
     avgLatencyMs: Math.round(numberValue(row?.avg_latency_ms)),
     p95LatencyMs: percentileLatency(),
     ...firstTokenLatency,
@@ -940,6 +971,7 @@ function getApiKeyModelUsageStats(): ApiKeyModelUsageStatsRow[] {
         COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
         COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
         COALESCE(SUM(total_tokens), 0) AS total_tokens,
+        COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
         COALESCE(AVG(latency_ms), 0) AS avg_latency_ms,
         COALESCE(SUM(latency_ms), 0) AS total_latency_ms,
         MIN(started_at) AS first_request_at,
@@ -1028,6 +1060,7 @@ function getDailyUsageStats(): DailyUsageStatsRow[] {
         COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
         COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
         COALESCE(SUM(total_tokens), 0) AS total_tokens,
+        COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
         COALESCE(AVG(latency_ms), 0) AS avg_latency_ms,
         COALESCE(SUM(latency_ms), 0) AS total_latency_ms,
         MIN(started_at) AS first_request_at,
@@ -1044,6 +1077,7 @@ function getDailyUsageStats(): DailyUsageStatsRow[] {
   return rows.map((row) => {
     const requestCount = numberValue(row.request_count);
     const totalTokens = numberValue(row.total_tokens);
+    const cachedTokens = numberValue(row.cached_tokens);
     const date = String(row.date || "");
     const firstTokenLatency = firstTokenLatencyStats({ day: date });
     return {
@@ -1055,6 +1089,8 @@ function getDailyUsageStats(): DailyUsageStatsRow[] {
       promptTokens: numberValue(row.prompt_tokens),
       completionTokens: numberValue(row.completion_tokens),
       totalTokens,
+      cachedTokens,
+      cacheHitRate: cacheHitRate(cachedTokens, numberValue(row.prompt_tokens)),
       avgLatencyMs: Math.round(numberValue(row.avg_latency_ms)),
       p95LatencyMs: percentileLatency({ day: date }),
       ...firstTokenLatency,
@@ -1076,6 +1112,7 @@ function aggregateSelect(keyColumn: string, labelColumn: string) {
     COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
     COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
     COALESCE(SUM(total_tokens), 0) AS total_tokens,
+    COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
     COALESCE(AVG(latency_ms), 0) AS avg_latency_ms,
     COALESCE(SUM(latency_ms), 0) AS total_latency_ms,
     MIN(started_at) AS first_request_at,
@@ -1099,6 +1136,8 @@ function emptyUsageStatsRow(input: {
     promptTokens: 0,
     completionTokens: 0,
     totalTokens: 0,
+    cachedTokens: 0,
+    cacheHitRate: 0,
     avgLatencyMs: 0,
     p95LatencyMs: 0,
     avgFirstTokenLatencyMs: 0,
@@ -1121,7 +1160,9 @@ function toUsageStatsRow(
   },
 ): UsageStatsRow {
   const requestCount = numberValue(row.request_count);
+  const promptTokens = numberValue(row.prompt_tokens);
   const totalTokens = numberValue(row.total_tokens);
+  const cachedTokens = numberValue(row.cached_tokens);
   const firstRequestAt = nullableString(row.first_request_at);
   const lastRequestAt = nullableString(row.last_request_at);
   return {
@@ -1136,9 +1177,11 @@ function toUsageStatsRow(
     successCount: numberValue(row.success_count),
     errorCount: numberValue(row.error_count),
     streamCount: numberValue(row.stream_count),
-    promptTokens: numberValue(row.prompt_tokens),
+    promptTokens,
     completionTokens: numberValue(row.completion_tokens),
     totalTokens,
+    cachedTokens,
+    cacheHitRate: cacheHitRate(cachedTokens, promptTokens),
     avgLatencyMs: Math.round(numberValue(row.avg_latency_ms)),
     p95LatencyMs: percentileLatency({
       groupKey: nullableString(row.group_key),
@@ -1349,6 +1392,24 @@ function throughput(totalTokens: number, totalLatencyMs: unknown) {
   return Math.round((totalTokens / latencySeconds) * 100) / 100;
 }
 
+function cacheHitRate(cachedTokens: number, promptTokens: number) {
+  return promptTokens > 0
+    ? Math.round((cachedTokens / promptTokens) * 10_000) / 100
+    : 0;
+}
+
+function normalizeUsageSnapshot(usage?: UsageSnapshot): UsageSnapshot {
+  return {
+    promptTokens: Math.max(0, Math.floor(numberValue(usage?.promptTokens))),
+    completionTokens: Math.max(
+      0,
+      Math.floor(numberValue(usage?.completionTokens)),
+    ),
+    totalTokens: Math.max(0, Math.floor(numberValue(usage?.totalTokens))),
+    cachedTokens: Math.max(0, Math.floor(numberValue(usage?.cachedTokens))),
+  };
+}
+
 function numberValue(value: unknown) {
   const number = Number(value || 0);
   return Number.isFinite(number) ? number : 0;
@@ -1399,6 +1460,11 @@ function toPublicRequestLogRow(
     prompt_tokens: Number(row.prompt_tokens || 0),
     completion_tokens: Number(row.completion_tokens || 0),
     total_tokens: Number(row.total_tokens || 0),
+    cached_tokens: Number(row.cached_tokens || 0),
+    cache_hit_rate: cacheHitRate(
+      Number(row.cached_tokens || 0),
+      Number(row.prompt_tokens || 0),
+    ),
     error_code: nullableString(row.error_code),
   };
 }

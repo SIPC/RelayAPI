@@ -45,6 +45,8 @@ export async function GET(request: Request) {
       summary: {
         errorCount: result.errorCount,
         totalTokens: result.totalTokens,
+        cachedTokens: result.cachedTokens,
+        cacheHitRate: result.cacheHitRate,
         avgLatencyMs: result.avgLatencyMs,
       },
     });

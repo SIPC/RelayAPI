@@ -6,10 +6,13 @@ import {
   chatCompletionsToCodex,
   codexFetch,
   codexJson,
+  codexPromptCacheKeyForApiKey,
   codexResponseToChatCompletion,
   copyUpstreamHeaders,
   extractUsageFromCodexResponse,
   normalizeCompactPayload,
+  normalizeRawCodexCompactPayload,
+  normalizeRawCodexResponsesPayload,
   normalizeResponsesPayload,
   parseCodexSseResponse,
 } from "@/src/server/codex/client";
@@ -156,6 +159,7 @@ export async function handleOpenAIResponses(request: Request) {
       stream: true,
       sourceHeaders: request.headers,
       channel,
+      promptCacheKey: codexPromptCacheKeyForApiKey(apiKey),
       timing,
     });
     const raw = timing.time(
@@ -235,7 +239,7 @@ export async function handleRawCodexResponses(request: Request) {
     requestType: "codex.responses.raw",
     streamFromPayload: true,
     exposeUpstreamErrors: true,
-    normalizePayload: (payload) => payload,
+    normalizePayload: normalizeRawCodexResponsesPayload,
   });
 }
 
@@ -245,7 +249,7 @@ export async function handleRawCodexCompact(request: Request) {
     requestType: "codex.responses.compact.raw",
     streamFromPayload: false,
     exposeUpstreamErrors: true,
-    normalizePayload: (payload) => payload,
+    normalizePayload: normalizeRawCodexCompactPayload,
   });
 }
 
@@ -283,6 +287,7 @@ export async function handleChatCompletions(request: Request) {
           stream: true,
           sourceHeaders: request.headers,
           channel,
+          promptCacheKey: codexPromptCacheKeyForApiKey(apiKey),
           timing,
         },
       );
@@ -395,6 +400,7 @@ export async function handleChatCompletions(request: Request) {
       stream: true,
       sourceHeaders: request.headers,
       channel,
+      promptCacheKey: codexPromptCacheKeyForApiKey(apiKey),
       timing,
     });
     if (!result.response.ok) {
@@ -535,6 +541,7 @@ async function handleRawCodexProxy(
       stream: false,
       sourceHeaders: request.headers,
       channel,
+      promptCacheKey: codexPromptCacheKeyForApiKey(apiKey),
       timing,
     });
     const usage = timing.time("extract_usage", "提取 Token 用量", () =>
@@ -627,6 +634,7 @@ async function forwardCodexStream(input: {
       stream: true,
       sourceHeaders: input.request.headers,
       channel: input.channel,
+      promptCacheKey: codexPromptCacheKeyForApiKey(input.apiKey),
       timing: input.timing,
     },
   );
@@ -1209,5 +1217,10 @@ function stringValue(value: unknown) {
 }
 
 function emptyUsage(): UsageSnapshot {
-  return { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  return {
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    cachedTokens: 0,
+  };
 }

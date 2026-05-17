@@ -37,6 +37,8 @@ type RequestLogRow = {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  cached_tokens: number;
+  cache_hit_rate: number;
   error_code: string | null;
 };
 
@@ -78,6 +80,8 @@ export default async function Home() {
         summary: {
           errorCount: requestLogs.errorCount,
           totalTokens: requestLogs.totalTokens,
+          cachedTokens: requestLogs.cachedTokens,
+          cacheHitRate: requestLogs.cacheHitRate,
           avgLatencyMs: requestLogs.avgLatencyMs,
         },
       }}

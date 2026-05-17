@@ -7,7 +7,11 @@ import { proxiedFetch } from "@/src/server/net/proxy";
 import { ensureFreshCredential } from "@/src/server/services/codexCredentials";
 import { getGlobalProxySetting } from "@/src/server/services/settings";
 import type { StageTimer } from "@/src/server/http/stageTimer";
-import type { ChannelRecord, UsageSnapshot } from "@/src/shared/types/entities";
+import type {
+  ChannelRecord,
+  RelayApiKeyContext,
+  UsageSnapshot,
+} from "@/src/shared/types/entities";
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -47,6 +51,26 @@ export interface ToolNameMaps {
   shortToOriginal: Map<string, string>;
 }
 
+export function codexPromptCacheKeyForApiKey(
+  apiKey: Pick<RelayApiKeyContext, "id"> | null | undefined,
+) {
+  const id = stringValue(apiKey?.id).trim();
+  if (!id) {
+    return "";
+  }
+  return deterministicUuid(`relay-api:codex:prompt-cache:${id}`);
+}
+
+function resolveCodexPromptCacheKey(
+  payload: unknown,
+  fallback: string | null | undefined,
+) {
+  const explicit = isRecord(payload)
+    ? stringValue(payload.prompt_cache_key).trim()
+    : "";
+  return explicit || stringValue(fallback).trim();
+}
+
 export async function codexFetch(
   upstreamPath: "/responses" | "/responses/compact",
   payload: Record<string, unknown>,
@@ -54,6 +78,7 @@ export async function codexFetch(
     stream: boolean;
     sourceHeaders: Headers;
     channel: ChannelRecord;
+    promptCacheKey?: string | null;
     timing?: StageTimer;
   },
 ) {
@@ -66,14 +91,20 @@ export async function codexFetch(
   if (!credential.tokens.access_token) {
     throw new Error("Saved Codex credential does not contain access_token");
   }
+  const promptCacheKey = resolveCodexPromptCacheKey(
+    payload,
+    input.promptCacheKey,
+  );
   const upstreamPayload =
     input.timing?.time("prepare_upstream_payload", "构造上游 Payload", () =>
       prepareCodexPayloadForUpstream(payload, {
         fastServiceTier: shouldUsePriorityServiceTier(credential),
+        promptCacheKey,
       }),
     ) ??
     prepareCodexPayloadForUpstream(payload, {
       fastServiceTier: shouldUsePriorityServiceTier(credential),
+      promptCacheKey,
     });
   const response =
     (await input.timing?.timeAsync("upstream_fetch", "上游 Fetch", () =>
@@ -84,6 +115,7 @@ export async function codexFetch(
           headers: buildCodexHeaders(credential, {
             stream: input.stream,
             sourceHeaders: input.sourceHeaders,
+            promptCacheKey,
           }),
           body: JSON.stringify(upstreamPayload),
           signal: AbortSignal.timeout(
@@ -106,6 +138,7 @@ export async function codexFetch(
         headers: buildCodexHeaders(credential, {
           stream: input.stream,
           sourceHeaders: input.sourceHeaders,
+          promptCacheKey,
         }),
         body: JSON.stringify(upstreamPayload),
         signal: AbortSignal.timeout(
@@ -130,6 +163,7 @@ export async function codexJson(
     stream: boolean;
     sourceHeaders: Headers;
     channel: ChannelRecord;
+    promptCacheKey?: string | null;
     timing?: StageTimer;
   },
 ) {
@@ -162,14 +196,18 @@ export function toCodexUrl(baseUrl: string, upstreamPath: string) {
 
 function buildCodexHeaders(
   credential: Awaited<ReturnType<typeof ensureFreshCredential>>,
-  input: { stream: boolean; sourceHeaders: Headers },
+  input: {
+    stream: boolean;
+    sourceHeaders: Headers;
+    promptCacheKey?: string | null;
+  },
 ) {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Authorization: `Bearer ${credential.tokens.access_token}`,
     Accept: input.stream ? "text/event-stream" : "application/json",
     "User-Agent": serverConfig.userAgent,
-    Originator: "codex-tui",
+    Originator: serverConfig.codexOriginator,
   };
   for (const name of [
     "version",
@@ -185,11 +223,19 @@ function buildCodexHeaders(
   if (credential.accountId) {
     headers["Chatgpt-Account-Id"] = credential.accountId;
   }
-  if (headers["User-Agent"].includes("Mac OS")) {
-    headers.Session_id =
-      input.sourceHeaders.get("session_id") ||
-      input.sourceHeaders.get("session-id") ||
-      crypto.randomUUID();
+  const promptCacheKey = stringValue(input.promptCacheKey).trim();
+  const sessionId =
+    promptCacheKey ||
+    input.sourceHeaders.get("session_id") ||
+    input.sourceHeaders.get("session-id") ||
+    "";
+  if (sessionId) {
+    headers.Session_id = sessionId;
+  } else if (headers["User-Agent"].includes("Mac OS")) {
+    headers.Session_id = crypto.randomUUID();
+  }
+  if (promptCacheKey) {
+    headers.Conversation_id = promptCacheKey;
   }
   return headers;
 }
@@ -205,12 +251,22 @@ function canonicalHeaderName(name: string) {
 
 export function prepareCodexPayloadForUpstream(
   payload: unknown,
-  options: { fastServiceTier?: boolean } = {},
+  options: { fastServiceTier?: boolean; promptCacheKey?: string | null } = {},
 ) {
   if (!isRecord(payload)) {
     return payload;
   }
   const upstreamPayload = cloneJsonObject(payload);
+  const promptCacheKey = resolveCodexPromptCacheKey(
+    upstreamPayload,
+    options.promptCacheKey,
+  );
+  if (promptCacheKey) {
+    upstreamPayload.prompt_cache_key = promptCacheKey;
+  }
+  // Service tier is server-controlled. Do not let clients opt into priority
+  // by sending service_tier in the request body.
+  delete upstreamPayload.service_tier;
   if (options.fastServiceTier) {
     upstreamPayload.service_tier = "priority";
   }
@@ -350,6 +406,25 @@ export function normalizeCompactPayload(inputPayload: unknown) {
   const payload = normalizeResponsesPayload(inputPayload, { stream: false });
   delete payload.stream;
   delete payload.store;
+  return payload;
+}
+
+export function normalizeRawCodexResponsesPayload(inputPayload: unknown) {
+  const payload = cloneJsonObject(inputPayload);
+  payload.store = false;
+  payload.parallel_tool_calls = true;
+  payload.include = ["reasoning.encrypted_content"];
+  normalizeRawCodexPayloadForUpstream(payload);
+  return payload;
+}
+
+export function normalizeRawCodexCompactPayload(inputPayload: unknown) {
+  const payload = cloneJsonObject(inputPayload);
+  normalizeRawCodexPayloadForUpstream(payload);
+  delete payload.stream;
+  delete payload.store;
+  delete payload.include;
+  delete payload.parallel_tool_calls;
   return payload;
 }
 
@@ -650,7 +725,38 @@ export function normalizeUsage(usage: unknown): UsageSnapshot {
   );
   const totalTokens =
     numberValue(object.total_tokens) || promptTokens + completionTokens;
-  return { promptTokens, completionTokens, totalTokens };
+  const cachedTokens = extractCachedTokens(object);
+  return { promptTokens, completionTokens, totalTokens, cachedTokens };
+}
+
+function extractCachedTokens(usage: Record<string, unknown>) {
+  return firstPositiveNumber(
+    usage.cached_tokens,
+    recordValue(usage.input_tokens_details)?.cached_tokens,
+    recordValue(usage.prompt_tokens_details)?.cached_tokens,
+    recordValue(usage.input_token_details)?.cached_tokens,
+    recordValue(usage.prompt_token_details)?.cached_tokens,
+    recordValue(usage.cache_read_input_tokens)?.cached_tokens,
+    usage.cache_read_input_tokens,
+    usage.cached_input_tokens,
+    usage.prompt_cache_hit_tokens,
+    usage.prompt_cache_read_tokens,
+    usage.cache_read_tokens,
+  );
+}
+
+function recordValue(value: unknown) {
+  return isRecord(value) ? value : null;
+}
+
+function firstPositiveNumber(...values: unknown[]) {
+  for (const value of values) {
+    const number = numberValue(value);
+    if (number > 0) {
+      return number;
+    }
+  }
+  return 0;
 }
 
 export function extractTextFromCodexResponse(raw: unknown): string {
@@ -746,6 +852,9 @@ export function codexResponseToChatCompletion(
       prompt_tokens: usage.promptTokens,
       completion_tokens: usage.completionTokens,
       total_tokens: usage.totalTokens,
+      prompt_tokens_details: {
+        cached_tokens: usage.cachedTokens,
+      },
     },
   };
 }
@@ -860,13 +969,24 @@ function normalizeRawCodexPayloadForUpstream(payload: Record<string, unknown>) {
   if (payload.instructions === undefined || payload.instructions === null) {
     payload.instructions = "";
   }
+
+  // These fields are either rejected by Codex upstream or should be controlled
+  // by Relay instead of client payloads when shared OAuth credentials are used.
+  delete payload.previous_response_id;
+  delete payload.user;
+  delete payload.temperature;
+  delete payload.top_p;
+  delete payload.top_k;
+  delete payload.max_tokens;
+  delete payload.max_output_tokens;
+  delete payload.max_completion_tokens;
   delete payload.stream_options;
+  delete payload.context_management;
+  delete payload.truncation;
   delete payload.prompt_cache_retention;
   delete payload.safety_identifier;
+
   normalizeReasoningForCodex(payload);
-  if (payload.service_tier && payload.service_tier !== "priority") {
-    delete payload.service_tier;
-  }
 }
 
 function stripUnsupportedCodexFields(
@@ -958,6 +1078,17 @@ function reasoningEnabledToEffort(value: unknown) {
     return "none";
   }
   return "";
+}
+
+function deterministicUuid(seed: string) {
+  const hash = crypto.createHash("sha1").update(seed).digest();
+  hash[6] = (hash[6] & 0x0f) | 0x50;
+  hash[8] = (hash[8] & 0x3f) | 0x80;
+  const hex = hash.subarray(0, 16).toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(
+    12,
+    16,
+  )}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
 function cloneJsonObject(value: unknown): Record<string, unknown> {

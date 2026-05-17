@@ -64,6 +64,8 @@ export type AdminDashboardRequestLogRow = {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  cached_tokens: number;
+  cache_hit_rate: number;
   error_code: string | null;
 };
 
@@ -115,6 +117,8 @@ export type RequestLogsPage = {
   summary: {
     errorCount: number;
     totalTokens: number;
+    cachedTokens: number;
+    cacheHitRate: number;
     avgLatencyMs: number;
   };
 };

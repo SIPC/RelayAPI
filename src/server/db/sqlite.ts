@@ -437,6 +437,27 @@ function migrateLogDb(db: DatabaseSync) {
         ON channel_health_events(created_at);
     `,
   );
+
+  applyMigration(db, "007_cached_token_usage", (database) => {
+    addColumnIfMissing(
+      database,
+      "request_logs",
+      "cached_tokens",
+      "INTEGER NOT NULL DEFAULT 0",
+    );
+    addColumnIfMissing(
+      database,
+      "usage_records",
+      "cached_tokens",
+      "INTEGER NOT NULL DEFAULT 0",
+    );
+    addColumnIfMissing(
+      database,
+      "usage_daily_buckets",
+      "cached_tokens",
+      "INTEGER NOT NULL DEFAULT 0",
+    );
+  });
 }
 
 function addColumnIfMissing(

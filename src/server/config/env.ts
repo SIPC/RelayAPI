@@ -127,7 +127,8 @@ export const serverConfig = {
   globalProxy: resolveGlobalProxy(),
   userAgent:
     process.env.CODEX_USER_AGENT ||
-    "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.118.0)",
+    "codex_cli_rs/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9",
+  codexOriginator: process.env.CODEX_ORIGINATOR || "codex_cli_rs",
   autoImportLegacyCredentials:
     process.env.RELAY_IMPORT_LEGACY_CREDENTIALS === "1",
   legacyCredentialDirs: [

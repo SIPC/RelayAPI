@@ -66,7 +66,12 @@ export function createOpenAIChatSseStream(
     upstreamCompleted: false,
     firstTokenReported: false,
     done: false,
-    usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    usage: {
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      cachedTokens: 0,
+    },
     onFirstToken: input.onFirstToken,
   };
   let buffer = "";
@@ -629,6 +634,9 @@ function writeOpenAIChatChunk(
             prompt_tokens: usage.promptTokens,
             completion_tokens: usage.completionTokens,
             total_tokens: usage.totalTokens,
+            prompt_tokens_details: {
+              cached_tokens: usage.cachedTokens,
+            },
           },
         }
       : {}),

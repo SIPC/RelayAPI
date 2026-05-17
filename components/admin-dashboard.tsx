@@ -1464,7 +1464,12 @@ function TokenCell({
 }: {
   row: Pick<
     UsageStatsRow,
-    "promptTokens" | "completionTokens" | "totalTokens" | "avgTokensPerRequest"
+    | "promptTokens"
+    | "completionTokens"
+    | "totalTokens"
+    | "cachedTokens"
+    | "cacheHitRate"
+    | "avgTokensPerRequest"
   >;
 }) {
   return (
@@ -1474,6 +1479,10 @@ function TokenCell({
         P {formatTokenNumber(row.promptTokens)} · C{" "}
         {formatTokenNumber(row.completionTokens)} · 平均{" "}
         {formatTokenNumber(Math.round(row.avgTokensPerRequest))}
+      </div>
+      <div className="text-xs text-muted-foreground">
+        缓存 {formatTokenNumber(row.cachedTokens)} · 命中率{" "}
+        {formatPercent(row.cacheHitRate)}
       </div>
     </div>
   );
@@ -4296,7 +4305,7 @@ function LogsSection({
         <MetricCard
           title="匹配 Token"
           value={formatTokenNumber(logsPage.summary.totalTokens)}
-          description={`平均延迟 ${formatDuration(logsPage.summary.avgLatencyMs)}`}
+          description={`缓存 ${formatTokenNumber(logsPage.summary.cachedTokens)} · 命中率 ${formatPercent(logsPage.summary.cacheHitRate)} · 平均延迟 ${formatDuration(logsPage.summary.avgLatencyMs)}`}
           icon={DatabaseIcon}
         />
       </div>
@@ -4455,6 +4464,10 @@ function LogsSection({
                           输入 {formatTokenNumber(log.prompt_tokens)} / 输出{" "}
                           {formatTokenNumber(log.completion_tokens)}
                         </div>
+                        <div className="text-xs text-muted-foreground">
+                          缓存 {formatTokenNumber(log.cached_tokens)} ·{" "}
+                          {formatPercent(log.cache_hit_rate)}
+                        </div>
                       </TableCell>
                       <TableCell>
                         <Button
@@ -4602,6 +4615,16 @@ function RequestLogDetailDialog({
               <div>
                 <div className="text-xs text-muted-foreground">模型</div>
                 <div>{log.model || "-"}</div>
+              </div>
+              <div>
+                <div className="text-xs text-muted-foreground">
+                  Token / 缓存
+                </div>
+                <div>
+                  {formatTokenNumber(log.total_tokens)} · 缓存{" "}
+                  {formatTokenNumber(log.cached_tokens)} (
+                  {formatPercent(log.cache_hit_rate)})
+                </div>
               </div>
               <div>
                 <div className="text-xs text-muted-foreground">密钥</div>
@@ -4846,7 +4869,7 @@ function buildOverviewTrendMetrics(
     {
       title: "今日 Token",
       value: formatTokenNumber(today.totalTokens),
-      description: `输入 ${formatTokenNumber(today.promptTokens)} · 输出 ${formatTokenNumber(today.completionTokens)}`,
+      description: `输入 ${formatTokenNumber(today.promptTokens)} · 输出 ${formatTokenNumber(today.completionTokens)} · 缓存 ${formatTokenNumber(today.cachedTokens)} (${formatPercent(today.cacheHitRate)})`,
       changeLabel: formatChangePercent(tokenChange.value),
       direction: tokenChange.direction,
       tone: directionTone(tokenChange.direction),
@@ -4888,6 +4911,8 @@ function emptyDailyUsageRow(date: string): DailyUsageRow {
     promptTokens: 0,
     completionTokens: 0,
     totalTokens: 0,
+    cachedTokens: 0,
+    cacheHitRate: 0,
     avgLatencyMs: 0,
     p95LatencyMs: 0,
     avgFirstTokenLatencyMs: 0,
