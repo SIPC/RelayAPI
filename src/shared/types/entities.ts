@@ -83,6 +83,28 @@ export interface PublicCredentialProxyConfig {
   passwordSet?: boolean;
 }
 
+export interface ProxyPoolRecord {
+  id: string;
+  name: string;
+  enabled: boolean;
+  type: CredentialProxyType;
+  host: string;
+  port: number;
+  username: string;
+  passwordSet: boolean;
+  notes: string;
+  createdAt: string;
+  updatedAt: string;
+  lastUsedAt: string | null;
+}
+
+export interface ProxyPoolRecordWithSecret extends Omit<
+  ProxyPoolRecord,
+  "passwordSet"
+> {
+  password: string;
+}
+
 export type CodexUpstreamTransport = "http" | "websocket";
 
 export interface CodexTokenBundle {
@@ -105,6 +127,7 @@ export interface CodexCredentialRecord {
   fastEnabled: boolean;
   upstreamTransport: CodexUpstreamTransport;
   useGlobalProxy: boolean;
+  proxyPoolId: string | null;
   proxy: PublicCredentialProxyConfig | null;
   usageHealth?: CodexAccountUsageHealth;
   expiresAt: string | null;

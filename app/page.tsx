@@ -10,6 +10,7 @@ import { listApiKeyPublicRecords } from "@/src/server/services/apiKeys";
 import { listChannelRecords } from "@/src/server/services/channels";
 import { listPublicCodexCredentials } from "@/src/server/services/codexCredentials";
 import { getPublicGlobalSettings } from "@/src/server/services/settings";
+import { listPublicProxyPoolItems } from "@/src/server/services/proxyPool";
 import type { AdminOverviewStats } from "@/src/shared/types/entities";
 import {
   initializeWebAccessKey,
@@ -56,6 +57,7 @@ export default async function Home() {
   const apiKeys = listApiKeyPublicRecords();
   const codexCredentials = await listPublicCodexCredentials();
   const channels = listChannelRecords();
+  const proxyPool = listPublicProxyPoolItems();
   const requestLogs = queryRequestLogs({
     limit: 50,
     offset: 0,
@@ -70,6 +72,7 @@ export default async function Home() {
       initialApiKeys={apiKeys}
       initialChannels={channels}
       initialCredentials={codexCredentials}
+      initialProxyPool={proxyPool}
       initialRequestLogsPage={{
         object: "list",
         data: requestLogs.data as RequestLogRow[],

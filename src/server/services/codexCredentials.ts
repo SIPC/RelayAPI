@@ -16,12 +16,14 @@ import {
 } from "@/src/server/repositories/codexCredentials";
 import { credentialUsageHealth } from "@/src/server/repositories/logs";
 import { detachCredentialFromChannels } from "@/src/server/repositories/channels";
+import { getProxyPoolItemById } from "@/src/server/repositories/proxyPool";
 import {
   saveOAuthPendingState,
   takeOAuthPendingState,
 } from "@/src/server/repositories/oauthPendingStates";
 import { randomId, sha256 } from "@/src/server/services/crypto";
 import { getGlobalProxySetting } from "@/src/server/services/settings";
+import { getProxyPoolCredentialProxy } from "@/src/server/services/proxyPool";
 import type {
   CodexCredentialRecord,
   CodexCredentialWithTokens,
@@ -222,6 +224,7 @@ export function patchCodexCredentialRouting(
     fastEnabled?: boolean;
     upstreamTransport?: CodexUpstreamTransport;
     useGlobalProxy?: boolean;
+    proxyPoolId?: string | null;
     proxy?: unknown;
   },
 ) {
@@ -248,6 +251,9 @@ export function patchCodexCredentialRouting(
   const proxyPatch = Object.hasOwn(input, "proxy")
     ? { proxy: normalizeCredentialProxyPatch(input.proxy, existing.proxy) }
     : {};
+  const proxyPoolPatch = Object.hasOwn(input, "proxyPoolId")
+    ? { proxyPoolId: normalizeProxyPoolId(input.proxyPoolId) }
+    : {};
   const updated = updateCodexCredential(id, {
     ...(input.enabled !== undefined ? { enabled: Boolean(input.enabled) } : {}),
     ...(input.priority !== undefined
@@ -261,6 +267,7 @@ export function patchCodexCredentialRouting(
     ...(input.useGlobalProxy !== undefined
       ? { useGlobalProxy: Boolean(input.useGlobalProxy) }
       : {}),
+    ...proxyPoolPatch,
     ...proxyPatch,
   });
   if (!updated) {
@@ -271,6 +278,21 @@ export function patchCodexCredentialRouting(
     );
   }
   return publicCredential(updated);
+}
+
+export function resolveCredentialProxy(input: {
+  proxy: CredentialProxyConfig | null;
+  proxyPoolId: string | null;
+  useGlobalProxy: boolean;
+}) {
+  if (input.proxy?.enabled) {
+    return input.proxy;
+  }
+  const pooledProxy = getProxyPoolCredentialProxy(input.proxyPoolId);
+  if (pooledProxy?.enabled) {
+    return pooledProxy;
+  }
+  return input.useGlobalProxy ? getGlobalProxySetting() : null;
 }
 
 export async function removeCodexCredential(id: string) {
@@ -451,6 +473,7 @@ async function refreshCodexCredentialWithTokens(id: string) {
     const tokenResponse = await tokenRequest(
       body,
       credential.proxy,
+      credential.proxyPoolId,
       credential.useGlobalProxy,
     );
     return await saveTokenResponse(tokenResponse, credential);
@@ -507,7 +530,7 @@ async function exchangeCodeForTokens(input: {
   try {
     // OAuth route responses also get public metadata only.
     return publicCredential(
-      await saveTokenResponse(await tokenRequest(body, null, true), null),
+      await saveTokenResponse(await tokenRequest(body, null, null, true), null),
     );
   } catch (error) {
     logServerError(error, {
@@ -524,6 +547,7 @@ async function exchangeCodeForTokens(input: {
 async function tokenRequest(
   body: URLSearchParams,
   proxy: CredentialProxyConfig | null,
+  proxyPoolId: string | null,
   useGlobalProxyFallback: boolean,
 ) {
   const response = await proxiedFetch(
@@ -537,11 +561,11 @@ async function tokenRequest(
       body,
       signal: AbortSignal.timeout(serverConfig.requestTimeoutMs),
     },
-    proxy?.enabled
-      ? proxy
-      : useGlobalProxyFallback
-        ? getGlobalProxySetting()
-        : null,
+    resolveCredentialProxy({
+      proxy,
+      proxyPoolId,
+      useGlobalProxy: useGlobalProxyFallback,
+    }),
   );
   const text = await response.text();
   const parsed = parseMaybeJson<Record<string, unknown>>(text) || { raw: text };
@@ -708,6 +732,7 @@ function publicCredential(
     fastEnabled: credential.fastEnabled,
     upstreamTransport: credential.upstreamTransport,
     useGlobalProxy: credential.useGlobalProxy,
+    proxyPoolId: credential.proxyPoolId,
     proxy: credential.proxy
       ? {
           enabled: credential.proxy.enabled,
@@ -955,6 +980,21 @@ function normalizeCodexUpstreamTransport(
     "unsupported_codex_upstream_transport",
     "Codex upstream transport must be http or websocket",
   );
+}
+
+function normalizeProxyPoolId(input: unknown) {
+  const id = stringValue(input).trim();
+  if (!id) {
+    return null;
+  }
+  if (!getProxyPoolItemById(id)) {
+    throw new HttpError(
+      400,
+      "proxy_pool_not_found",
+      "Selected proxy pool item does not exist",
+    );
+  }
+  return id;
 }
 
 function normalizeCredentialProxyPatch(

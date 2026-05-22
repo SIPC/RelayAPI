@@ -93,9 +93,11 @@ import {
   adminErrorMessage,
   createApiKey,
   createChannel,
+  createProxyPoolItem,
   deleteApiKey,
   deleteChannel,
   deleteCredential,
+  deleteProxyPoolItem,
   downloadCredentialsExport,
   finishCodexOAuth,
   getCredentialQuota,
@@ -106,6 +108,7 @@ import {
   importCredentialJson,
   listChannels,
   listCredentials,
+  listProxyPoolItems,
   logoutWebSession,
   pruneRequestLogs,
   refreshCredential,
@@ -115,11 +118,13 @@ import {
   updateApiKey,
   updateChannel,
   updateCredentialRouting,
+  updateProxyPoolItem,
   type AdminDashboardRequestLogRow,
   type ApiKeyPayload,
   type ChannelPayload,
   type CodexQuotaReport,
   type OAuthStartResponse,
+  type ProxyPoolPayload,
   type RequestLogDetail,
   type RequestLogsPage,
 } from "@/lib/admin-api";
@@ -133,6 +138,7 @@ import type {
   CredentialProxyType,
   CreatedApiKey,
   GlobalSettingsRecord,
+  ProxyPoolRecord,
   PublicApiKey,
   UsageStatsRow,
 } from "@/src/shared/types/entities";
@@ -141,6 +147,7 @@ type AdminDashboardProps = {
   initialApiKeys: PublicApiKey[];
   initialChannels: ChannelRecord[];
   initialCredentials: CodexCredentialRecord[];
+  initialProxyPool: ProxyPoolRecord[];
   initialRequestLogsPage: RequestLogsPage;
   initialOverviewStats: AdminOverviewStats;
   initialGlobalSettings: GlobalSettingsRecord;
@@ -151,6 +158,7 @@ type SectionId =
   | "overview"
   | "apiKeys"
   | "credentials"
+  | "proxyPool"
   | "channels"
   | "settings"
   | "logs";
@@ -211,6 +219,11 @@ type CredentialProxyFormState = {
   password: string;
 };
 
+type ProxyPoolFormState = CredentialProxyFormState & {
+  name: string;
+  notes: string;
+};
+
 type ChannelFormState = {
   name: string;
   credentialIds: string;
@@ -262,6 +275,7 @@ export function AdminDashboard({
   initialApiKeys,
   initialChannels,
   initialCredentials,
+  initialProxyPool,
   initialRequestLogsPage,
   initialOverviewStats,
   initialGlobalSettings,
@@ -272,6 +286,7 @@ export function AdminDashboard({
   const [apiKeys, setApiKeys] = React.useState(initialApiKeys);
   const [channels, setChannels] = React.useState(initialChannels);
   const [credentials, setCredentials] = React.useState(initialCredentials);
+  const [proxyPool, setProxyPool] = React.useState(initialProxyPool);
   const [globalSettings, setGlobalSettings] = React.useState(
     initialGlobalSettings,
   );
@@ -329,6 +344,7 @@ export function AdminDashboard({
       setApiKeys(snapshot.apiKeys);
       setChannels(snapshot.channels);
       setCredentials(snapshot.credentials);
+      setProxyPool(snapshot.proxyPool);
       setGlobalSettings(snapshot.globalSettings);
       setRequestLogs(snapshot.requestLogs);
       setOverviewStats(snapshot.overviewStats);
@@ -462,6 +478,13 @@ export function AdminDashboard({
       description: "Codex 账号",
       icon: UserRoundIcon,
       count: credentials.length,
+    },
+    {
+      id: "proxyPool",
+      label: "代理池",
+      description: "SOCKS 代理",
+      icon: DatabaseIcon,
+      count: proxyPool.length,
     },
     {
       id: "channels",
@@ -667,9 +690,16 @@ export function AdminDashboard({
               <CredentialsSection
                 credentials={credentials}
                 globalSettings={globalSettings}
+                proxyPool={proxyPool}
                 onDeleted={handleCredentialDeleted}
                 onRefreshData={refreshCredentialAndChannelData}
                 onUpdated={handleCredentialUpdated}
+              />
+            )}
+            {activeSection === "proxyPool" && (
+              <ProxyPoolSection
+                proxyPool={proxyPool}
+                onChanged={setProxyPool}
               />
             )}
             {activeSection === "channels" && (
@@ -2229,15 +2259,350 @@ function ApiKeyDeleteDialog({
   );
 }
 
+function ProxyPoolSection({
+  proxyPool,
+  onChanged,
+}: {
+  proxyPool: ProxyPoolRecord[];
+  onChanged: (proxyPool: ProxyPoolRecord[]) => void;
+}) {
+  const [dialogOpen, setDialogOpen] = React.useState(false);
+  const [editing, setEditing] = React.useState<ProxyPoolRecord | null>(null);
+  const [form, setForm] = React.useState<ProxyPoolFormState>(() =>
+    emptyProxyPoolForm(),
+  );
+  const [pendingId, setPendingId] = React.useState<string | null>(null);
+  const [saving, setSaving] = React.useState(false);
+
+  function patchForm(patch: Partial<ProxyPoolFormState>) {
+    setForm((current) => ({ ...current, ...patch }));
+  }
+
+  function openCreate() {
+    setEditing(null);
+    setForm(emptyProxyPoolForm());
+    setDialogOpen(true);
+  }
+
+  function openEdit(proxy: ProxyPoolRecord) {
+    setEditing(proxy);
+    setForm(proxyPoolForm(proxy));
+    setDialogOpen(true);
+  }
+
+  async function refreshProxyPool() {
+    onChanged(await listProxyPoolItems());
+  }
+
+  async function saveProxy() {
+    const payload = proxyPoolPayload(form, editing);
+    if (!payload) {
+      return;
+    }
+    setSaving(true);
+    try {
+      if (editing) {
+        const updated = await updateProxyPoolItem(editing.id, payload);
+        onChanged([
+          updated,
+          ...proxyPool.filter((proxy) => proxy.id !== updated.id),
+        ]);
+        toast.success("代理已更新");
+      } else {
+        const created = await createProxyPoolItem(payload);
+        onChanged([created, ...proxyPool]);
+        toast.success("代理已添加");
+      }
+      setDialogOpen(false);
+      setEditing(null);
+      setForm(emptyProxyPoolForm());
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function removeProxy(proxy: ProxyPoolRecord) {
+    setPendingId(proxy.id);
+    try {
+      await deleteProxyPoolItem(proxy.id);
+      onChanged(proxyPool.filter((item) => item.id !== proxy.id));
+      toast.success("代理已删除");
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setPendingId(null);
+    }
+  }
+
+  return (
+    <>
+      <Card>
+        <CardHeader>
+          <CardTitle>代理池</CardTitle>
+          <CardDescription>
+            集中保存 SOCKS5 / SOCKS5H 代理账密，之后可在 Codex
+            凭据设置中直接选择使用。
+          </CardDescription>
+          <CardAction>
+            <div className="flex flex-wrap justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={refreshProxyPool}
+              >
+                <RefreshCwIcon data-icon="inline-start" />
+                刷新
+              </Button>
+              <Button type="button" onClick={openCreate}>
+                <PlusIcon data-icon="inline-start" />
+                添加代理
+              </Button>
+            </div>
+          </CardAction>
+        </CardHeader>
+        <CardContent>
+          {proxyPool.length === 0 ? (
+            <Empty className="min-h-64">
+              <EmptyHeader>
+                <EmptyMedia variant="icon">
+                  <DatabaseIcon />
+                </EmptyMedia>
+                <EmptyTitle>还没有代理</EmptyTitle>
+                <EmptyDescription>
+                  添加代理后，可以在凭据设置里下拉选择，不用重复输入账密。
+                </EmptyDescription>
+              </EmptyHeader>
+              <Button type="button" onClick={openCreate}>
+                <PlusIcon data-icon="inline-start" />
+                添加代理
+              </Button>
+            </Empty>
+          ) : (
+            <div className="overflow-hidden rounded-lg border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>名称</TableHead>
+                    <TableHead>地址</TableHead>
+                    <TableHead>认证</TableHead>
+                    <TableHead>状态</TableHead>
+                    <TableHead>最近使用</TableHead>
+                    <TableHead className="text-right">操作</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {proxyPool.map((proxy) => (
+                    <TableRow key={proxy.id}>
+                      <TableCell>
+                        <div className="grid gap-1">
+                          <span className="font-medium">{proxy.name}</span>
+                          {proxy.notes && (
+                            <span className="text-xs text-muted-foreground">
+                              {proxy.notes}
+                            </span>
+                          )}
+                        </div>
+                      </TableCell>
+                      <TableCell className="font-mono text-xs">
+                        {proxy.type}://{proxy.host}:{proxy.port}
+                      </TableCell>
+                      <TableCell>
+                        {proxy.username ? (
+                          <Badge variant="outline">
+                            {proxy.username}
+                            {proxy.passwordSet ? ":******" : ""}
+                          </Badge>
+                        ) : (
+                          <Badge variant="outline">无用户名</Badge>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        <Badge
+                          variant={proxy.enabled ? "secondary" : "outline"}
+                        >
+                          {proxy.enabled ? "已启用" : "已停用"}
+                        </Badge>
+                      </TableCell>
+                      <TableCell>
+                        {formatNullableDate(proxy.lastUsedAt)}
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex justify-end gap-2">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            disabled={pendingId === proxy.id}
+                            onClick={() => openEdit(proxy)}
+                          >
+                            <PencilIcon data-icon="inline-start" />
+                            编辑
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            disabled={pendingId === proxy.id}
+                            onClick={() => removeProxy(proxy)}
+                          >
+                            {pendingId === proxy.id ? (
+                              <Spinner data-icon="inline-start" />
+                            ) : (
+                              <Trash2Icon data-icon="inline-start" />
+                            )}
+                            删除
+                          </Button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>{editing ? "编辑代理" : "添加代理"}</DialogTitle>
+            <DialogDescription>
+              密码会在服务端加密保存，前端列表不会返回明文。
+            </DialogDescription>
+          </DialogHeader>
+          <FieldGroup>
+            <Field>
+              <FieldLabel>名称</FieldLabel>
+              <Input
+                disabled={saving}
+                value={form.name}
+                placeholder="香港 GOST 01"
+                onChange={(event) => patchForm({ name: event.target.value })}
+              />
+            </Field>
+            <div className="grid gap-3 sm:grid-cols-[0.8fr_1fr_0.7fr]">
+              <Field>
+                <FieldLabel>协议</FieldLabel>
+                <select
+                  className="h-9 rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={saving}
+                  value={form.type}
+                  onChange={(event) =>
+                    patchForm({
+                      type: event.target.value as CredentialProxyType,
+                    })
+                  }
+                >
+                  <option value="socks5h">socks5h</option>
+                  <option value="socks5">socks5</option>
+                </select>
+              </Field>
+              <Field>
+                <FieldLabel>主机</FieldLabel>
+                <Input
+                  disabled={saving}
+                  value={form.host}
+                  placeholder="127.0.0.1"
+                  onChange={(event) => patchForm({ host: event.target.value })}
+                />
+              </Field>
+              <Field>
+                <FieldLabel>端口</FieldLabel>
+                <Input
+                  disabled={saving}
+                  inputMode="numeric"
+                  value={form.port}
+                  placeholder="1080"
+                  onChange={(event) => patchForm({ port: event.target.value })}
+                />
+              </Field>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field>
+                <FieldLabel>用户名（可选）</FieldLabel>
+                <Input
+                  disabled={saving}
+                  value={form.username}
+                  placeholder="username"
+                  onChange={(event) =>
+                    patchForm({ username: event.target.value })
+                  }
+                />
+              </Field>
+              <Field>
+                <FieldLabel>密码（留空保持原密码）</FieldLabel>
+                <Input
+                  disabled={saving}
+                  type="password"
+                  value={form.password}
+                  placeholder={
+                    editing?.passwordSet ? "已设置，留空保持不变" : "password"
+                  }
+                  onChange={(event) =>
+                    patchForm({ password: event.target.value })
+                  }
+                />
+              </Field>
+            </div>
+            <Field>
+              <FieldLabel>备注</FieldLabel>
+              <Textarea
+                disabled={saving}
+                value={form.notes}
+                placeholder="可选备注"
+                onChange={(event) => patchForm({ notes: event.target.value })}
+              />
+            </Field>
+            <Field orientation="horizontal">
+              <FieldContent>
+                <FieldLabel>启用代理</FieldLabel>
+                <FieldDescription>
+                  停用后引用它的凭据会继续回退到全局代理或直连。
+                </FieldDescription>
+              </FieldContent>
+              <Switch
+                checked={form.enabled}
+                disabled={saving}
+                onCheckedChange={(checked) =>
+                  patchForm({ enabled: Boolean(checked) })
+                }
+              />
+            </Field>
+          </FieldGroup>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={saving}
+              onClick={() => setDialogOpen(false)}
+            >
+              取消
+            </Button>
+            <Button type="button" disabled={saving} onClick={saveProxy}>
+              {saving && <Spinner data-icon="inline-start" />}
+              保存代理
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
 function CredentialsSection({
   credentials,
   globalSettings,
+  proxyPool,
   onDeleted,
   onRefreshData,
   onUpdated,
 }: {
   credentials: CodexCredentialRecord[];
   globalSettings: GlobalSettingsRecord;
+  proxyPool: ProxyPoolRecord[];
   onDeleted: (id: string) => void;
   onRefreshData: () => Promise<{
     credentials: CodexCredentialRecord[];
@@ -2610,6 +2975,7 @@ function CredentialsSection({
                             onDeleted={() => remove(credential)}
                             onRefreshToken={() => refreshToken(credential)}
                             onSaved={onUpdated}
+                            proxyPool={proxyPool}
                           />
                         </div>
                       </div>
@@ -2657,6 +3023,7 @@ function CredentialsSection({
                         <CredentialProxyBadge
                           credential={credential}
                           globalSettings={globalSettings}
+                          proxyPool={proxyPool}
                         />
                       </div>
 
@@ -2837,10 +3204,12 @@ function CredentialProxyControls({
   credential,
   disabled,
   onSaved,
+  proxyPool,
 }: {
   credential: CodexCredentialRecord;
   disabled: boolean;
   onSaved: (credential: CodexCredentialRecord) => void;
+  proxyPool: ProxyPoolRecord[];
 }) {
   const [form, setForm] = React.useState(() => credentialProxyForm(credential));
   const [saving, setSaving] = React.useState(false);
@@ -2911,6 +3280,21 @@ function CredentialProxyControls({
     }
   }
 
+  async function saveProxyPoolId(proxyPoolId: string | null) {
+    setSaving(true);
+    try {
+      const updated = await updateCredentialRouting(credential.id, {
+        proxyPoolId,
+      });
+      onSaved(updated);
+      toast.success(proxyPoolId ? "已选择代理池代理" : "代理池选择已清除");
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setSaving(false);
+    }
+  }
+
   async function saveUseGlobalProxy(useGlobalProxy: boolean) {
     setSaving(true);
     try {
@@ -2972,17 +3356,40 @@ function CredentialProxyControls({
         />
       </div>
 
-      <div className="flex items-center justify-between gap-3 rounded-md border border-border/50 bg-background/50 p-2">
-        <div>
-          <div className="font-medium">使用全局代理</div>
-          <div className="text-xs text-muted-foreground">无本地代理时回退</div>
+      <div className="grid gap-2 sm:grid-cols-2">
+        <div className="flex items-center justify-between gap-3 rounded-md border border-border/50 bg-background/50 p-2">
+          <div>
+            <div className="font-medium">使用全局代理</div>
+            <div className="text-xs text-muted-foreground">
+              无本地/代理池代理时回退
+            </div>
+          </div>
+          <Switch
+            checked={credential.useGlobalProxy}
+            disabled={pending}
+            size="sm"
+            onCheckedChange={(checked) => saveUseGlobalProxy(Boolean(checked))}
+          />
         </div>
-        <Switch
-          checked={credential.useGlobalProxy}
-          disabled={pending}
-          size="sm"
-          onCheckedChange={(checked) => saveUseGlobalProxy(Boolean(checked))}
-        />
+        <label className="grid gap-1 rounded-md border border-border/50 bg-background/50 p-2 text-xs text-muted-foreground">
+          代理池
+          <select
+            className="h-9 rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={pending}
+            value={credential.proxyPoolId ?? ""}
+            onChange={(event) =>
+              saveProxyPoolId(event.target.value ? event.target.value : null)
+            }
+          >
+            <option value="">不使用代理池</option>
+            {proxyPool.map((proxy) => (
+              <option key={proxy.id} value={proxy.id}>
+                {proxy.name} · {proxy.type}://{proxy.host}:{proxy.port}
+                {proxy.enabled ? "" : "（已停用）"}
+              </option>
+            ))}
+          </select>
+        </label>
       </div>
 
       <div className="grid gap-2 sm:grid-cols-[0.8fr_1fr_0.7fr]">
@@ -3047,7 +3454,8 @@ function CredentialProxyControls({
 
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="text-xs text-muted-foreground">
-          当前：{credentialProxyText(credential)} · 全局：
+          当前：{credentialProxyText(credential)} · 代理池：
+          {proxyPoolSelectionText(credential, proxyPool)} · 全局：
           {credential.useGlobalProxy ? "开启" : "关闭"}
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -3343,12 +3751,14 @@ function CredentialSettingsDialog({
   onDeleted,
   onRefreshToken,
   onSaved,
+  proxyPool,
 }: {
   credential: CodexCredentialRecord;
   disabled: boolean;
   onDeleted: () => Promise<void>;
   onRefreshToken: () => Promise<void>;
   onSaved: (credential: CodexCredentialRecord) => void;
+  proxyPool: ProxyPoolRecord[];
 }) {
   const [open, setOpen] = React.useState(false);
   const [refreshingToken, setRefreshingToken] = React.useState(false);
@@ -3489,10 +3899,11 @@ function CredentialSettingsDialog({
             />
 
             <CredentialProxyControls
-              key={`${credential.id}:${credential.proxy?.enabled}:${credential.proxy?.type}:${credential.proxy?.host}:${credential.proxy?.port}:${credential.proxy?.username}:${credential.proxy?.passwordSet}`}
+              key={`${credential.id}:${credential.proxyPoolId}:${credential.proxy?.enabled}:${credential.proxy?.type}:${credential.proxy?.host}:${credential.proxy?.port}:${credential.proxy?.username}:${credential.proxy?.passwordSet}`}
               credential={credential}
               disabled={disabled}
               onSaved={onSaved}
+              proxyPool={proxyPool}
             />
           </section>
         </div>
@@ -3504,9 +3915,11 @@ function CredentialSettingsDialog({
 function CredentialProxyBadge({
   credential,
   globalSettings,
+  proxyPool,
 }: {
   credential: CodexCredentialRecord;
   globalSettings: GlobalSettingsRecord;
+  proxyPool: ProxyPoolRecord[];
 }) {
   const proxy = credential.proxy;
   if (proxy?.enabled) {
@@ -3517,6 +3930,25 @@ function CredentialProxyBadge({
         title={credentialProxyText(credential)}
       >
         已启用 · {proxy.type}
+      </Badge>
+    );
+  }
+
+  if (credential.proxyPoolId) {
+    const pooledProxy = proxyPool.find(
+      (proxy) => proxy.id === credential.proxyPoolId,
+    );
+    if (!pooledProxy) {
+      return (
+        <Badge variant="outline" title="已选择代理池代理，但该代理不存在">
+          代理池 · 缺失
+        </Badge>
+      );
+    }
+    return (
+      <Badge variant="outline" title={proxyPoolRecordText(pooledProxy)}>
+        代理池 · {pooledProxy.enabled ? "已启用" : "已停用"} ·{" "}
+        {pooledProxy.type}
       </Badge>
     );
   }
@@ -5471,6 +5903,81 @@ function globalProxySourceLabel(source: GlobalSettingsRecord["proxySource"]) {
     none: "未配置",
   };
   return labels[source] || source;
+}
+
+function emptyProxyPoolForm(): ProxyPoolFormState {
+  return {
+    name: "",
+    enabled: true,
+    type: "socks5h",
+    host: "",
+    port: "1080",
+    username: "",
+    password: "",
+    notes: "",
+  };
+}
+
+function proxyPoolForm(proxy: ProxyPoolRecord): ProxyPoolFormState {
+  return {
+    name: proxy.name,
+    enabled: proxy.enabled,
+    type: proxy.type,
+    host: proxy.host,
+    port: String(proxy.port),
+    username: proxy.username,
+    password: "",
+    notes: proxy.notes,
+  };
+}
+
+function proxyPoolPayload(
+  form: ProxyPoolFormState,
+  existing: ProxyPoolRecord | null,
+): ProxyPoolPayload | null {
+  const name = form.name.trim();
+  const host = form.host.trim();
+  const port = integerValue(form.port, 0);
+  if (!name) {
+    toast.error("请输入代理名称");
+    return null;
+  }
+  if (!host) {
+    toast.error("请输入 SOCKS5 代理主机");
+    return null;
+  }
+  if (port < 1 || port > 65535) {
+    toast.error("代理端口必须在 1 到 65535 之间");
+    return null;
+  }
+  return {
+    name,
+    enabled: form.enabled,
+    type: form.type,
+    host,
+    port,
+    username: form.username.trim(),
+    ...(form.password.trim() || !existing ? { password: form.password } : {}),
+    notes: form.notes.trim(),
+  };
+}
+
+function proxyPoolRecordText(proxy: ProxyPoolRecord) {
+  const auth = proxy.username
+    ? `${proxy.username}${proxy.passwordSet ? ":******" : ""}@`
+    : "";
+  return `${proxy.enabled ? "已启用" : "已停用"} · ${proxy.type}://${auth}${proxy.host}:${proxy.port}`;
+}
+
+function proxyPoolSelectionText(
+  credential: CodexCredentialRecord,
+  proxyPool: ProxyPoolRecord[],
+) {
+  if (!credential.proxyPoolId) {
+    return "未选择";
+  }
+  const proxy = proxyPool.find((item) => item.id === credential.proxyPoolId);
+  return proxy ? proxyPoolRecordText(proxy) : "代理不存在";
 }
 
 function credentialProxyForm(

@@ -256,6 +256,30 @@ function migrateMainDb(db: DatabaseSync) {
   applyMigration(db, "005_credential_proxy", (database) => {
     addColumnIfMissing(database, "codex_credentials", "proxy_envelope", "TEXT");
   });
+
+  applyMigration(
+    db,
+    "006_proxy_pool",
+    `
+      CREATE TABLE IF NOT EXISTS proxy_pool (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        type TEXT NOT NULL CHECK (type IN ('socks5', 'socks5h')),
+        host TEXT NOT NULL,
+        port INTEGER NOT NULL,
+        username TEXT NOT NULL DEFAULT '',
+        password_envelope TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+        notes TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_used_at TEXT
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS idx_proxy_pool_enabled
+        ON proxy_pool(enabled, updated_at);
+    `,
+  );
 }
 
 function migrateLogDb(db: DatabaseSync) {
