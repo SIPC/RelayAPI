@@ -19,6 +19,8 @@ import type {
 const GLOBAL_PROXY_SETTING_KEY = "global_proxy";
 const CODEX_USER_AGENT_SETTING_KEY = "codex_user_agent";
 const FULL_REQUEST_LOGGING_SETTING_KEY = "full_request_logging";
+const CODEX_AUTO_DISABLE_REFRESH_EXHAUSTED_SETTING_KEY =
+  "codex_auto_disable_refresh_exhausted";
 const REQUEST_LOG_RETENTION_DAYS_SETTING_KEY = "request_log_retention_days";
 const REQUEST_LOG_DETAIL_RETENTION_DAYS_SETTING_KEY =
   "request_log_detail_retention_days";
@@ -50,11 +52,14 @@ export function getPublicGlobalSettings(): GlobalSettingsRecord {
   const stored = readStoredGlobalProxy();
   const storedUserAgent = readStoredUserAgent();
   const fullRequestLoggingEnabled = getFullRequestLoggingSetting();
+  const codexAutoDisableRefreshExhausted =
+    getCodexAutoDisableRefreshExhaustedSetting();
   const retentionSettings = getRequestLogRetentionSettings();
   const updatedAt = latestUpdatedAt(
     getSettingUpdatedAt(GLOBAL_PROXY_SETTING_KEY),
     getSettingUpdatedAt(CODEX_USER_AGENT_SETTING_KEY),
     getSettingUpdatedAt(FULL_REQUEST_LOGGING_SETTING_KEY),
+    getSettingUpdatedAt(CODEX_AUTO_DISABLE_REFRESH_EXHAUSTED_SETTING_KEY),
     getSettingUpdatedAt(REQUEST_LOG_RETENTION_DAYS_SETTING_KEY),
     getSettingUpdatedAt(REQUEST_LOG_DETAIL_RETENTION_DAYS_SETTING_KEY),
   );
@@ -67,6 +72,7 @@ export function getPublicGlobalSettings(): GlobalSettingsRecord {
         ? "database"
         : serverConfig.userAgentSource,
       fullRequestLoggingEnabled,
+      codexAutoDisableRefreshExhausted,
       ...retentionSettings,
       updatedAt,
     };
@@ -80,6 +86,7 @@ export function getPublicGlobalSettings(): GlobalSettingsRecord {
         ? "database"
         : serverConfig.userAgentSource,
       fullRequestLoggingEnabled,
+      codexAutoDisableRefreshExhausted,
       ...retentionSettings,
       updatedAt,
     };
@@ -92,6 +99,7 @@ export function getPublicGlobalSettings(): GlobalSettingsRecord {
       ? "database"
       : serverConfig.userAgentSource,
     fullRequestLoggingEnabled,
+    codexAutoDisableRefreshExhausted,
     ...retentionSettings,
     updatedAt,
   };
@@ -101,6 +109,7 @@ export function patchGlobalSettings(input: {
   proxy?: unknown;
   userAgent?: unknown;
   fullRequestLoggingEnabled?: unknown;
+  codexAutoDisableRefreshExhausted?: unknown;
   requestLogRetentionDays?: unknown;
   requestLogDetailRetentionDays?: unknown;
 }) {
@@ -126,6 +135,12 @@ export function patchGlobalSettings(input: {
       input.fullRequestLoggingEnabled ? "1" : "0",
     );
   }
+  if (Object.hasOwn(input, "codexAutoDisableRefreshExhausted")) {
+    upsertSettingValue(
+      CODEX_AUTO_DISABLE_REFRESH_EXHAUSTED_SETTING_KEY,
+      input.codexAutoDisableRefreshExhausted ? "1" : "0",
+    );
+  }
   if (Object.hasOwn(input, "requestLogRetentionDays")) {
     upsertSettingValue(
       REQUEST_LOG_RETENTION_DAYS_SETTING_KEY,
@@ -143,6 +158,12 @@ export function patchGlobalSettings(input: {
 
 export function getFullRequestLoggingSetting() {
   return getSettingValue(FULL_REQUEST_LOGGING_SETTING_KEY) === "1";
+}
+
+export function getCodexAutoDisableRefreshExhaustedSetting() {
+  return (
+    getSettingValue(CODEX_AUTO_DISABLE_REFRESH_EXHAUSTED_SETTING_KEY) === "1"
+  );
 }
 
 export function getRequestLogRetentionSettings() {

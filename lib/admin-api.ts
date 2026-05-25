@@ -466,6 +466,7 @@ export function updateGlobalSettings(payload: {
   proxy?: CredentialProxyPayload;
   userAgent?: string | null;
   fullRequestLoggingEnabled?: boolean;
+  codexAutoDisableRefreshExhausted?: boolean;
   requestLogRetentionDays?: number;
   requestLogDetailRetentionDays?: number;
 }) {

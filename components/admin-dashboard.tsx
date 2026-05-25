@@ -713,7 +713,7 @@ export function AdminDashboard({
             )}
             {activeSection === "settings" && (
               <SettingsSection
-                key={`${globalSettings.proxySource}:${globalSettings.proxy?.enabled}:${globalSettings.proxy?.type}:${globalSettings.proxy?.host}:${globalSettings.proxy?.port}:${globalSettings.proxy?.username}:${globalSettings.proxy?.passwordSet}:${globalSettings.userAgentSource}:${globalSettings.userAgent}:${globalSettings.fullRequestLoggingEnabled}:${globalSettings.requestLogRetentionDays}:${globalSettings.requestLogDetailRetentionDays}:${globalSettings.updatedAt}`}
+                key={`${globalSettings.proxySource}:${globalSettings.proxy?.enabled}:${globalSettings.proxy?.type}:${globalSettings.proxy?.host}:${globalSettings.proxy?.port}:${globalSettings.proxy?.username}:${globalSettings.proxy?.passwordSet}:${globalSettings.userAgentSource}:${globalSettings.userAgent}:${globalSettings.fullRequestLoggingEnabled}:${globalSettings.codexAutoDisableRefreshExhausted}:${globalSettings.requestLogRetentionDays}:${globalSettings.requestLogDetailRetentionDays}:${globalSettings.updatedAt}`}
                 settings={globalSettings}
                 onSaved={setGlobalSettings}
               />
@@ -749,6 +749,7 @@ function SettingsSection({
   const [userAgent, setUserAgent] = React.useState(settings.userAgent);
   const [userAgentSaving, setUserAgentSaving] = React.useState(false);
   const [loggingSaving, setLoggingSaving] = React.useState(false);
+  const [refreshPolicySaving, setRefreshPolicySaving] = React.useState(false);
   const [retentionSaving, setRetentionSaving] = React.useState(false);
   const [pruning, setPruning] = React.useState(false);
   const [retentionForm, setRetentionForm] = React.useState(() => ({
@@ -892,6 +893,25 @@ function SettingsSection({
     }
   }
 
+  async function updateCodexAutoDisableRefreshExhausted(enabled: boolean) {
+    setRefreshPolicySaving(true);
+    try {
+      const updated = await updateGlobalSettings({
+        codexAutoDisableRefreshExhausted: enabled,
+      });
+      onSaved(updated);
+      toast.success(
+        enabled
+          ? "Token 刷新失败自动禁用已开启"
+          : "Token 刷新失败自动禁用已关闭",
+      );
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setRefreshPolicySaving(false);
+    }
+  }
+
   async function saveRetentionSettings() {
     const requestLogRetentionDays = integerValue(
       retentionForm.requestLogRetentionDays,
@@ -980,18 +1000,19 @@ function SettingsSection({
             代理。凭据也可以单独覆盖 User-Agent。
           </CardDescription>
         </CardHeader>
-        <CardContent className="grid gap-4">
-          <Alert className="items-start">
+        <CardContent className="grid gap-4 xl:grid-cols-2">
+          <Alert className="items-start xl:col-span-2">
             <SettingsIcon className="size-4" />
             <AlertTitle>生效范围</AlertTitle>
             <AlertDescription>
               User-Agent 按“凭据覆盖 → 数据库全局设置 →
-              环境变量/默认值”生效。全局代理只用于 OAuth 登录 callback 换
-              token；后续 refresh_token 和额度查询默认不使用全局代理。
+              环境变量/默认值”生效。全局代理用于 OAuth 登录 callback 换
+              token；后续 refresh_token
+              和额度查询需在单个凭据中开启全局代理回退。
             </AlertDescription>
           </Alert>
 
-          <div className="grid gap-3 rounded-lg border border-border/60 bg-muted/25 p-3 text-sm">
+          <div className="grid gap-3 rounded-lg border border-border/60 bg-muted/25 p-3 text-sm xl:col-span-2">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
               <div className="grid gap-1">
                 <div className="font-medium">Codex User-Agent</div>
@@ -1037,8 +1058,8 @@ function SettingsSection({
             </div>
           </div>
 
-          <div className="grid gap-3 rounded-lg border border-border/60 bg-muted/25 p-3 text-sm">
-            <div className="flex items-center justify-between gap-3">
+          <div className="grid h-full gap-3 rounded-lg border border-border/60 bg-muted/25 p-3 text-sm">
+            <div className="flex items-start justify-between gap-3">
               <div>
                 <div className="font-medium">记录完整日志</div>
                 <div className="text-xs text-muted-foreground">
@@ -1057,9 +1078,30 @@ function SettingsSection({
             </div>
           </div>
 
-          <div className="grid gap-3 rounded-lg border border-border/60 bg-muted/25 p-3 text-sm">
+          <div className="grid h-full gap-3 rounded-lg border border-border/60 bg-muted/25 p-3 text-sm">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="font-medium">自动停用错误凭据</div>
+                <div className="text-xs text-muted-foreground">
+                  Token 定时刷新始终会在凭据过期前 4
+                  天尝试执行；失败后每天再试，最多总共尝试 3
+                  次。开启此开关后，达到次数上限的错误凭据会自动停用；关闭时仅标记错误，不影响自动刷新。
+                </div>
+              </div>
+              <Switch
+                checked={settings.codexAutoDisableRefreshExhausted}
+                disabled={refreshPolicySaving}
+                size="sm"
+                onCheckedChange={(checked) =>
+                  void updateCodexAutoDisableRefreshExhausted(Boolean(checked))
+                }
+              />
+            </div>
+          </div>
+
+          <div className="grid h-full gap-3 rounded-lg border border-border/60 bg-muted/25 p-3 text-sm">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-              <div className="space-y-1">
+              <div className="grid gap-1">
                 <div className="font-medium">日志保留与清理</div>
                 <div className="text-xs text-muted-foreground">
                   概要日志会影响总览统计；详细日志包含请求/响应体，建议保留更短时间。
@@ -1147,8 +1189,8 @@ function SettingsSection({
             </div>
           </div>
 
-          <div className="grid gap-3 rounded-lg border border-border/60 bg-muted/25 p-3 text-sm">
-            <div className="flex items-center justify-between gap-3">
+          <div className="grid h-full gap-3 rounded-lg border border-border/60 bg-muted/25 p-3 text-sm">
+            <div className="flex items-start justify-between gap-3">
               <div>
                 <div className="font-medium">OAuth 登录代理</div>
                 <div className="text-xs text-muted-foreground">
@@ -1167,7 +1209,7 @@ function SettingsSection({
               />
             </div>
 
-            <div className="grid gap-2 sm:grid-cols-[0.8fr_1fr_0.7fr]">
+            <div className="grid gap-2 sm:grid-cols-2 2xl:grid-cols-[0.8fr_1fr_0.7fr]">
               <label className="grid gap-1 text-xs text-muted-foreground">
                 协议
                 <select
@@ -3026,6 +3068,7 @@ function CredentialsSection({
                 const quotaLoading = quotaLoadingIds.has(credential.id);
                 const name =
                   credential.email || credential.accountId || "未知账号";
+                const refreshStatus = codexTokenRefreshStatus(credential);
 
                 return (
                   <Card
@@ -3060,6 +3103,30 @@ function CredentialsSection({
                         </div>
                       </div>
 
+                      {(refreshStatus.exhausted ||
+                        refreshStatus.attemptCount > 0 ||
+                        refreshStatus.autoDisabled ||
+                        !credential.enabled) && (
+                        <div className="flex flex-wrap gap-1.5">
+                          {!credential.enabled && (
+                            <Badge variant="outline">
+                              {refreshStatus.autoDisabled
+                                ? "自动停用"
+                                : "已停用"}
+                            </Badge>
+                          )}
+                          {refreshStatus.exhausted ? (
+                            <Badge variant="destructive">Token 刷新错误</Badge>
+                          ) : refreshStatus.attemptCount > 0 ? (
+                            <Badge variant="outline">
+                              Token 刷新{" "}
+                              {formatNumber(refreshStatus.attemptCount)}
+                              /3
+                            </Badge>
+                          ) : null}
+                        </div>
+                      )}
+
                       <div className="grid gap-2 text-sm">
                         <div className="flex items-center gap-2">
                           <span className="shrink-0 text-muted-foreground">
@@ -3092,6 +3159,44 @@ function CredentialsSection({
                           <div className="text-xs text-amber-600 dark:text-amber-300">
                             凭据冷却至{" "}
                             {formatNullableDate(credential.cooldownUntil)}
+                          </div>
+                        )}
+                        {refreshStatus.hasNotice && (
+                          <div
+                            className={
+                              refreshStatus.exhausted
+                                ? "text-xs text-destructive"
+                                : "text-xs text-amber-600 dark:text-amber-300"
+                            }
+                          >
+                            {refreshStatus.exhausted ? (
+                              <>
+                                {refreshStatus.autoDisabled
+                                  ? "Token 自动刷新已连续失败 3 次，凭据已自动停用。"
+                                  : "Token 自动刷新已连续失败 3 次。"}
+                              </>
+                            ) : (
+                              <>
+                                Token 自动刷新失败{" "}
+                                {formatNumber(refreshStatus.attemptCount)}/3
+                                {refreshStatus.nextAttemptAt && (
+                                  <>
+                                    ，下次尝试：
+                                    <LocalDateTime
+                                      value={refreshStatus.nextAttemptAt}
+                                    />
+                                  </>
+                                )}
+                              </>
+                            )}
+                            {refreshStatus.lastError && (
+                              <>。原因：{refreshStatus.lastError}</>
+                            )}
+                          </div>
+                        )}
+                        {credential.lastError && !refreshStatus.hasNotice && (
+                          <div className="text-xs text-destructive">
+                            {credential.lastError}
                           </div>
                         )}
                       </div>
@@ -4081,6 +4186,28 @@ function CredentialSettingsDialog({
       </DialogContent>
     </Dialog>
   );
+}
+
+function codexTokenRefreshStatus(credential: CodexCredentialRecord) {
+  const attemptCount = metadataInteger(
+    credential.metadata.token_refresh_attempt_count,
+  );
+  const exhausted = credential.metadata.token_refresh_exhausted === true;
+  const autoDisabled = credential.metadata.token_refresh_auto_disabled === true;
+  const nextAttemptAt = metadataString(
+    credential.metadata.token_refresh_next_attempt_at,
+  );
+  const lastError =
+    metadataString(credential.metadata.token_refresh_last_error) ||
+    (exhausted ? credential.lastError || "" : "");
+  return {
+    attemptCount,
+    exhausted,
+    autoDisabled,
+    nextAttemptAt,
+    lastError,
+    hasNotice: exhausted || attemptCount > 0,
+  };
 }
 
 function CredentialProxyBadge({
@@ -6300,6 +6427,15 @@ function formatDateTime(value: string) {
     parts.find((item) => item.type === type)?.value || "";
 
   return `${part("year")}-${part("month")}-${part("day")} ${part("hour")}:${part("minute")}:${part("second")}`;
+}
+
+function metadataString(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function metadataInteger(value: unknown) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
 }
 
 function parseUtcDate(value: string | null | undefined) {

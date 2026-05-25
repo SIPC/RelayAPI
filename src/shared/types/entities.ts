@@ -152,6 +152,7 @@ export interface GlobalSettingsRecord {
   userAgent: string;
   userAgentSource: "database" | "environment" | "default";
   fullRequestLoggingEnabled: boolean;
+  codexAutoDisableRefreshExhausted: boolean;
   requestLogRetentionDays: number | null;
   requestLogDetailRetentionDays: number | null;
   updatedAt: string | null;

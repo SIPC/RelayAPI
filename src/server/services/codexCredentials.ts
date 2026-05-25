@@ -51,6 +51,17 @@ interface PendingOAuthState {
 }
 
 const OAUTH_STATE_TTL_MS = 15 * 60 * 1000;
+const TOKEN_REFRESH_ERROR_PREFIX = "Codex token 自动刷新失败";
+const TOKEN_REFRESH_METADATA_KEYS = [
+  "token_refresh_attempt_count",
+  "token_refresh_next_attempt_at",
+  "token_refresh_last_attempt_at",
+  "token_refresh_last_failed_at",
+  "token_refresh_last_error",
+  "token_refresh_exhausted",
+  "token_refresh_exhausted_at",
+  "token_refresh_auto_disabled",
+] as const;
 const pendingStates = new Map<string, PendingOAuthState>();
 let legacyImportAttempted = false;
 
@@ -320,6 +331,10 @@ export async function refreshCodexCredential(id: string) {
   return publicCredential(await refreshCodexCredentialWithTokens(id));
 }
 
+export async function refreshCodexCredentialForScheduler(id: string) {
+  return refreshCodexCredentialWithTokens(id);
+}
+
 export async function exportCodexCredentials() {
   await importLegacyCredentialsOnce();
   return {
@@ -492,7 +507,9 @@ async function refreshCodexCredentialWithTokens(id: string) {
       credential.useGlobalProxy,
       getEffectiveCodexUserAgent(credential),
     );
-    return await saveTokenResponse(tokenResponse, credential);
+    return clearCodexTokenRefreshState(
+      await saveTokenResponse(tokenResponse, credential),
+    );
   } catch (error) {
     logServerError(error, {
       operation: "codex.refresh_token",
@@ -521,14 +538,18 @@ export async function ensureFreshCredential(id: string) {
   const expiresAt = Date.parse(
     credential.expiresAt || credential.tokens.expired || "",
   );
-  if (!Number.isFinite(expiresAt)) {
+  if (!Number.isFinite(expiresAt) || expiresAt > Date.now()) {
     return credential;
   }
-  const refreshLeadMs = 5 * 60 * 1000;
-  if (expiresAt - Date.now() > refreshLeadMs) {
-    return credential;
-  }
-  return refreshCodexCredentialWithTokens(id);
+  throw new HttpError(
+    503,
+    credential.metadata.token_refresh_exhausted === true
+      ? "codex_token_refresh_exhausted"
+      : "codex_token_expired",
+    credential.metadata.token_refresh_exhausted === true
+      ? "Codex credential token refresh has exhausted its retry budget"
+      : "Codex credential token is expired and waiting for scheduled refresh",
+  );
 }
 
 async function exchangeCodeForTokens(input: {
@@ -774,6 +795,45 @@ function publicCredential(
     updatedAt: credential.updatedAt,
     metadata: credential.metadata,
   };
+}
+
+function clearCodexTokenRefreshState(
+  credential: CodexCredentialWithTokens,
+): CodexCredentialWithTokens {
+  if (
+    !hasCodexTokenRefreshState(credential.metadata) &&
+    !isCodexTokenRefreshError(credential)
+  ) {
+    return credential;
+  }
+  const metadata = { ...credential.metadata };
+  for (const key of TOKEN_REFRESH_METADATA_KEYS) {
+    metadata[key] = undefined;
+  }
+  const updated = updateCodexCredential(credential.id, {
+    enabled:
+      credential.metadata.token_refresh_auto_disabled === true
+        ? true
+        : credential.enabled,
+    lastError: stringValue(credential.lastError).startsWith(
+      TOKEN_REFRESH_ERROR_PREFIX,
+    )
+      ? null
+      : credential.lastError,
+    metadata,
+  });
+  return updated || credential;
+}
+
+function hasCodexTokenRefreshState(metadata: Record<string, unknown>) {
+  return TOKEN_REFRESH_METADATA_KEYS.some((key) => metadata[key] !== undefined);
+}
+
+function isCodexTokenRefreshError(credential: CodexCredentialRecord) {
+  return (
+    credential.metadata.token_refresh_exhausted === true ||
+    stringValue(credential.lastError).startsWith(TOKEN_REFRESH_ERROR_PREFIX)
+  );
 }
 
 function codexCredentialLogMetadata(credential: CodexCredentialWithTokens) {
