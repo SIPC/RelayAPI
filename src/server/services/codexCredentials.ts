@@ -62,6 +62,7 @@ const TOKEN_REFRESH_METADATA_KEYS = [
   "token_refresh_exhausted_at",
   "token_refresh_auto_disabled",
 ] as const;
+const USAGE_HEALTH_RESET_METADATA_KEY = "usage_health_reset_at";
 const pendingStates = new Map<string, PendingOAuthState>();
 let legacyImportAttempted = false;
 
@@ -223,6 +224,7 @@ export async function listPublicCodexCredentials() {
   const credentials = listCodexCredentials();
   const healthByCredentialId = credentialUsageHealth(
     credentials.map((credential) => credential.id),
+    { resetSinceById: credentialUsageHealthResetMap(credentials) },
   );
   return credentials.map((credential) => ({
     ...credential,
@@ -316,7 +318,7 @@ export function resolveCredentialProxy(input: {
 }
 
 export async function removeCodexCredential(id: string) {
-  detachCredentialFromChannels(id);
+  detachCredentialFromChannels(id, "codex");
   if (!deleteCodexCredential(id)) {
     throw new HttpError(
       404,
@@ -329,6 +331,36 @@ export async function removeCodexCredential(id: string) {
 export async function refreshCodexCredential(id: string) {
   // Admin callers receive only public credential metadata; token plaintext stays server-side.
   return publicCredential(await refreshCodexCredentialWithTokens(id));
+}
+
+export async function resetCodexCredentialHealth(id: string) {
+  await importLegacyCredentialsOnce();
+  const credential = getCodexCredentialWithTokens(id);
+  if (!credential) {
+    throw new HttpError(
+      404,
+      "codex_credential_not_found",
+      "Codex credential not found",
+    );
+  }
+  const updated = updateCodexCredential(id, {
+    cooldownUntil: null,
+    lastError: isCodexTokenRefreshError(credential)
+      ? credential.lastError
+      : null,
+    metadata: {
+      ...credential.metadata,
+      [USAGE_HEALTH_RESET_METADATA_KEY]: new Date().toISOString(),
+    },
+  });
+  if (!updated) {
+    throw new HttpError(
+      404,
+      "codex_credential_not_found",
+      "Codex credential not found",
+    );
+  }
+  return publicCredential(updated);
 }
 
 export async function refreshCodexCredentialForScheduler(id: string) {
@@ -785,7 +817,9 @@ function publicCredential(
           passwordSet: Boolean(credential.proxy.password),
         }
       : null,
-    usageHealth: credentialUsageHealth([credential.id])[credential.id],
+    usageHealth: credentialUsageHealth([credential.id], {
+      resetSinceById: credentialUsageHealthResetMap([credential]),
+    })[credential.id],
     expiresAt: credential.expiresAt,
     lastRefreshAt: credential.lastRefreshAt,
     lastUsedAt: credential.lastUsedAt,
@@ -795,6 +829,17 @@ function publicCredential(
     updatedAt: credential.updatedAt,
     metadata: credential.metadata,
   };
+}
+
+function credentialUsageHealthResetMap(
+  credentials: Array<Pick<CodexCredentialRecord, "id" | "metadata">>,
+) {
+  return Object.fromEntries(
+    credentials.map((credential) => [
+      credential.id,
+      stringValue(credential.metadata[USAGE_HEALTH_RESET_METADATA_KEY]) || null,
+    ]),
+  );
 }
 
 function clearCodexTokenRefreshState(

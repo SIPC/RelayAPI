@@ -176,9 +176,19 @@ export async function codexFetch(
           },
           proxy,
         ));
-      return { response: fallbackResponse, credential, upstreamPayload };
+      return {
+        response: fallbackResponse,
+        credential,
+        upstreamPayload,
+        upstreamRequestHeaders: headers,
+      };
     }
-    return { response, credential, upstreamPayload };
+    return {
+      response,
+      credential,
+      upstreamPayload,
+      upstreamRequestHeaders: headers,
+    };
   }
   const response =
     (await input.timing?.timeAsync("upstream_fetch", "上游 Fetch", () =>
@@ -211,7 +221,12 @@ export async function codexFetch(
       },
       proxy,
     ));
-  return { response, credential, upstreamPayload };
+  return {
+    response,
+    credential,
+    upstreamPayload,
+    upstreamRequestHeaders: headers,
+  };
 }
 
 export async function codexJson(
@@ -226,11 +241,8 @@ export async function codexJson(
     timing?: StageTimer;
   },
 ) {
-  const { response, credential, upstreamPayload } = await codexFetch(
-    upstreamPath,
-    payload,
-    input,
-  );
+  const { response, credential, upstreamPayload, upstreamRequestHeaders } =
+    await codexFetch(upstreamPath, payload, input);
   const text =
     (await input.timing?.timeAsync(
       "read_upstream_body",
@@ -241,6 +253,7 @@ export async function codexJson(
     response,
     credential,
     upstreamPayload,
+    upstreamRequestHeaders,
     text,
     json: parseMaybeJson<unknown>(text),
   };

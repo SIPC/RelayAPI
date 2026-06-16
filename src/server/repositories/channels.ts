@@ -1,7 +1,11 @@
 import "server-only";
 
 import { getMainDb } from "@/src/server/db/sqlite";
-import type { ChannelRecord, ChannelStatus } from "@/src/shared/types/entities";
+import type {
+  ChannelProvider,
+  ChannelRecord,
+  ChannelStatus,
+} from "@/src/shared/types/entities";
 import { jsonStringify, safeJsonParse } from "@/src/server/services/crypto";
 
 type ChannelRow = {
@@ -26,6 +30,7 @@ type ChannelRow = {
 export interface SaveChannelInput {
   id: string;
   name: string;
+  provider: ChannelProvider;
   baseUrl: string;
   credentialId?: string;
   credentialIds?: string[];
@@ -55,18 +60,24 @@ export function getChannelById(id: string): ChannelRecord | null {
   return row ? toChannelRecord(row) : null;
 }
 
-export function getChannelByCredentialId(credentialId: string) {
+export function getChannelByCredentialId(
+  credentialId: string,
+  provider?: ChannelProvider,
+) {
   const row = getMainDb()
     .prepare(
       `SELECT channels.*
        FROM channels
        LEFT JOIN channel_credentials
          ON channel_credentials.channel_id = channels.id
-       WHERE channels.credential_id = ? OR channel_credentials.credential_id = ?
+       WHERE (channels.credential_id = ? OR channel_credentials.credential_id = ?)
+         AND (? IS NULL OR channels.provider = ?)
        ORDER BY channels.created_at ASC
        LIMIT 1`,
     )
-    .get(credentialId, credentialId) as ChannelRow | undefined;
+    .get(credentialId, credentialId, provider || null, provider || null) as
+    | ChannelRow
+    | undefined;
   return row ? toChannelRecord(row) : null;
 }
 
@@ -79,11 +90,12 @@ export function insertChannel(input: SaveChannelInput) {
       `INSERT INTO channels (
         id, name, provider, base_url, credential_id, enabled, priority,
         weight, model_allowlist_json, status, health_score, created_at, updated_at
-      ) VALUES (?, ?, 'codex', ?, ?, ?, ?, ?, ?, ?, 100, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 100, ?, ?)`,
     )
     .run(
       input.id,
       input.name,
+      input.provider,
       input.baseUrl,
       primaryCredentialId,
       input.enabled ? 1 : 0,
@@ -172,8 +184,14 @@ export function deleteChannel(id: string) {
   return result.changes > 0;
 }
 
-export function detachCredentialFromChannels(credentialId: string) {
+export function detachCredentialFromChannels(
+  credentialId: string,
+  provider?: ChannelProvider,
+) {
   for (const channel of listChannels()) {
+    if (provider && channel.provider !== provider) {
+      continue;
+    }
     if (!channel.credentialIds.includes(credentialId)) {
       continue;
     }
@@ -182,6 +200,8 @@ export function detachCredentialFromChannels(credentialId: string) {
     );
     if (remainingCredentialIds.length > 0) {
       updateChannel(channel.id, { credentialIds: remainingCredentialIds });
+    } else {
+      deleteChannel(channel.id);
     }
   }
 }
@@ -255,7 +275,7 @@ function toChannelRecord(
   return {
     id: row.id,
     name: row.name,
-    provider: "codex",
+    provider: normalizeProvider(row.provider),
     baseUrl: row.base_url,
     credentialId: row.credential_id,
     credentialIds:
@@ -294,6 +314,10 @@ function cleanUniqueStrings(values: unknown[]) {
         .filter(Boolean),
     ),
   ];
+}
+
+function normalizeProvider(value: string): ChannelProvider {
+  return value === "claude" ? "claude" : "codex";
 }
 
 function normalizeStatus(value: string): ChannelStatus {

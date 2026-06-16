@@ -1,5 +1,11 @@
 import "server-only";
 
+import {
+  CLAUDE_LONG_CONTEXT_SUFFIX,
+  CLAUDE_LONG_CONTEXT_TOKENS,
+  CLAUDE_THINKING_SUFFIX_LEVELS,
+  claudeModelAllowlistCandidates,
+} from "@/src/server/claude/modelSuffix";
 import { serverConfig } from "@/src/server/config/env";
 
 const CREATED_2024_01_01 = 1704067200;
@@ -37,7 +43,37 @@ const FALLBACK_MODEL_BY_ID = new Map(
   ].map((entry) => [entry.id, entry]),
 );
 
-const MODEL_THINKING_SUFFIX_LEVELS = ["high", "xhigh"] as const;
+const CODEX_THINKING_SUFFIX_LEVELS = ["high", "xhigh"] as const;
+const CLAUDE_LONG_CONTEXT_MODEL_IDS = new Set([
+  "claude-sonnet-4-6",
+  "claude-opus-4-6",
+  "claude-opus-4-7",
+  "claude-opus-4-8",
+  "claude-fable-5",
+]);
+const CLAUDE_128K_OUTPUT_MODEL_IDS = new Set([
+  "claude-opus-4-6",
+  "claude-opus-4-7",
+  "claude-opus-4-8",
+  "claude-fable-5",
+]);
+const CLAUDE_MODEL_IDS = [
+  "claude-sonnet-4-5",
+  "claude-sonnet-4-5-20250929",
+  "claude-opus-4-5",
+  "claude-opus-4-5-20251101",
+  "claude-haiku-4-5",
+  "claude-haiku-4-5-20251001",
+  "claude-sonnet-4-20250514",
+  "claude-opus-4-20250514",
+  "claude-3-7-sonnet-20250219",
+  "claude-3-5-haiku-20241022",
+  "claude-sonnet-4-6",
+  "claude-opus-4-6",
+  "claude-opus-4-7",
+  "claude-opus-4-8",
+  "claude-fable-5",
+];
 
 const FALLBACK_PLAN_MODEL_IDS: Record<string, string[]> = {
   free: [
@@ -94,7 +130,9 @@ export async function createModelsResponse(
   });
   const modelAllowlist = input.modelAllowlist || [];
   if (input.openAICompatible) {
-    let models = withThinkingSuffixModels(data);
+    let models = withThinkingSuffixModels(
+      mergeClaudeModels(data, catalog.data),
+    );
     if (modelAllowlist.length > 0) {
       models = models.filter((entry) =>
         modelMatchesAllowlist(entry.id, modelAllowlist),
@@ -193,9 +231,10 @@ function isUsableCatalog(data: unknown) {
   return (
     Boolean(data) &&
     typeof data === "object" &&
-    ["codex-free", "codex-team", "codex-plus", "codex-pro"].some((key) =>
+    (["codex-free", "codex-team", "codex-plus", "codex-pro"].some((key) =>
       Array.isArray((data as Record<string, unknown>)[key]),
-    )
+    ) ||
+      Array.isArray((data as Record<string, unknown>).claude))
   );
 }
 
@@ -229,6 +268,7 @@ function getCodexModelsFromCatalog(
 
 function fallbackCatalog(): Catalog {
   return {
+    claude: fallbackClaudeModels(),
     "codex-free": fallbackModels("free"),
     "codex-team": fallbackModels("team"),
     "codex-plus": fallbackModels("plus"),
@@ -249,6 +289,46 @@ function fallbackModelById(id: string): ModelEntry {
     return structuredClone(found);
   }
   return model(id, id, CREATED_2024_01_01);
+}
+
+function mergeClaudeModels(models: ModelEntry[], catalog: Catalog) {
+  const catalogClaudeModels = Array.isArray(catalog.claude)
+    ? catalog.claude.map(normalizeModelEntry).filter((entry) => entry.id)
+    : [];
+  const fallbackClaudeById = fallbackClaudeModels();
+  return upsertById(models, ...fallbackClaudeById, ...catalogClaudeModels);
+}
+
+function fallbackClaudeModels() {
+  return [serverConfig.claudeDefaultModel, ...CLAUDE_MODEL_IDS]
+    .map((id) => id.trim())
+    .filter(Boolean)
+    .map(claudeModelById);
+}
+
+function claudeModelById(id: string): ModelEntry {
+  return {
+    id,
+    object: "model",
+    created: CREATED_2024_01_01,
+    owned_by: "anthropic",
+    type: "claude",
+    display_name: claudeDisplayName(id),
+    version: id,
+    context_length: longContextClaudeModel(id)
+      ? CLAUDE_LONG_CONTEXT_TOKENS
+      : 200000,
+    max_completion_tokens: highOutputClaudeModel(id) ? 128000 : 64000,
+    supported_parameters: ["tools", "reasoning"],
+    thinking: { levels: claudeThinkingLevels(id) },
+  };
+}
+
+function claudeDisplayName(id: string) {
+  return id
+    .replace(/^claude-/, "Claude ")
+    .replace(/-/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
 function normalizeModelEntry(entry: Record<string, unknown>): ModelEntry {
@@ -290,17 +370,26 @@ function model(id: string, displayName: string, created: number): ModelEntry {
 }
 
 function modelMatchesAllowlist(modelId: string, allowlist: string[]) {
-  const parsed = parseThinkingSuffixModel(modelId);
+  const candidates = modelAllowlistCandidates(modelId);
   return allowlist.some((allowed) => {
     const cleanAllowed = String(allowed || "").trim();
-    return (
-      cleanAllowed === modelId ||
-      (parsed.hasSuffix && cleanAllowed === parsed.baseModel)
-    );
+    return candidates.includes(cleanAllowed);
   });
 }
 
-function parseThinkingSuffixModel(modelId: string) {
+function modelAllowlistCandidates(modelId: string) {
+  if (modelId.startsWith("claude-")) {
+    return claudeModelAllowlistCandidates(modelId);
+  }
+  return codexModelAllowlistCandidates(modelId);
+}
+
+function codexModelAllowlistCandidates(modelId: string) {
+  const parsed = parseCodexThinkingSuffixModel(modelId);
+  return parsed.hasSuffix ? [modelId, parsed.baseModel] : [modelId];
+}
+
+function parseCodexThinkingSuffixModel(modelId: string) {
   const value = String(modelId || "").trim();
   const lastOpen = value.lastIndexOf("(");
   if (lastOpen <= 0 || !value.endsWith(")")) {
@@ -311,7 +400,7 @@ function parseThinkingSuffixModel(modelId: string) {
     .slice(lastOpen + 1, -1)
     .trim()
     .toLowerCase();
-  if (!baseModel || !MODEL_THINKING_SUFFIX_LEVELS.includes(suffix as never)) {
+  if (!baseModel || !CODEX_THINKING_SUFFIX_LEVELS.includes(suffix as never)) {
     return { baseModel: value, hasSuffix: false };
   }
   return { baseModel, hasSuffix: true };
@@ -322,17 +411,59 @@ function withThinkingSuffixModels(models: ModelEntry[]) {
   const seen = new Set<string>();
   for (const entry of models) {
     addModelEntry(output, seen, entry);
-    for (const level of thinkingLevelsForModel(entry)) {
+    if (isClaudeModelEntry(entry)) {
+      addThinkingSuffixModels(
+        output,
+        seen,
+        entry,
+        claudeThinkingLevelsForModel(entry),
+      );
+      for (const variant of contextSuffixModelsForEntry(entry)) {
+        addModelEntry(output, seen, variant);
+        addThinkingSuffixModels(
+          output,
+          seen,
+          variant,
+          claudeThinkingLevelsForModel(variant),
+        );
+      }
+      continue;
+    }
+    for (const level of codexThinkingLevelsForModel(entry)) {
       addModelEntry(output, seen, modelWithThinkingSuffix(entry, level));
     }
   }
   return output;
 }
 
-function modelWithThinkingSuffix(
+function contextSuffixModelsForEntry(entry: ModelEntry): ModelEntry[] {
+  if (!supportsLongContextSuffix(entry)) {
+    return [];
+  }
+  return [modelWithContextSuffix(entry, CLAUDE_LONG_CONTEXT_SUFFIX)];
+}
+
+function modelWithContextSuffix(entry: ModelEntry, suffix: string): ModelEntry {
+  return {
+    ...structuredClone(entry),
+    id: `${entry.id}(${suffix})`,
+    display_name: `${String(entry.display_name || entry.id)} (${suffix})`,
+    context_length: CLAUDE_LONG_CONTEXT_TOKENS,
+  };
+}
+
+function addThinkingSuffixModels(
+  output: ModelEntry[],
+  seen: Set<string>,
   entry: ModelEntry,
-  level: (typeof MODEL_THINKING_SUFFIX_LEVELS)[number],
-): ModelEntry {
+  levels: string[],
+) {
+  for (const level of levels) {
+    addModelEntry(output, seen, modelWithThinkingSuffix(entry, level));
+  }
+}
+
+function modelWithThinkingSuffix(entry: ModelEntry, level: string): ModelEntry {
   return {
     ...structuredClone(entry),
     id: `${entry.id}(${level})`,
@@ -340,23 +471,91 @@ function modelWithThinkingSuffix(
   };
 }
 
-function thinkingLevelsForModel(entry: ModelEntry) {
+function codexThinkingLevelsForModel(entry: ModelEntry) {
   if (!supportsThinkingSuffix(entry)) {
     return [];
   }
-  const configuredLevels = Array.isArray(
+  const configuredLevels = configuredThinkingLevels(entry);
+  if (configuredLevels.length === 0) {
+    return [...CODEX_THINKING_SUFFIX_LEVELS];
+  }
+  return CODEX_THINKING_SUFFIX_LEVELS.filter((level) =>
+    configuredLevels.includes(level),
+  );
+}
+
+function claudeThinkingLevelsForModel(entry: ModelEntry) {
+  if (!supportsClaudeThinkingSuffix(entry)) {
+    return [];
+  }
+  const configuredLevels = configuredThinkingLevels(entry);
+  if (configuredLevels.length === 0) {
+    return [];
+  }
+  return CLAUDE_THINKING_SUFFIX_LEVELS.filter((level) =>
+    configuredLevels.includes(level),
+  );
+}
+
+function configuredThinkingLevels(entry: ModelEntry) {
+  return Array.isArray(
     (entry.thinking as Record<string, unknown> | undefined)?.levels,
   )
     ? ((entry.thinking as Record<string, unknown>).levels as unknown[])
         .map((level) => String(level).trim().toLowerCase())
         .filter(Boolean)
     : [];
-  if (configuredLevels.length === 0) {
-    return [...MODEL_THINKING_SUFFIX_LEVELS];
+}
+
+function supportsLongContextSuffix(entry: ModelEntry) {
+  if (!entry.id || entry.id.includes("(") || !isClaudeModelEntry(entry)) {
+    return false;
   }
-  return MODEL_THINKING_SUFFIX_LEVELS.filter((level) =>
-    configuredLevels.includes(level),
+  return (
+    longContextClaudeModel(entry.id) ||
+    numericValue(entry.context_length) >= CLAUDE_LONG_CONTEXT_TOKENS
   );
+}
+
+function longContextClaudeModel(id: string) {
+  return CLAUDE_LONG_CONTEXT_MODEL_IDS.has(id);
+}
+
+function claudeThinkingLevels(id: string) {
+  if (id === "claude-sonnet-4-6") {
+    return ["low", "medium", "high"];
+  }
+  if (CLAUDE_128K_OUTPUT_MODEL_IDS.has(id)) {
+    return ["low", "medium", "high", "max"];
+  }
+  return [];
+}
+
+function highOutputClaudeModel(id: string) {
+  return CLAUDE_128K_OUTPUT_MODEL_IDS.has(id);
+}
+
+function isClaudeModelEntry(entry: ModelEntry) {
+  return (
+    String(entry.type || "").toLowerCase() === "claude" ||
+    String(entry.owned_by || entry.ownedBy || "").toLowerCase() ===
+      "anthropic" ||
+    entry.id.startsWith("claude-")
+  );
+}
+
+function supportsClaudeThinkingSuffix(entry: ModelEntry) {
+  if (!entry.id || entry.thinking === false) {
+    return false;
+  }
+  const supportedParameters = entry.supported_parameters;
+  if (Array.isArray(supportedParameters) && supportedParameters.length > 0) {
+    return (
+      supportedParameters.includes("tools") ||
+      supportedParameters.includes("reasoning")
+    );
+  }
+  return true;
 }
 
 function supportsThinkingSuffix(entry: ModelEntry) {
@@ -374,6 +573,11 @@ function supportsThinkingSuffix(entry: ModelEntry) {
     );
   }
   return true;
+}
+
+function numericValue(value: unknown) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
 }
 
 function addModelEntry(

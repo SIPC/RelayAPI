@@ -145,8 +145,7 @@ function migrateMainDb(db: DatabaseSync) {
         last_error TEXT,
         last_used_at TEXT,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        FOREIGN KEY (credential_id) REFERENCES codex_credentials(id) ON DELETE CASCADE
+        updated_at TEXT NOT NULL
       ) STRICT;
 
       CREATE INDEX IF NOT EXISTS idx_channels_credential
@@ -159,8 +158,7 @@ function migrateMainDb(db: DatabaseSync) {
         credential_id TEXT NOT NULL,
         created_at TEXT NOT NULL,
         PRIMARY KEY (channel_id, credential_id),
-        FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
-        FOREIGN KEY (credential_id) REFERENCES codex_credentials(id) ON DELETE CASCADE
+        FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
       ) STRICT;
 
       CREATE INDEX IF NOT EXISTS idx_channel_credentials_credential
@@ -239,8 +237,7 @@ function migrateMainDb(db: DatabaseSync) {
         credential_id TEXT NOT NULL,
         created_at TEXT NOT NULL,
         PRIMARY KEY (channel_id, credential_id),
-        FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
-        FOREIGN KEY (credential_id) REFERENCES codex_credentials(id) ON DELETE CASCADE
+        FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
       ) STRICT;
 
       CREATE INDEX IF NOT EXISTS idx_channel_credentials_credential
@@ -280,6 +277,98 @@ function migrateMainDb(db: DatabaseSync) {
         ON proxy_pool(enabled, updated_at);
     `,
   );
+
+  applyMigration(
+    db,
+    "007_claude_credentials",
+    `
+      CREATE TABLE IF NOT EXISTS claude_credentials (
+        id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL DEFAULT 'claude',
+        email TEXT NOT NULL DEFAULT '',
+        account_id TEXT NOT NULL DEFAULT '',
+        token_envelope TEXT NOT NULL,
+        proxy_envelope TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+        priority INTEGER NOT NULL DEFAULT 100,
+        weight INTEGER NOT NULL DEFAULT 1,
+        expires_at TEXT,
+        last_refresh_at TEXT,
+        last_used_at TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS idx_claude_credentials_routing
+        ON claude_credentials(enabled, priority, weight);
+    `,
+  );
+
+  applyMigration(db, "008_multi_provider_channels", (database) => {
+    database.exec(`
+      DROP INDEX IF EXISTS idx_channel_credentials_credential;
+      DROP INDEX IF EXISTS idx_channels_routing;
+      DROP INDEX IF EXISTS idx_channels_credential;
+
+      ALTER TABLE channel_credentials RENAME TO channel_credentials_legacy_008;
+      ALTER TABLE channels RENAME TO channels_legacy_008;
+
+      CREATE TABLE channels (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        provider TEXT NOT NULL DEFAULT 'codex' CHECK (provider IN ('codex', 'claude')),
+        base_url TEXT NOT NULL,
+        credential_id TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+        priority INTEGER NOT NULL DEFAULT 100,
+        weight INTEGER NOT NULL DEFAULT 1,
+        model_allowlist_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT 'healthy',
+        health_score REAL NOT NULL DEFAULT 100,
+        cooldown_until TEXT,
+        last_error TEXT,
+        last_used_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE channel_credentials (
+        channel_id TEXT NOT NULL,
+        credential_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (channel_id, credential_id),
+        FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
+      ) STRICT;
+
+      INSERT INTO channels (
+        id, name, provider, base_url, credential_id, enabled, priority,
+        weight, model_allowlist_json, status, health_score, cooldown_until,
+        last_error, last_used_at, created_at, updated_at
+      )
+      SELECT
+        id, name,
+        CASE WHEN provider = 'claude' THEN 'claude' ELSE 'codex' END,
+        base_url, credential_id, enabled, priority, weight,
+        model_allowlist_json, status, health_score, cooldown_until,
+        last_error, last_used_at, created_at, updated_at
+      FROM channels_legacy_008;
+
+      INSERT OR IGNORE INTO channel_credentials (channel_id, credential_id, created_at)
+      SELECT channel_id, credential_id, created_at
+      FROM channel_credentials_legacy_008;
+
+      CREATE INDEX IF NOT EXISTS idx_channels_credential
+        ON channels(credential_id);
+      CREATE INDEX IF NOT EXISTS idx_channels_routing
+        ON channels(provider, enabled, status, priority, weight);
+      CREATE INDEX IF NOT EXISTS idx_channel_credentials_credential
+        ON channel_credentials(credential_id);
+
+      DROP TABLE channel_credentials_legacy_008;
+      DROP TABLE channels_legacy_008;
+    `);
+  });
 }
 
 function migrateLogDb(db: DatabaseSync) {
@@ -480,6 +569,15 @@ function migrateLogDb(db: DatabaseSync) {
       "usage_daily_buckets",
       "cached_tokens",
       "INTEGER NOT NULL DEFAULT 0",
+    );
+  });
+
+  applyMigration(db, "008_request_log_forwarded_headers", (database) => {
+    addColumnIfMissing(
+      database,
+      "request_log_details",
+      "forwarded_headers_json",
+      "TEXT",
     );
   });
 }

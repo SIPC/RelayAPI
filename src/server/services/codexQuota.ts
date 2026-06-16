@@ -41,6 +41,7 @@ interface QuotaWindow {
   used_percent: number | null;
   remaining_percent: number | null;
   reset_label: string;
+  reset_at: string | null;
   exhausted: boolean;
 }
 
@@ -390,7 +391,8 @@ function buildWindow(
   if (!window) {
     return null;
   }
-  const usedPercent = deduceUsedPercent(window, limitReached, allowed);
+  const resetAt = resolveResetDate(window);
+  const usedPercent = deduceUsedPercent(window, limitReached, allowed, resetAt);
   const remainingPercent =
     usedPercent === null ? null : clamp(100 - usedPercent, 0, 100);
   return {
@@ -398,7 +400,8 @@ function buildWindow(
     label,
     used_percent: usedPercent,
     remaining_percent: remainingPercent,
-    reset_label: formatResetLabel(window),
+    reset_label: formatResetLabel(resetAt),
+    reset_at: resetAt?.toISOString() ?? null,
     exhausted: usedPercent !== null && usedPercent >= 100,
   };
 }
@@ -407,15 +410,13 @@ function deduceUsedPercent(
   window: RawObject,
   limitReached: unknown,
   allowed: unknown,
+  resetAt: Date | null,
 ) {
   const used = numberPtr(firstValue(window.used_percent, window.usedPercent));
   if (used !== null) {
     return clamp(used, 0, 100);
   }
-  if (
-    (booleanFromAny(limitReached) || allowed === false) &&
-    formatResetLabel(window) !== "-"
-  ) {
+  if ((booleanFromAny(limitReached) || allowed === false) && resetAt) {
     return 100;
   }
   return null;
@@ -442,18 +443,25 @@ function deriveCodexStatus(windows: QuotaWindow[]): CodexQuotaStatus {
   return "full";
 }
 
-function formatResetLabel(window: RawObject) {
+function resolveResetDate(window: RawObject) {
   const resetAt = numberFromAny(firstValue(window.reset_at, window.resetAt));
   if (resetAt > 0) {
-    return formatLocalMinute(new Date(resetAt * 1000));
+    const resetAtMs = resetAt > 1_000_000_000_000 ? resetAt : resetAt * 1000;
+    const date = new Date(resetAtMs);
+    return Number.isFinite(date.getTime()) ? date : null;
   }
   const resetAfterSeconds = numberFromAny(
     firstValue(window.reset_after_seconds, window.resetAfterSeconds),
   );
   if (resetAfterSeconds > 0) {
-    return formatLocalMinute(new Date(Date.now() + resetAfterSeconds * 1000));
+    const date = new Date(Date.now() + resetAfterSeconds * 1000);
+    return Number.isFinite(date.getTime()) ? date : null;
   }
-  return "-";
+  return null;
+}
+
+function formatResetLabel(date: Date | null) {
+  return date ? formatLocalMinute(date) : "-";
 }
 
 function formatLocalMinute(date: Date) {

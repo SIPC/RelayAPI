@@ -8,6 +8,7 @@ import {
 } from "@/src/server/repositories/logs";
 import { listApiKeyPublicRecords } from "@/src/server/services/apiKeys";
 import { listChannelRecords } from "@/src/server/services/channels";
+import { listPublicClaudeCredentials } from "@/src/server/services/claudeCredentials";
 import { listPublicCodexCredentials } from "@/src/server/services/codexCredentials";
 import { getPublicGlobalSettings } from "@/src/server/services/settings";
 import { listPublicProxyPoolItems } from "@/src/server/services/proxyPool";
@@ -56,6 +57,7 @@ export default async function Home() {
   // so the browser never receives database modules, token envelopes, or key hashes.
   const apiKeys = listApiKeyPublicRecords();
   const codexCredentials = await listPublicCodexCredentials();
+  const claudeCredentials = listPublicClaudeCredentials();
   const channels = listChannelRecords();
   const proxyPool = listPublicProxyPoolItems();
   const requestLogs = queryRequestLogs({
@@ -72,6 +74,7 @@ export default async function Home() {
       initialApiKeys={apiKeys}
       initialChannels={channels}
       initialCredentials={codexCredentials}
+      initialClaudeCredentials={claudeCredentials}
       initialProxyPool={proxyPool}
       initialRequestLogsPage={{
         object: "list",

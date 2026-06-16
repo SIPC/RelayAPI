@@ -96,32 +96,44 @@ import {
   createProxyPoolItem,
   deleteApiKey,
   deleteChannel,
+  deleteClaudeCredential,
   deleteCredential,
   deleteProxyPoolItem,
+  downloadClaudeCredentialsExport,
   downloadCredentialsExport,
+  finishClaudeOAuth,
   finishCodexOAuth,
+  getClaudeCredentialQuota,
   getCredentialQuota,
   getDashboardSnapshot,
   getOverview,
   getRequestLogDetail,
   getRequestLogsPage,
+  importClaudeCredentialJson,
   importCredentialJson,
   listChannels,
+  listClaudeCredentials,
   listCredentials,
   listProxyPoolItems,
   logoutWebSession,
   pruneRequestLogs,
+  refreshClaudeCredential,
   refreshCredential,
-  updateGlobalSettings,
+  resetClaudeCredentialHealth,
+  resetCredentialHealth,
+  startClaudeOAuth,
   startCodexOAuth,
+  updateGlobalSettings,
   WEB_AUTH_EXPIRED_EVENT,
   updateApiKey,
   updateChannel,
+  updateClaudeCredentialRouting,
   updateCredentialRouting,
   updateProxyPoolItem,
   type AdminDashboardRequestLogRow,
   type ApiKeyPayload,
   type ChannelPayload,
+  type ClaudeQuotaReport,
   type CodexQuotaReport,
   type OAuthStartResponse,
   type ProxyPoolPayload,
@@ -133,6 +145,7 @@ import type {
   ApiKeyUsageStatsRow,
   ChannelRecord,
   ChannelStatus,
+  ClaudeCredentialRecord,
   CodexCredentialRecord,
   CodexUpstreamTransport,
   CredentialProxyType,
@@ -147,6 +160,7 @@ type AdminDashboardProps = {
   initialApiKeys: PublicApiKey[];
   initialChannels: ChannelRecord[];
   initialCredentials: CodexCredentialRecord[];
+  initialClaudeCredentials: ClaudeCredentialRecord[];
   initialProxyPool: ProxyPoolRecord[];
   initialRequestLogsPage: RequestLogsPage;
   initialOverviewStats: AdminOverviewStats;
@@ -163,6 +177,7 @@ type SectionId =
   | "settings"
   | "logs";
 type LogStatusFilter = "all" | "success" | "error";
+type RoutableCredentialRecord = CodexCredentialRecord | ClaudeCredentialRecord;
 
 type NavigationItem = {
   id: SectionId;
@@ -225,6 +240,7 @@ type ProxyPoolFormState = CredentialProxyFormState & {
 };
 
 type ChannelFormState = {
+  provider: ChannelRecord["provider"];
   name: string;
   credentialIds: string;
   enabled: boolean;
@@ -262,6 +278,7 @@ const EMPTY_API_KEY_FORM: ApiKeyFormState = {
 };
 
 const EMPTY_CHANNEL_FORM: ChannelFormState = {
+  provider: "codex",
   name: "",
   credentialIds: "",
   enabled: true,
@@ -275,6 +292,7 @@ export function AdminDashboard({
   initialApiKeys,
   initialChannels,
   initialCredentials,
+  initialClaudeCredentials,
   initialProxyPool,
   initialRequestLogsPage,
   initialOverviewStats,
@@ -286,6 +304,9 @@ export function AdminDashboard({
   const [apiKeys, setApiKeys] = React.useState(initialApiKeys);
   const [channels, setChannels] = React.useState(initialChannels);
   const [credentials, setCredentials] = React.useState(initialCredentials);
+  const [claudeCredentials, setClaudeCredentials] = React.useState(
+    initialClaudeCredentials,
+  );
   const [proxyPool, setProxyPool] = React.useState(initialProxyPool);
   const [globalSettings, setGlobalSettings] = React.useState(
     initialGlobalSettings,
@@ -344,6 +365,7 @@ export function AdminDashboard({
       setApiKeys(snapshot.apiKeys);
       setChannels(snapshot.channels);
       setCredentials(snapshot.credentials);
+      setClaudeCredentials(snapshot.claudeCredentials);
       setProxyPool(snapshot.proxyPool);
       setGlobalSettings(snapshot.globalSettings);
       setRequestLogs(snapshot.requestLogs);
@@ -400,14 +422,21 @@ export function AdminDashboard({
   }
 
   async function refreshCredentialAndChannelData() {
-    const [nextCredentials, nextChannels] = await Promise.all([
-      listCredentials(),
-      listChannels(),
-    ]);
+    const [nextCredentials, nextClaudeCredentials, nextChannels] =
+      await Promise.all([
+        listCredentials(),
+        listClaudeCredentials(),
+        listChannels(),
+      ]);
     setCredentials(nextCredentials);
+    setClaudeCredentials(nextClaudeCredentials);
     setChannels(nextChannels);
     setSnapshotTime(Date.now());
-    return { credentials: nextCredentials, channels: nextChannels };
+    return {
+      credentials: nextCredentials,
+      claudeCredentials: nextClaudeCredentials,
+      channels: nextChannels,
+    };
   }
 
   function handleCredentialUpdated(updated: CodexCredentialRecord) {
@@ -424,6 +453,39 @@ export function AdminDashboard({
     setChannels((current) =>
       current
         .map((channel) => {
+          if (channel.provider !== "codex") {
+            return channel;
+          }
+          const credentialIds = channel.credentialIds.filter(
+            (credentialId) => credentialId !== id,
+          );
+          return {
+            ...channel,
+            credentialId: credentialIds[0] || channel.credentialId,
+            credentialIds,
+          };
+        })
+        .filter((channel) => channel.credentialIds.length > 0),
+    );
+  }
+
+  function handleClaudeCredentialUpdated(updated: ClaudeCredentialRecord) {
+    setClaudeCredentials((current) => [
+      updated,
+      ...current.filter((credential) => credential.id !== updated.id),
+    ]);
+  }
+
+  function handleClaudeCredentialDeleted(id: string) {
+    setClaudeCredentials((current) =>
+      current.filter((credential) => credential.id !== id),
+    );
+    setChannels((current) =>
+      current
+        .map((channel) => {
+          if (channel.provider !== "claude") {
+            return channel;
+          }
           const credentialIds = channel.credentialIds.filter(
             (credentialId) => credentialId !== id,
           );
@@ -475,9 +537,9 @@ export function AdminDashboard({
     {
       id: "credentials",
       label: "凭据",
-      description: "Codex 账号",
+      description: "账号凭据",
       icon: UserRoundIcon,
-      count: credentials.length,
+      count: credentials.length + claudeCredentials.length,
     },
     {
       id: "proxyPool",
@@ -670,7 +732,7 @@ export function AdminDashboard({
               <OverviewSection
                 apiKeyCount={apiKeys.length}
                 channelCount={channels.length}
-                credentialCount={credentials.length}
+                credentialCount={credentials.length + claudeCredentials.length}
                 enabledChannelCount={enabledChannelCount}
                 hasOperationalData={hasOperationalData}
                 overviewStats={overviewStats}
@@ -688,9 +750,12 @@ export function AdminDashboard({
             )}
             {activeSection === "credentials" && (
               <CredentialsSection
+                claudeCredentials={claudeCredentials}
                 credentials={credentials}
                 globalSettings={globalSettings}
                 proxyPool={proxyPool}
+                onClaudeDeleted={handleClaudeCredentialDeleted}
+                onClaudeUpdated={handleClaudeCredentialUpdated}
                 onDeleted={handleCredentialDeleted}
                 onRefreshData={refreshCredentialAndChannelData}
                 onUpdated={handleCredentialUpdated}
@@ -705,6 +770,7 @@ export function AdminDashboard({
             {activeSection === "channels" && (
               <ChannelsSection
                 channels={channels}
+                claudeCredentials={claudeCredentials}
                 credentials={credentials}
                 onCreated={handleChannelCreated}
                 onDeleted={handleChannelDeleted}
@@ -2080,7 +2146,7 @@ function ApiKeyFields({
             id="api-key-models"
             className="min-h-24"
             value={form.modelAllowlist}
-            placeholder="留空表示不限模型，例如 gpt-5.5 或 gpt-5.5(xhigh)"
+            placeholder="留空表示不限模型，例如 gpt-5.5(xhigh) 或 claude-opus-4-8(1m)(max)"
             onChange={(event) => update("modelAllowlist", event.target.value)}
           />
         </Field>
@@ -2109,7 +2175,7 @@ function CredentialVisualSelector({
   onSelectedIdsChange,
   selectedIds,
 }: {
-  credentials: CodexCredentialRecord[];
+  credentials: RoutableCredentialRecord[];
   selectedIds: string[];
   onSelectedIdsChange: (ids: string[]) => void;
 }) {
@@ -2128,7 +2194,9 @@ function CredentialVisualSelector({
       <Alert>
         <UserRoundIcon />
         <AlertTitle>暂无可选凭据</AlertTitle>
-        <AlertDescription>请先连接或上传 Codex 凭据。</AlertDescription>
+        <AlertDescription>
+          请先连接或上传对应 provider 的凭据。
+        </AlertDescription>
       </Alert>
     );
   }
@@ -2157,7 +2225,9 @@ function CredentialVisualSelector({
                   <span className="truncate font-medium">{name}</span>
                 </div>
                 <Badge variant="outline" className="shrink-0">
-                  {codexPlanLabel(credential.planType)}
+                  {credential.provider === "codex"
+                    ? codexPlanLabel(credential.planType)
+                    : "Claude"}
                 </Badge>
               </div>
               <div className="grid gap-1 text-xs text-muted-foreground">
@@ -2253,7 +2323,10 @@ function ChannelVisualSelector({
                     )}
                     <span className="truncate font-medium">{channel.name}</span>
                   </div>
-                  {renderChannelStatusBadge(channel.status)}
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    {renderChannelProviderBadge(channel.provider)}
+                    {renderChannelStatusBadge(channel.status)}
+                  </div>
                 </div>
                 <div className="grid gap-1 text-xs text-muted-foreground">
                   <div className="truncate font-mono">{channel.id}</div>
@@ -2715,21 +2788,24 @@ function ProxyPoolSection({
 }
 
 function CredentialsSection({
+  claudeCredentials,
   credentials,
   globalSettings,
   proxyPool,
+  onClaudeDeleted,
+  onClaudeUpdated,
   onDeleted,
   onRefreshData,
   onUpdated,
 }: {
+  claudeCredentials: ClaudeCredentialRecord[];
   credentials: CodexCredentialRecord[];
   globalSettings: GlobalSettingsRecord;
   proxyPool: ProxyPoolRecord[];
+  onClaudeDeleted: (id: string) => void;
+  onClaudeUpdated: (credential: ClaudeCredentialRecord) => void;
   onDeleted: (id: string) => void;
-  onRefreshData: () => Promise<{
-    credentials: CodexCredentialRecord[];
-    channels: ChannelRecord[];
-  }>;
+  onRefreshData: () => Promise<unknown>;
   onUpdated: (credential: CodexCredentialRecord) => void;
 }) {
   const [oauthOpen, setOauthOpen] = React.useState(false);
@@ -2767,6 +2843,20 @@ function CredentialsSection({
       const updated = await refreshCredential(credential.id);
       onUpdated(updated);
       toast.success("Codex token 已刷新");
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+      throw error;
+    } finally {
+      setPendingId(null);
+    }
+  }
+
+  async function resetHealth(credential: CodexCredentialRecord) {
+    setPendingId(credential.id);
+    try {
+      const updated = await resetCredentialHealth(credential.id);
+      onUpdated(updated);
+      toast.success("Codex 凭据健康度已重置，冷却已取消");
     } catch (error) {
       toast.error(adminErrorMessage(error));
       throw error;
@@ -3068,7 +3158,7 @@ function CredentialsSection({
                 const quotaLoading = quotaLoadingIds.has(credential.id);
                 const name =
                   credential.email || credential.accountId || "未知账号";
-                const refreshStatus = codexTokenRefreshStatus(credential);
+                const refreshStatus = credentialTokenRefreshStatus(credential);
 
                 return (
                   <Card
@@ -3201,6 +3291,23 @@ function CredentialsSection({
                         )}
                       </div>
 
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={pendingId === credential.id}
+                          onClick={() => resetHealth(credential)}
+                        >
+                          {pendingId === credential.id ? (
+                            <Spinner data-icon="inline-start" />
+                          ) : (
+                            <RefreshCwIcon data-icon="inline-start" />
+                          )}
+                          重置健康度
+                        </Button>
+                      </div>
+
                       <div className="flex items-center gap-2 text-sm">
                         <span className="shrink-0 text-muted-foreground">
                           请求代理：
@@ -3250,12 +3357,1301 @@ function CredentialsSection({
         </CardContent>
       </Card>
 
+      <ClaudeCredentialsPanel
+        credentials={claudeCredentials}
+        globalSettings={globalSettings}
+        onDeleted={onClaudeDeleted}
+        onRefreshData={onRefreshData}
+        onUpdated={onClaudeUpdated}
+        proxyPool={proxyPool}
+      />
+
       <OAuthDialog
         open={oauthOpen}
         onOpenChange={setOauthOpen}
         onCompleted={onRefreshData}
+        provider="codex"
       />
     </>
+  );
+}
+
+function ClaudeCredentialsPanel({
+  credentials,
+  globalSettings,
+  onDeleted,
+  onRefreshData,
+  onUpdated,
+  proxyPool,
+}: {
+  credentials: ClaudeCredentialRecord[];
+  globalSettings: GlobalSettingsRecord;
+  onDeleted: (id: string) => void;
+  onRefreshData: () => Promise<unknown>;
+  onUpdated: (credential: ClaudeCredentialRecord) => void;
+  proxyPool: ProxyPoolRecord[];
+}) {
+  const [oauthOpen, setOauthOpen] = React.useState(false);
+  const [pendingId, setPendingId] = React.useState<string | null>(null);
+  const [uploadingCredential, setUploadingCredential] = React.useState(false);
+  const [exportingCredentials, setExportingCredentials] = React.useState(false);
+  const [quotaLoadingIds, setQuotaLoadingIds] = React.useState<Set<string>>(
+    () => new Set(),
+  );
+  const [quotas, setQuotas] = React.useState<Record<string, ClaudeQuotaReport>>(
+    {},
+  );
+  const [quotaErrors, setQuotaErrors] = React.useState<Record<string, string>>(
+    {},
+  );
+  const [refreshingAllQuotas, setRefreshingAllQuotas] = React.useState(false);
+  const quotaLoadRequestedRef = React.useRef(new Set<string>());
+  const credentialFileInputRef = React.useRef<HTMLInputElement>(null);
+
+  const setQuotaLoading = React.useCallback((id: string, loading: boolean) => {
+    setQuotaLoadingIds((current) => {
+      const next = new Set(current);
+      if (loading) {
+        next.add(id);
+      } else {
+        next.delete(id);
+      }
+      return next;
+    });
+  }, []);
+
+  const loadQuota = React.useCallback(
+    async (
+      credential: ClaudeCredentialRecord,
+      options: { silent?: boolean } = {},
+    ) => {
+      setQuotaLoading(credential.id, true);
+      setQuotaErrors((current) => {
+        if (!(credential.id in current)) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[credential.id];
+        return next;
+      });
+
+      try {
+        const quota = await getClaudeCredentialQuota(credential.id);
+        setQuotas((current) => ({ ...current, [credential.id]: quota }));
+        if (!options.silent) {
+          toast.success("Claude 用量已读取");
+        }
+        return true;
+      } catch (error) {
+        const message = adminErrorMessage(error);
+        setQuotaErrors((current) => ({ ...current, [credential.id]: message }));
+        if (!options.silent) {
+          toast.error(message);
+        }
+        return false;
+      } finally {
+        setQuotaLoading(credential.id, false);
+      }
+    },
+    [setQuotaLoading],
+  );
+
+  const refreshAllQuotas = React.useCallback(async () => {
+    if (credentials.length === 0) {
+      return;
+    }
+
+    setRefreshingAllQuotas(true);
+    try {
+      const results = await Promise.all(
+        credentials.map((credential) =>
+          loadQuota(credential, { silent: true }),
+        ),
+      );
+      const failedCount = results.filter((success) => !success).length;
+      if (failedCount > 0) {
+        toast.error(
+          `Claude 用量刷新完成，${formatNumber(failedCount)} 个账号失败`,
+        );
+      } else {
+        toast.success("全部 Claude 用量已刷新");
+      }
+    } finally {
+      setRefreshingAllQuotas(false);
+    }
+  }, [credentials, loadQuota]);
+
+  React.useEffect(() => {
+    credentials.forEach((credential) => {
+      if (quotaLoadRequestedRef.current.has(credential.id)) {
+        return;
+      }
+      quotaLoadRequestedRef.current.add(credential.id);
+      void loadQuota(credential, { silent: true });
+    });
+  }, [credentials, loadQuota]);
+
+  const quotaRefreshPending = refreshingAllQuotas || quotaLoadingIds.size > 0;
+
+  const sortedCredentials = React.useMemo(
+    () =>
+      [...credentials].sort(
+        (left, right) =>
+          Number(right.enabled) - Number(left.enabled) ||
+          right.priority - left.priority ||
+          usageHealthScore(right.usageHealth) -
+            usageHealthScore(left.usageHealth),
+      ),
+    [credentials],
+  );
+
+  function openCredentialUpload() {
+    credentialFileInputRef.current?.click();
+  }
+
+  async function handleCredentialUploadChange(
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) {
+    const files = Array.from(event.currentTarget.files || []);
+    event.currentTarget.value = "";
+    if (files.length === 0) {
+      return;
+    }
+
+    setUploadingCredential(true);
+    try {
+      const importedCredentials: ClaudeCredentialRecord[] = [];
+      let failedCount = 0;
+
+      for (const file of files) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(await file.text()) as unknown;
+        } catch (error) {
+          failedCount += 1;
+          console.error(
+            `Failed to parse Claude credential file ${file.name}`,
+            error,
+          );
+          continue;
+        }
+
+        const payloads = credentialUploadPayloads(parsed);
+        if (payloads.length === 0) {
+          failedCount += 1;
+          continue;
+        }
+
+        for (const [index, payload] of payloads.entries()) {
+          try {
+            const imported = await importClaudeCredentialJson(
+              payload,
+              payloads.length > 1 ? `${file.name}#${index + 1}` : file.name,
+            );
+            importedCredentials.push(imported);
+          } catch (error) {
+            failedCount += 1;
+            console.error(
+              `Failed to import Claude credential from ${file.name}#${index + 1}`,
+              error,
+            );
+          }
+        }
+      }
+
+      if (importedCredentials.length > 0) {
+        await onRefreshData();
+      }
+
+      if (importedCredentials.length > 0 && failedCount > 0) {
+        toast.error(
+          `已上传 ${formatNumber(importedCredentials.length)} 个 Claude 凭据，失败 ${formatNumber(failedCount)} 个`,
+        );
+      } else if (importedCredentials.length > 0) {
+        toast.success(
+          `已上传 ${formatNumber(importedCredentials.length)} 个 Claude 凭据`,
+        );
+      } else {
+        toast.error("没有成功上传的 Claude 凭据");
+      }
+    } finally {
+      setUploadingCredential(false);
+    }
+  }
+
+  async function exportAllCredentials() {
+    setExportingCredentials(true);
+    try {
+      await downloadClaudeCredentialsExport();
+      toast.success("Claude 凭据导出已开始");
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setExportingCredentials(false);
+    }
+  }
+
+  async function refreshToken(credential: ClaudeCredentialRecord) {
+    setPendingId(credential.id);
+    try {
+      const updated = await refreshClaudeCredential(credential.id);
+      onUpdated(updated);
+      toast.success("Claude token 已刷新");
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+      throw error;
+    } finally {
+      setPendingId(null);
+    }
+  }
+
+  async function resetHealth(credential: ClaudeCredentialRecord) {
+    setPendingId(credential.id);
+    try {
+      const updated = await resetClaudeCredentialHealth(credential.id);
+      onUpdated(updated);
+      toast.success("Claude 凭据健康度已重置，冷却已取消");
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+      throw error;
+    } finally {
+      setPendingId(null);
+    }
+  }
+
+  async function remove(credential: ClaudeCredentialRecord) {
+    setPendingId(credential.id);
+    try {
+      await deleteClaudeCredential(credential.id);
+      onDeleted(credential.id);
+      toast.success("Claude 凭据已删除");
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+      throw error;
+    } finally {
+      setPendingId(null);
+    }
+  }
+
+  return (
+    <>
+      <input
+        ref={credentialFileInputRef}
+        type="file"
+        accept="application/json,.json"
+        className="hidden"
+        multiple
+        onChange={handleCredentialUploadChange}
+      />
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Claude 凭据</CardTitle>
+          <CardDescription>
+            连接 Claude OAuth 凭据。外部仍通过 OpenAI-compatible
+            <code className="mx-1 rounded bg-muted px-1 py-0.5 text-xs">
+              /v1/chat/completions
+            </code>
+            调用，model 以{" "}
+            <code className="rounded bg-muted px-1 py-0.5 text-xs">
+              claude-
+            </code>
+            开头时自动转发到 Claude 上游。
+          </CardDescription>
+          <CardAction>
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={credentials.length === 0 || exportingCredentials}
+                onClick={exportAllCredentials}
+              >
+                {exportingCredentials ? (
+                  <Spinner data-icon="inline-start" />
+                ) : (
+                  <DownloadIcon data-icon="inline-start" />
+                )}
+                导出全部
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={credentials.length === 0 || quotaRefreshPending}
+                onClick={refreshAllQuotas}
+              >
+                {quotaRefreshPending ? (
+                  <Spinner data-icon="inline-start" />
+                ) : (
+                  <RefreshCwIcon data-icon="inline-start" />
+                )}
+                刷新用量
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={uploadingCredential}
+                onClick={openCredentialUpload}
+              >
+                {uploadingCredential ? (
+                  <Spinner data-icon="inline-start" />
+                ) : (
+                  <UploadIcon data-icon="inline-start" />
+                )}
+                上传凭证
+              </Button>
+              <Button type="button" onClick={() => setOauthOpen(true)}>
+                <PlusIcon data-icon="inline-start" />
+                连接 Claude
+              </Button>
+            </div>
+          </CardAction>
+        </CardHeader>
+        <CardContent>
+          {credentials.length === 0 ? (
+            <Empty className="min-h-64">
+              <EmptyHeader>
+                <EmptyMedia variant="icon">
+                  <UserRoundIcon />
+                </EmptyMedia>
+                <EmptyTitle>还没有 Claude 凭据</EmptyTitle>
+                <EmptyDescription>
+                  通过 Claude OAuth 连接后即可使用 OpenAI Chat Completions
+                  格式请求 Claude 模型。
+                </EmptyDescription>
+              </EmptyHeader>
+              <div className="flex flex-wrap items-center justify-center gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={uploadingCredential}
+                  onClick={openCredentialUpload}
+                >
+                  {uploadingCredential ? (
+                    <Spinner data-icon="inline-start" />
+                  ) : (
+                    <UploadIcon data-icon="inline-start" />
+                  )}
+                  上传凭证
+                </Button>
+                <Button type="button" onClick={() => setOauthOpen(true)}>
+                  <PlusIcon data-icon="inline-start" />
+                  连接 Claude
+                </Button>
+              </div>
+            </Empty>
+          ) : (
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
+              {sortedCredentials.map((credential) => {
+                const quota = quotas[credential.id];
+                const quotaLoading = quotaLoadingIds.has(credential.id);
+                const name =
+                  credential.email ||
+                  credential.accountId ||
+                  "未知 Claude 账号";
+                const refreshStatus = credentialTokenRefreshStatus(credential);
+                return (
+                  <Card
+                    key={credential.id}
+                    className="relative bg-linear-to-br from-card via-card to-muted/45 shadow-sm"
+                  >
+                    <CardContent className="grid gap-3">
+                      <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
+                        <div className="flex min-w-0 items-center gap-2 overflow-hidden">
+                          <Badge
+                            variant="secondary"
+                            className="h-6 shrink-0 px-2 text-sm font-semibold"
+                          >
+                            Claude
+                          </Badge>
+                          <div
+                            className="min-w-0 flex-1 truncate text-base font-medium"
+                            title={name}
+                          >
+                            {name}
+                          </div>
+                        </div>
+                        <ClaudeCredentialSettingsDialog
+                          credential={credential}
+                          disabled={pendingId === credential.id}
+                          onDeleted={() => remove(credential)}
+                          onRefreshToken={() => refreshToken(credential)}
+                          onSaved={onUpdated}
+                          proxyPool={proxyPool}
+                        />
+                      </div>
+
+                      {(refreshStatus.exhausted ||
+                        refreshStatus.attemptCount > 0 ||
+                        refreshStatus.autoDisabled ||
+                        !credential.enabled) && (
+                        <div className="flex flex-wrap gap-1.5">
+                          {!credential.enabled && (
+                            <Badge variant="outline">
+                              {refreshStatus.autoDisabled
+                                ? "自动停用"
+                                : "已停用"}
+                            </Badge>
+                          )}
+                          {refreshStatus.exhausted ? (
+                            <Badge variant="destructive">Token 刷新错误</Badge>
+                          ) : refreshStatus.attemptCount > 0 ? (
+                            <Badge variant="outline">
+                              Token 刷新{" "}
+                              {formatNumber(refreshStatus.attemptCount)}
+                              /3
+                            </Badge>
+                          ) : null}
+                        </div>
+                      )}
+
+                      <div className="grid gap-2 text-sm">
+                        <div className="flex items-center gap-2">
+                          <span className="shrink-0 text-muted-foreground">
+                            凭据健康度：
+                          </span>
+                          {credential.usageHealth ? (
+                            <>
+                              <UsageHealthBadge
+                                status={credential.usageHealth.status}
+                              />
+                              <span className="tabular-nums text-muted-foreground">
+                                {formatNumber(credential.usageHealth.score)}%
+                              </span>
+                            </>
+                          ) : (
+                            <Badge variant="outline">未知</Badge>
+                          )}
+                        </div>
+                        {credential.usageHealth && (
+                          <div className="text-xs text-muted-foreground">
+                            最近{" "}
+                            {formatNumber(credential.usageHealth.windowSize)} 次
+                            · 成功{" "}
+                            {formatNumber(credential.usageHealth.successCount)}·
+                            错误{" "}
+                            {formatNumber(credential.usageHealth.errorCount)}
+                          </div>
+                        )}
+                        {credential.cooldownUntil && (
+                          <div className="text-xs text-amber-600 dark:text-amber-300">
+                            凭据冷却至{" "}
+                            {formatNullableDate(credential.cooldownUntil)}
+                          </div>
+                        )}
+                        {refreshStatus.hasNotice && (
+                          <div
+                            className={
+                              refreshStatus.exhausted
+                                ? "text-xs text-destructive"
+                                : "text-xs text-amber-600 dark:text-amber-300"
+                            }
+                          >
+                            {refreshStatus.exhausted ? (
+                              <>
+                                {refreshStatus.autoDisabled
+                                  ? "Token 自动刷新已连续失败 3 次，凭据已自动停用。"
+                                  : "Token 自动刷新已连续失败 3 次。"}
+                              </>
+                            ) : (
+                              <>
+                                Token 自动刷新失败{" "}
+                                {formatNumber(refreshStatus.attemptCount)}/3
+                                {refreshStatus.nextAttemptAt && (
+                                  <>
+                                    ，下次尝试：
+                                    <LocalDateTime
+                                      value={refreshStatus.nextAttemptAt}
+                                    />
+                                  </>
+                                )}
+                              </>
+                            )}
+                            {refreshStatus.lastError && (
+                              <>。原因：{refreshStatus.lastError}</>
+                            )}
+                          </div>
+                        )}
+                        {credential.lastError && !refreshStatus.hasNotice && (
+                          <div className="text-xs text-destructive">
+                            {credential.lastError}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={pendingId === credential.id}
+                          onClick={() => resetHealth(credential)}
+                        >
+                          {pendingId === credential.id ? (
+                            <Spinner data-icon="inline-start" />
+                          ) : (
+                            <RefreshCwIcon data-icon="inline-start" />
+                          )}
+                          重置健康度
+                        </Button>
+                      </div>
+
+                      <div className="flex items-center gap-2 text-sm">
+                        <span className="shrink-0 text-muted-foreground">
+                          请求代理：
+                        </span>
+                        <CredentialProxyBadge
+                          credential={credential}
+                          globalSettings={globalSettings}
+                          proxyPool={proxyPool}
+                        />
+                      </div>
+
+                      <div className="flex items-center gap-2 text-sm">
+                        <span className="shrink-0 text-muted-foreground">
+                          过期时间：
+                        </span>
+                        <span className="min-w-0 truncate">
+                          {formatNullableDate(credential.expiresAt)}
+                        </span>
+                      </div>
+
+                      <div className="grid gap-2 text-sm">
+                        <span className="text-muted-foreground">
+                          额度 / 用量：
+                        </span>
+                        <div className="rounded-lg border border-border/60 bg-muted/35 p-3">
+                          <ClaudeQuotaUsageCell
+                            errorMessage={quotaErrors[credential.id]}
+                            loading={quotaLoading}
+                            quota={quota}
+                          />
+                        </div>
+                      </div>
+                    </CardContent>
+                    {refreshingAllQuotas && quotaLoading && (
+                      <div className="absolute inset-0 z-10 flex items-center justify-center bg-card/70 backdrop-blur-[1px]">
+                        <div className="flex items-center gap-2 rounded-full border bg-background/90 px-3 py-1.5 text-sm font-medium shadow-sm">
+                          <Spinner data-icon="inline-start" />
+                          刷新用量中
+                        </div>
+                      </div>
+                    )}
+                  </Card>
+                );
+              })}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <OAuthDialog
+        open={oauthOpen}
+        onOpenChange={setOauthOpen}
+        onCompleted={onRefreshData}
+        provider="claude"
+      />
+    </>
+  );
+}
+
+function ClaudeCredentialRoutingControls({
+  credential,
+  disabled,
+  onSaved,
+}: {
+  credential: ClaudeCredentialRecord;
+  disabled: boolean;
+  onSaved: (credential: ClaudeCredentialRecord) => void;
+}) {
+  const [priority, setPriority] = React.useState(
+    credential.priority.toString(),
+  );
+  const [weight, setWeight] = React.useState(credential.weight.toString());
+  const [saving, setSaving] = React.useState(false);
+
+  async function saveRouting(patch: {
+    enabled?: boolean;
+    priority?: number;
+    weight?: number;
+  }) {
+    setSaving(true);
+    try {
+      const updated = await updateClaudeCredentialRouting(credential.id, patch);
+      onSaved(updated);
+      toast.success("Claude 凭据路由配置已保存");
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="grid gap-2 rounded-lg border border-border/60 bg-muted/25 p-2.5 text-sm">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="font-medium">凭据路由</div>
+          <div className="text-xs text-muted-foreground">
+            Claude 不使用 Codex 通道，按凭据优先级和权重直接选择。
+          </div>
+        </div>
+        <Switch
+          checked={credential.enabled}
+          disabled={disabled || saving}
+          size="sm"
+          onCheckedChange={(checked) =>
+            saveRouting({ enabled: Boolean(checked) })
+          }
+        />
+      </div>
+      <div className="grid gap-2 sm:grid-cols-[1fr_1fr_auto]">
+        <Input
+          aria-label="Claude 凭据优先级"
+          inputMode="numeric"
+          value={priority}
+          placeholder="优先级"
+          onChange={(event) => setPriority(event.target.value)}
+        />
+        <Input
+          aria-label="Claude 凭据权重"
+          inputMode="numeric"
+          value={weight}
+          placeholder="权重"
+          onChange={(event) => setWeight(event.target.value)}
+        />
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={disabled || saving}
+          onClick={() =>
+            saveRouting({
+              priority: integerValue(priority, credential.priority),
+              weight: Math.max(1, integerValue(weight, credential.weight)),
+            })
+          }
+        >
+          {saving && <Spinner data-icon="inline-start" />}
+          保存
+        </Button>
+      </div>
+      <div className="text-xs text-muted-foreground">
+        当前：优先级 {formatNumber(credential.priority)} · 权重{" "}
+        {formatNumber(credential.weight)}
+      </div>
+    </div>
+  );
+}
+
+function ClaudeCredentialUserAgentControls({
+  credential,
+  disabled,
+  onSaved,
+}: {
+  credential: ClaudeCredentialRecord;
+  disabled: boolean;
+  onSaved: (credential: ClaudeCredentialRecord) => void;
+}) {
+  const [value, setValue] = React.useState(credential.userAgent ?? "");
+  const [saving, setSaving] = React.useState(false);
+
+  async function saveUserAgent(userAgent: string | null) {
+    setSaving(true);
+    try {
+      const updated = await updateClaudeCredentialRouting(credential.id, {
+        userAgent,
+      });
+      onSaved(updated);
+      setValue(updated.userAgent ?? "");
+      toast.success(
+        updated.userAgent
+          ? "Claude 凭据 User-Agent 已保存"
+          : "Claude 凭据 User-Agent 已清除，将使用默认设置",
+      );
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const pending = disabled || saving;
+
+  return (
+    <div className="grid gap-2 rounded-lg border border-border/60 bg-muted/25 p-2.5 text-sm">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+        <div className="grid gap-1">
+          <div className="font-medium">User-Agent 覆盖</div>
+          <div className="text-xs text-muted-foreground">
+            留空则使用 Claude 默认配置。该值会用于此凭据的 Claude 请求和 token
+            refresh。
+          </div>
+        </div>
+        <Badge variant={credential.userAgent ? "secondary" : "outline"}>
+          {credential.userAgent ? "凭据自定义" : "使用默认"}
+        </Badge>
+      </div>
+      <Textarea
+        className="min-h-20 font-mono text-xs"
+        disabled={pending}
+        value={value}
+        placeholder="使用 Claude 默认 User-Agent"
+        onChange={(event) => setValue(event.target.value)}
+      />
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-xs text-muted-foreground">
+          当前：{credential.userAgent || "使用默认 User-Agent"}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={pending || !credential.userAgent}
+            onClick={() => saveUserAgent(null)}
+          >
+            {saving && <Spinner data-icon="inline-start" />}
+            清除覆盖
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            disabled={pending}
+            onClick={() => saveUserAgent(value.trim() || null)}
+          >
+            {saving && <Spinner data-icon="inline-start" />}
+            保存 User-Agent
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ClaudeCredentialProxyControls({
+  credential,
+  disabled,
+  onSaved,
+  proxyPool,
+}: {
+  credential: ClaudeCredentialRecord;
+  disabled: boolean;
+  onSaved: (credential: ClaudeCredentialRecord) => void;
+  proxyPool: ProxyPoolRecord[];
+}) {
+  const [form, setForm] = React.useState(() => credentialProxyForm(credential));
+  const [saving, setSaving] = React.useState(false);
+  const [clearing, setClearing] = React.useState(false);
+  const proxy = credential.proxy;
+
+  function patchForm(patch: Partial<CredentialProxyFormState>) {
+    setForm((current) => ({ ...current, ...patch }));
+  }
+
+  async function saveProxy() {
+    const host = form.host.trim();
+    const port = integerValue(form.port, 0);
+    if (!host) {
+      toast.error("请输入 SOCKS5 代理主机");
+      return;
+    }
+    if (port < 1 || port > 65535) {
+      toast.error("代理端口必须在 1 到 65535 之间");
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const payload: {
+        enabled: boolean;
+        type: CredentialProxyType;
+        host: string;
+        port: number;
+        username: string;
+        password?: string;
+      } = {
+        enabled: form.enabled,
+        type: form.type,
+        host,
+        port,
+        username: form.username.trim(),
+      };
+      if (form.password.trim()) {
+        payload.password = form.password;
+      }
+      const updated = await updateClaudeCredentialRouting(credential.id, {
+        proxy: payload,
+      });
+      setForm(credentialProxyForm(updated));
+      onSaved(updated);
+      toast.success("Claude 凭据请求代理已保存");
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function clearProxy() {
+    setClearing(true);
+    try {
+      const updated = await updateClaudeCredentialRouting(credential.id, {
+        proxy: null,
+      });
+      setForm(credentialProxyForm(updated));
+      onSaved(updated);
+      toast.success("Claude 凭据请求代理已清除");
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setClearing(false);
+    }
+  }
+
+  async function saveProxyPoolId(proxyPoolId: string | null) {
+    setSaving(true);
+    try {
+      const updated = await updateClaudeCredentialRouting(credential.id, {
+        proxyPoolId,
+      });
+      onSaved(updated);
+      toast.success(proxyPoolId ? "已选择代理池代理" : "代理池选择已清除");
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveUseGlobalProxy(useGlobalProxy: boolean) {
+    setSaving(true);
+    try {
+      const updated = await updateClaudeCredentialRouting(credential.id, {
+        useGlobalProxy,
+      });
+      onSaved(updated);
+      toast.success(
+        useGlobalProxy ? "已允许使用全局代理" : "已关闭全局代理回退",
+      );
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function clearPassword() {
+    if (!proxy) {
+      return;
+    }
+    setSaving(true);
+    try {
+      const updated = await updateClaudeCredentialRouting(credential.id, {
+        proxy: {
+          enabled: proxy.enabled,
+          type: proxy.type,
+          host: proxy.host,
+          port: proxy.port,
+          username: proxy.username,
+          password: "",
+        },
+      });
+      setForm(credentialProxyForm(updated));
+      onSaved(updated);
+      toast.success("代理密码已清除");
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const pending = disabled || saving || clearing;
+
+  return (
+    <div className="grid gap-2 rounded-lg border border-border/60 bg-muted/25 p-2.5 text-sm">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="font-medium">请求代理</div>
+        </div>
+        <Switch
+          checked={form.enabled}
+          disabled={pending}
+          size="sm"
+          onCheckedChange={(checked) =>
+            patchForm({ enabled: Boolean(checked) })
+          }
+        />
+      </div>
+
+      <div className="grid gap-2 sm:grid-cols-2">
+        <div className="flex items-center justify-between gap-3 rounded-md border border-border/50 bg-background/50 p-2">
+          <div>
+            <div className="font-medium">使用全局代理</div>
+            <div className="text-xs text-muted-foreground">
+              无本地/代理池代理时回退
+            </div>
+          </div>
+          <Switch
+            checked={credential.useGlobalProxy}
+            disabled={pending}
+            size="sm"
+            onCheckedChange={(checked) => saveUseGlobalProxy(Boolean(checked))}
+          />
+        </div>
+        <label className="grid gap-1 rounded-md border border-border/50 bg-background/50 p-2 text-xs text-muted-foreground">
+          代理池
+          <select
+            className="h-9 rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={pending}
+            value={credential.proxyPoolId ?? ""}
+            onChange={(event) =>
+              saveProxyPoolId(event.target.value ? event.target.value : null)
+            }
+          >
+            <option value="">不使用代理池</option>
+            {proxyPool.map((proxy) => (
+              <option key={proxy.id} value={proxy.id}>
+                {proxy.name} · {proxy.type}://{proxy.host}:{proxy.port}
+                {proxy.enabled ? "" : "（已停用）"}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      <div className="grid gap-2 sm:grid-cols-[0.8fr_1fr_0.7fr]">
+        <label className="grid gap-1 text-xs text-muted-foreground">
+          协议
+          <select
+            className="h-9 rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={pending}
+            value={form.type}
+            onChange={(event) =>
+              patchForm({ type: event.target.value as CredentialProxyType })
+            }
+          >
+            <option value="socks5h">socks5h</option>
+            <option value="socks5">socks5</option>
+          </select>
+        </label>
+        <label className="grid gap-1 text-xs text-muted-foreground">
+          主机
+          <Input
+            disabled={pending}
+            value={form.host}
+            placeholder="127.0.0.1"
+            onChange={(event) => patchForm({ host: event.target.value })}
+          />
+        </label>
+        <label className="grid gap-1 text-xs text-muted-foreground">
+          端口
+          <Input
+            disabled={pending}
+            inputMode="numeric"
+            value={form.port}
+            placeholder="1080"
+            onChange={(event) => patchForm({ port: event.target.value })}
+          />
+        </label>
+      </div>
+
+      <div className="grid gap-2 sm:grid-cols-2">
+        <label className="grid gap-1 text-xs text-muted-foreground">
+          用户名（可选）
+          <Input
+            disabled={pending}
+            value={form.username}
+            placeholder="username"
+            onChange={(event) => patchForm({ username: event.target.value })}
+          />
+        </label>
+        <label className="grid gap-1 text-xs text-muted-foreground">
+          密码（留空则保持原密码）
+          <Input
+            disabled={pending}
+            type="password"
+            value={form.password}
+            placeholder={
+              proxy?.passwordSet ? "已设置，留空保持不变" : "password"
+            }
+            onChange={(event) => patchForm({ password: event.target.value })}
+          />
+        </label>
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-xs text-muted-foreground">
+          当前：{credentialProxyText(credential)} · 代理池：
+          {proxyPoolSelectionText(credential, proxyPool)} · 全局：
+          {credential.useGlobalProxy ? "开启" : "关闭"}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={pending || !proxy?.passwordSet}
+            onClick={clearPassword}
+          >
+            {saving && <Spinner data-icon="inline-start" />}
+            清除密码
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={pending || !proxy}
+            onClick={clearProxy}
+          >
+            {clearing && <Spinner data-icon="inline-start" />}
+            清除代理
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            disabled={pending}
+            onClick={saveProxy}
+          >
+            {saving && <Spinner data-icon="inline-start" />}
+            保存代理
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ClaudeCredentialSettingsDialog({
+  credential,
+  disabled,
+  onDeleted,
+  onRefreshToken,
+  onSaved,
+  proxyPool,
+}: {
+  credential: ClaudeCredentialRecord;
+  disabled: boolean;
+  onDeleted: () => Promise<void>;
+  onRefreshToken: () => Promise<void>;
+  onSaved: (credential: ClaudeCredentialRecord) => void;
+  proxyPool: ProxyPoolRecord[];
+}) {
+  const [open, setOpen] = React.useState(false);
+  const [refreshingToken, setRefreshingToken] = React.useState(false);
+  const [exporting, setExporting] = React.useState(false);
+  const accountName = credential.email || credential.accountId || credential.id;
+
+  async function refreshTokenFromSettings() {
+    setRefreshingToken(true);
+    try {
+      await onRefreshToken();
+    } catch {
+      // Parent action already shows the concrete error toast.
+    } finally {
+      setRefreshingToken(false);
+    }
+  }
+
+  async function exportCredentialFromSettings() {
+    setExporting(true);
+    try {
+      await downloadClaudeCredentialsExport(credential.id);
+      toast.success("Claude 凭据导出已开始");
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <Button
+        type="button"
+        size="icon-sm"
+        variant="outline"
+        disabled={disabled}
+        onClick={() => setOpen(true)}
+        title="Claude 凭据设置"
+      >
+        <SettingsIcon />
+      </Button>
+      <DialogContent className="max-h-[88vh] gap-3 overflow-y-auto sm:max-w-4xl">
+        <DialogHeader className="pr-8">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0">
+              <DialogTitle>Claude 凭据设置</DialogTitle>
+              <DialogDescription className="mt-1 truncate">
+                {accountName}
+              </DialogDescription>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Badge variant="secondary">Claude</Badge>
+              <Badge variant={credential.enabled ? "secondary" : "outline"}>
+                {credential.enabled ? "已启用" : "已禁用"}
+              </Badge>
+            </div>
+          </div>
+        </DialogHeader>
+
+        <div className="grid gap-3 lg:grid-cols-[240px_minmax(0,1fr)]">
+          <aside className="grid h-fit gap-3">
+            <div className="grid gap-2 rounded-lg border border-border/60 bg-muted/25 p-2.5 text-sm">
+              <div className="min-w-0">
+                <div className="truncate font-medium" title={accountName}>
+                  {accountName}
+                </div>
+                <div className="mt-1 truncate font-mono text-xs text-muted-foreground">
+                  {credential.id}
+                </div>
+              </div>
+              <div className="grid gap-1.5 text-xs text-muted-foreground">
+                <CredentialCompactRow label="邮箱" value={credential.email} />
+                <CredentialCompactRow
+                  label="账号"
+                  value={credential.accountId}
+                />
+                <CredentialCompactRow
+                  label="过期"
+                  value={formatNullableDate(credential.expiresAt)}
+                />
+                <CredentialCompactRow
+                  label="使用"
+                  value={formatNullableDate(credential.lastUsedAt)}
+                />
+              </div>
+            </div>
+
+            <div className="grid gap-2 rounded-lg border border-border/60 bg-muted/25 p-2.5">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="justify-start"
+                disabled={disabled || refreshingToken}
+                onClick={refreshTokenFromSettings}
+              >
+                {refreshingToken ? (
+                  <Spinner data-icon="inline-start" />
+                ) : (
+                  <RefreshCwIcon data-icon="inline-start" />
+                )}
+                刷新 token
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="justify-start"
+                disabled={disabled || exporting}
+                onClick={exportCredentialFromSettings}
+              >
+                {exporting ? (
+                  <Spinner data-icon="inline-start" />
+                ) : (
+                  <DownloadIcon data-icon="inline-start" />
+                )}
+                导出凭据
+              </Button>
+              <ClaudeCredentialDeleteSettingsAction
+                credential={credential}
+                disabled={disabled}
+                onConfirm={onDeleted}
+              />
+            </div>
+          </aside>
+
+          <section className="grid min-w-0 gap-3">
+            <ClaudeCredentialRoutingControls
+              key={`${credential.id}:${credential.priority}:${credential.weight}:${credential.enabled}`}
+              credential={credential}
+              disabled={disabled}
+              onSaved={onSaved}
+            />
+
+            <ClaudeCredentialUserAgentControls
+              key={`${credential.id}:${credential.userAgent ?? "default"}`}
+              credential={credential}
+              disabled={disabled}
+              onSaved={onSaved}
+            />
+
+            <ClaudeCredentialProxyControls
+              key={`${credential.id}:${credential.proxyPoolId}:${credential.proxy?.enabled}:${credential.proxy?.type}:${credential.proxy?.host}:${credential.proxy?.port}:${credential.proxy?.username}:${credential.proxy?.passwordSet}`}
+              credential={credential}
+              disabled={disabled}
+              onSaved={onSaved}
+              proxyPool={proxyPool}
+            />
+          </section>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function ClaudeCredentialDeleteSettingsAction({
+  credential,
+  disabled,
+  onConfirm,
+}: {
+  credential: ClaudeCredentialRecord;
+  disabled: boolean;
+  onConfirm: () => Promise<void>;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const [pending, setPending] = React.useState(false);
+
+  async function confirm() {
+    setPending(true);
+    try {
+      await onConfirm();
+      setOpen(false);
+    } catch {
+      // Parent action already shows the concrete error toast.
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <AlertDialog open={open} onOpenChange={setOpen}>
+      <Button
+        type="button"
+        size="sm"
+        variant="destructive"
+        className="justify-start"
+        disabled={disabled}
+        onClick={() => setOpen(true)}
+      >
+        <Trash2Icon data-icon="inline-start" />
+        删除凭据
+      </Button>
+      <AlertDialogContent size="sm">
+        <AlertDialogHeader>
+          <AlertDialogMedia>
+            <Trash2Icon />
+          </AlertDialogMedia>
+          <AlertDialogTitle>删除 Claude 凭据？</AlertDialogTitle>
+          <AlertDialogDescription>
+            将删除 {credential.email || credential.accountId || credential.id}
+            。此操作不可恢复。
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={pending}>取消</AlertDialogCancel>
+          <AlertDialogAction
+            variant="destructive"
+            disabled={pending}
+            onClick={confirm}
+          >
+            {pending && <Spinner data-icon="inline-start" />}
+            删除
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   );
 }
 
@@ -3767,19 +5163,30 @@ function OAuthDialog({
   onCompleted,
   onOpenChange,
   open,
+  provider,
 }: {
   onCompleted: () => Promise<unknown>;
   onOpenChange: (open: boolean) => void;
   open: boolean;
+  provider: "codex" | "claude";
 }) {
   const [pending, setPending] = React.useState(false);
   const [session, setSession] = React.useState<OAuthStartResponse | null>(null);
   const [callbackUrl, setCallbackUrl] = React.useState("");
 
+  const providerLabel = provider === "claude" ? "Claude" : "Codex";
+  const callbackPlaceholder =
+    provider === "claude"
+      ? "http://localhost:54545/callback?code=...&state=..."
+      : "http://localhost:3000/api/admin/codex/credentials/oauth/callback?code=...&state=...";
+
   async function startOAuth() {
     setPending(true);
     try {
-      const started = await startCodexOAuth();
+      const started =
+        provider === "claude"
+          ? await startClaudeOAuth()
+          : await startCodexOAuth();
       setSession(started);
       toast.success("OAuth 链接已生成");
     } catch (error) {
@@ -3798,12 +5205,16 @@ function OAuthDialog({
     }
     setPending(true);
     try {
-      await finishCodexOAuth(trimmed);
+      if (provider === "claude") {
+        await finishClaudeOAuth(trimmed);
+      } else {
+        await finishCodexOAuth(trimmed);
+      }
       await onCompleted();
       setCallbackUrl("");
       setSession(null);
       onOpenChange(false);
-      toast.success("Codex 凭据已连接");
+      toast.success(`${providerLabel} 凭据已连接`);
     } catch (error) {
       toast.error(adminErrorMessage(error));
     } finally {
@@ -3816,7 +5227,7 @@ function OAuthDialog({
       <DialogContent className="sm:max-w-3xl">
         <form className="grid gap-4" onSubmit={finishOAuth}>
           <DialogHeader>
-            <DialogTitle>连接 Codex 账号</DialogTitle>
+            <DialogTitle>连接 {providerLabel} 账号</DialogTitle>
             <DialogDescription>
               先生成 OAuth 链接并在浏览器打开，授权完成后把 callback URL 或
               query string 粘贴回来完成保存。
@@ -3894,7 +5305,7 @@ function OAuthDialog({
                 id="oauth-callback-url"
                 className="min-h-28"
                 value={callbackUrl}
-                placeholder="http://localhost:3000/api/admin/codex/credentials/oauth/callback?code=...&state=..."
+                placeholder={callbackPlaceholder}
                 onChange={(event) => setCallbackUrl(event.target.value)}
               />
             </Field>
@@ -3987,7 +5398,10 @@ function QuotaProgressCell({
                 {window.label}
               </span>
               <span className="shrink-0 text-right text-xs text-muted-foreground">
-                {window.reset_label || "-"}
+                <QuotaResetTime
+                  fallback={window.reset_label || "-"}
+                  value={window.reset_at}
+                />
               </span>
             </div>
             <div className="flex min-w-0 items-center gap-2">
@@ -4011,6 +5425,168 @@ function QuotaProgressCell({
         );
       })}
     </div>
+  );
+}
+
+function ClaudeQuotaUsageCell({
+  errorMessage,
+  loading,
+  quota,
+}: {
+  errorMessage?: string;
+  loading: boolean;
+  quota: ClaudeQuotaReport | undefined;
+}) {
+  if (!quota) {
+    if (errorMessage) {
+      return <span className="text-xs text-destructive">{errorMessage}</span>;
+    }
+    return (
+      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+        {loading ? (
+          <>
+            <Spinner data-icon="inline-start" />
+            读取中
+          </>
+        ) : (
+          <Badge variant="outline">未读取</Badge>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid gap-2">
+      <div className="flex items-center justify-between gap-2">
+        <ClaudeQuotaStatusBadge quota={quota} />
+        <span className="text-xs text-muted-foreground">真实额度</span>
+      </div>
+      {quota.cooldown_until && quota.status === "cooling_down" && (
+        <div className="text-xs text-amber-600 dark:text-amber-300">
+          冷却至 <LocalDateTime value={quota.cooldown_until} />
+        </div>
+      )}
+      {quota.windows.length === 0 ? (
+        <div className="text-xs text-muted-foreground">
+          {quota.message || "Anthropic 未返回可展示的额度窗口"}
+        </div>
+      ) : (
+        <div className="grid gap-2">
+          {quota.windows.map((window) => {
+            const remainingPercent = window.remaining_percent;
+            const progressValue =
+              remainingPercent === null ? 0 : clamp(remainingPercent, 0, 100);
+            const percentWindow = isClaudePercentQuotaWindow(window);
+            return (
+              <div
+                key={window.id}
+                className="grid gap-1 rounded-md border border-border/50 bg-background/55 p-2"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-foreground">
+                    {window.label}
+                  </span>
+                  <span className="text-xs tabular-nums text-muted-foreground">
+                    重置{" "}
+                    <QuotaResetTime
+                      fallback={window.reset_label}
+                      value={window.reset_at}
+                    />
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Progress
+                    className="min-w-0 flex-1 **:data-[slot=progress-track]:h-2"
+                    value={progressValue}
+                  />
+                  <span
+                    className={`w-10 shrink-0 text-right text-xs tabular-nums ${
+                      window.exhausted
+                        ? "text-destructive"
+                        : "text-muted-foreground"
+                    }`}
+                  >
+                    {remainingPercent === null
+                      ? "未知"
+                      : `${Math.round(remainingPercent)}%`}
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
+                  {percentWindow ? (
+                    <>
+                      <span>剩余 {formatQuotaPercent(window.remaining)}</span>
+                      <span>总量 {formatQuotaPercent(window.limit)}</span>
+                      {window.used !== null && (
+                        <span>已用 {formatQuotaPercent(window.used)}</span>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <span>剩余 {formatQuotaAmount(window.remaining)}</span>
+                      <span>总量 {formatQuotaAmount(window.limit)}</span>
+                      {window.used !== null && (
+                        <span>已用 {formatQuotaAmount(window.used)}</span>
+                      )}
+                    </>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {quota.windows.length > 0 && (
+        <div className="text-[11px] text-muted-foreground">{quota.message}</div>
+      )}
+    </div>
+  );
+}
+
+function ClaudeQuotaStatusBadge({ quota }: { quota: ClaudeQuotaReport }) {
+  if (quota.status === "error" || quota.status === "exhausted") {
+    return (
+      <Badge variant="destructive">
+        {claudeQuotaStatusLabel(quota.status)}
+      </Badge>
+    );
+  }
+  if (quota.status === "cooling_down" || quota.status === "low") {
+    return (
+      <Badge variant="outline">{claudeQuotaStatusLabel(quota.status)}</Badge>
+    );
+  }
+  return (
+    <Badge variant="secondary">{claudeQuotaStatusLabel(quota.status)}</Badge>
+  );
+}
+
+function QuotaResetTime({
+  fallback,
+  value,
+}: {
+  fallback: string;
+  value?: string | null;
+}) {
+  const isClient = React.useSyncExternalStore(
+    subscribeNoop,
+    () => true,
+    () => false,
+  );
+  const resetAt = value?.trim();
+  const date = parseUtcDate(resetAt);
+
+  if (!resetAt || !date) {
+    return <>{fallback || "-"}</>;
+  }
+
+  return (
+    <time
+      dateTime={date.toISOString()}
+      suppressHydrationWarning
+      title={isClient ? `网页本地时间：${formatDateTime(resetAt)}` : undefined}
+    >
+      {isClient ? `本地 ${formatMonthDayMinute(resetAt)}` : fallback || "-"}
+    </time>
   );
 }
 
@@ -4188,7 +5764,9 @@ function CredentialSettingsDialog({
   );
 }
 
-function codexTokenRefreshStatus(credential: CodexCredentialRecord) {
+function credentialTokenRefreshStatus(
+  credential: Pick<RoutableCredentialRecord, "metadata" | "lastError">,
+) {
   const attemptCount = metadataInteger(
     credential.metadata.token_refresh_attempt_count,
   );
@@ -4215,7 +5793,7 @@ function CredentialProxyBadge({
   globalSettings,
   proxyPool,
 }: {
-  credential: CodexCredentialRecord;
+  credential: RoutableCredentialRecord;
   globalSettings: GlobalSettingsRecord;
   proxyPool: ProxyPoolRecord[];
 }) {
@@ -4381,12 +5959,14 @@ function CredentialDeleteSettingsAction({
 
 function ChannelsSection({
   channels,
+  claudeCredentials,
   credentials,
   onCreated,
   onDeleted,
   onUpdated,
 }: {
   channels: ChannelRecord[];
+  claudeCredentials: ClaudeCredentialRecord[];
   credentials: CodexCredentialRecord[];
   onCreated: (channel: ChannelRecord) => void;
   onDeleted: (id: string) => void;
@@ -4396,10 +5976,15 @@ function ChannelsSection({
   const [editingChannel, setEditingChannel] =
     React.useState<ChannelRecord | null>(null);
   const [pendingId, setPendingId] = React.useState<string | null>(null);
-  const credentialsById = new Map(
+  const codexCredentialsById = new Map(
     credentials.map((credential) => [credential.id, credential]),
   );
+  const claudeCredentialsById = new Map(
+    claudeCredentials.map((credential) => [credential.id, credential]),
+  );
   const uniqueChannels = uniqueChannelsById(channels);
+  const hasRoutableCredentials =
+    credentials.length > 0 || claudeCredentials.length > 0;
 
   async function toggleEnabled(channel: ChannelRecord, enabled: boolean) {
     setPendingId(channel.id);
@@ -4467,7 +6052,7 @@ function ChannelsSection({
             <CardAction>
               <Button
                 type="button"
-                disabled={credentials.length === 0}
+                disabled={!hasRoutableCredentials}
                 onClick={() => setCreateOpen(true)}
               >
                 <PlusIcon data-icon="inline-start" />
@@ -4484,13 +6069,13 @@ function ChannelsSection({
                   </EmptyMedia>
                   <EmptyTitle>还没有通道</EmptyTitle>
                   <EmptyDescription>
-                    添加 Codex
-                    凭据后通常会自动创建默认通道，也可以手动创建多个通道做优先级和权重路由。
+                    添加 Codex 或 Claude 凭据后，可以手动创建对应 provider
+                    的通道做优先级和权重路由。
                   </EmptyDescription>
                 </EmptyHeader>
                 <Button
                   type="button"
-                  disabled={credentials.length === 0}
+                  disabled={!hasRoutableCredentials}
                   onClick={() => setCreateOpen(true)}
                 >
                   <PlusIcon data-icon="inline-start" />
@@ -4513,13 +6098,20 @@ function ChannelsSection({
                 </TableHeader>
                 <TableBody>
                   {uniqueChannels.map((channel, index) => {
+                    const credentialsById =
+                      channel.provider === "claude"
+                        ? claudeCredentialsById
+                        : codexCredentialsById;
                     const channelCredentials = channel.credentialIds
                       .map((credentialId) => credentialsById.get(credentialId))
-                      .filter(Boolean) as CodexCredentialRecord[];
+                      .filter(Boolean) as RoutableCredentialRecord[];
                     return (
                       <TableRow key={`${channel.id}:${index}`}>
                         <TableCell>
-                          <div className="font-medium">{channel.name}</div>
+                          <div className="flex items-center gap-2">
+                            {renderChannelProviderBadge(channel.provider)}
+                            <div className="font-medium">{channel.name}</div>
+                          </div>
                           <div className="max-w-80 truncate text-xs text-muted-foreground">
                             {channel.baseUrl}
                           </div>
@@ -4640,6 +6232,7 @@ function ChannelsSection({
       </div>
 
       <ChannelFormDialog
+        claudeCredentials={claudeCredentials}
         credentials={credentials}
         mode="create"
         open={createOpen}
@@ -4648,6 +6241,7 @@ function ChannelsSection({
       />
       <ChannelFormDialog
         channel={editingChannel}
+        claudeCredentials={claudeCredentials}
         credentials={credentials}
         mode="edit"
         open={Boolean(editingChannel)}
@@ -4667,6 +6261,7 @@ function ChannelsSection({
 
 function ChannelFormDialog({
   channel,
+  claudeCredentials,
   credentials,
   mode,
   onOpenChange,
@@ -4674,18 +6269,25 @@ function ChannelFormDialog({
   open,
 }: {
   channel?: ChannelRecord | null;
+  claudeCredentials: ClaudeCredentialRecord[];
   credentials: CodexCredentialRecord[];
   mode: "create" | "edit";
   onOpenChange: (open: boolean) => void;
   onSaved: (channel: ChannelRecord) => void;
   open: boolean;
 }) {
+  const defaultProvider: ChannelRecord["provider"] =
+    credentials.length > 0 ? "codex" : "claude";
   const initialForm =
     mode === "edit" && channel
       ? channelToForm(channel)
       : {
           ...EMPTY_CHANNEL_FORM,
-          credentialIds: credentials[0]?.id || "",
+          provider: defaultProvider,
+          credentialIds:
+            defaultProvider === "claude"
+              ? claudeCredentials[0]?.id || ""
+              : credentials[0]?.id || "",
         };
 
   return (
@@ -4693,8 +6295,9 @@ function ChannelFormDialog({
       <DialogContent className="sm:max-w-5xl">
         {open && (
           <ChannelFormDialogBody
-            key={`${mode}:${channel?.id || credentials[0]?.id || "new"}`}
+            key={`${mode}:${channel?.id || credentials[0]?.id || claudeCredentials[0]?.id || "new"}`}
             channel={channel}
+            claudeCredentials={claudeCredentials}
             credentials={credentials}
             initialForm={initialForm}
             mode={mode}
@@ -4712,6 +6315,7 @@ function ChannelFormDialog({
 
 function ChannelFormDialogBody({
   channel,
+  claudeCredentials,
   credentials,
   initialForm,
   mode,
@@ -4719,6 +6323,7 @@ function ChannelFormDialogBody({
   onSaved,
 }: {
   channel?: ChannelRecord | null;
+  claudeCredentials: ClaudeCredentialRecord[];
   credentials: CodexCredentialRecord[];
   initialForm: ChannelFormState;
   mode: "create" | "edit";
@@ -4731,7 +6336,7 @@ function ChannelFormDialogBody({
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (parseList(form.credentialIds).length === 0) {
-      toast.error("请至少选择一个 Codex 凭据");
+      toast.error(`请至少选择一个 ${channelProviderLabel(form.provider)} 凭据`);
       return;
     }
     setPending(true);
@@ -4758,7 +6363,13 @@ function ChannelFormDialogBody({
           通道是自动路由单元。优先级越高越优先，同优先级下按权重加权选择。
         </DialogDescription>
       </DialogHeader>
-      <ChannelFields credentials={credentials} form={form} onChange={setForm} />
+      <ChannelFields
+        claudeCredentials={claudeCredentials}
+        credentials={credentials}
+        form={form}
+        onChange={setForm}
+        providerLocked={mode === "edit"}
+      />
       <DialogFooter>
         <Button
           type="button"
@@ -4768,7 +6379,15 @@ function ChannelFormDialogBody({
         >
           取消
         </Button>
-        <Button type="submit" disabled={pending || credentials.length === 0}>
+        <Button
+          type="submit"
+          disabled={
+            pending ||
+            (form.provider === "claude"
+              ? claudeCredentials.length === 0
+              : credentials.length === 0)
+          }
+        >
           {pending && <Spinner data-icon="inline-start" />}
           {mode === "create" ? "创建通道" : "保存通道"}
         </Button>
@@ -4778,14 +6397,21 @@ function ChannelFormDialogBody({
 }
 
 function ChannelFields({
+  claudeCredentials,
   credentials,
   form,
   onChange,
+  providerLocked,
 }: {
+  claudeCredentials: ClaudeCredentialRecord[];
   credentials: CodexCredentialRecord[];
   form: ChannelFormState;
   onChange: React.Dispatch<React.SetStateAction<ChannelFormState>>;
+  providerLocked: boolean;
 }) {
+  const selectedProviderCredentials =
+    form.provider === "claude" ? claudeCredentials : credentials;
+
   const update = <K extends keyof ChannelFormState>(
     key: K,
     value: ChannelFormState[K],
@@ -4793,26 +6419,60 @@ function ChannelFields({
     onChange((current) => ({ ...current, [key]: value }));
   };
 
+  function updateProvider(provider: ChannelRecord["provider"]) {
+    const nextCredentials =
+      provider === "claude" ? claudeCredentials : credentials;
+    onChange((current) => ({
+      ...current,
+      provider,
+      credentialIds: nextCredentials[0]?.id || "",
+    }));
+  }
+
   return (
     <FieldSet>
       <FieldLegend>通道配置</FieldLegend>
       <FieldGroup>
-        {credentials.length === 0 && (
+        {selectedProviderCredentials.length === 0 && (
           <Alert>
             <UserRoundIcon />
-            <AlertTitle>需要先连接 Codex 凭据</AlertTitle>
+            <AlertTitle>
+              需要先连接 {channelProviderLabel(form.provider)} 凭据
+            </AlertTitle>
             <AlertDescription>
-              创建通道前必须至少有一个 Codex 凭据。
+              创建 {channelProviderLabel(form.provider)}{" "}
+              通道前必须至少有一个对应凭据。
             </AlertDescription>
           </Alert>
         )}
+
+        <Field>
+          <FieldLabel htmlFor="channel-provider">Provider</FieldLabel>
+          <select
+            id="channel-provider"
+            className="h-9 rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={providerLocked}
+            value={form.provider}
+            onChange={(event) =>
+              updateProvider(
+                event.target.value === "claude" ? "claude" : "codex",
+              )
+            }
+          >
+            <option value="codex">Codex</option>
+            <option value="claude">Claude</option>
+          </select>
+          <FieldDescription>
+            创建后不可修改。API Key 绑定到这个通道后才能使用对应 provider。
+          </FieldDescription>
+        </Field>
 
         <Field>
           <FieldLabel htmlFor="channel-name">名称</FieldLabel>
           <Input
             id="channel-name"
             value={form.name}
-            placeholder="Codex · account@example.com"
+            placeholder={`${channelProviderLabel(form.provider)} · account@example.com`}
             onChange={(event) => update("name", event.target.value)}
           />
         </Field>
@@ -4820,7 +6480,7 @@ function ChannelFields({
         <Field>
           <FieldLabel>绑定凭据</FieldLabel>
           <CredentialVisualSelector
-            credentials={credentials}
+            credentials={selectedProviderCredentials}
             selectedIds={parseList(form.credentialIds)}
             onSelectedIdsChange={(ids) =>
               update("credentialIds", ids.join("\n"))
@@ -4850,7 +6510,7 @@ function ChannelFields({
           <Input
             id="channel-base-url"
             value={form.baseUrl}
-            placeholder="留空使用服务端默认 Codex 基础 URL"
+            placeholder={`留空使用服务端默认 ${channelProviderLabel(form.provider)} 基础 URL`}
             onChange={(event) => update("baseUrl", event.target.value)}
           />
         </Field>
@@ -4884,7 +6544,7 @@ function ChannelFields({
             id="channel-models"
             className="min-h-24"
             value={form.modelAllowlist}
-            placeholder="留空表示不限模型，例如 gpt-5.5 或 gpt-5.5(xhigh)"
+            placeholder="留空表示不限模型，例如 gpt-5.5(xhigh) 或 claude-opus-4-8(1m)(max)"
             onChange={(event) => update("modelAllowlist", event.target.value)}
           />
         </Field>
@@ -5417,6 +7077,10 @@ function RequestLogDetailDialog({
                   bytes={body.request_body_bytes}
                 />
                 <DetailBlock
+                  title="转发到上游的 Headers"
+                  value={formatDetailValue(body.forwarded_headers)}
+                />
+                <DetailBlock
                   title="转发到上游的 Body"
                   value={body.forwarded_body_text}
                   truncated={body.forwarded_body_truncated}
@@ -5429,7 +7093,7 @@ function RequestLogDetailDialog({
                   bytes={body.upstream_body_bytes}
                 />
                 <DetailBlock
-                  title="上游 Headers"
+                  title="上游响应 Headers"
                   value={formatDetailValue(body.upstream_headers)}
                 />
                 {(body.error_message ||
@@ -6059,6 +7723,14 @@ function renderEnabledBadge(enabled: boolean) {
   );
 }
 
+function renderChannelProviderBadge(provider: ChannelRecord["provider"]) {
+  return <Badge variant="outline">{channelProviderLabel(provider)}</Badge>;
+}
+
+function channelProviderLabel(provider: ChannelRecord["provider"]) {
+  return provider === "claude" ? "Claude" : "Codex";
+}
+
 function renderChannelStatusBadge(status: ChannelStatus) {
   if (status === "healthy") {
     return <Badge variant="secondary">{STATUS_LABELS[status]}</Badge>;
@@ -6145,6 +7817,7 @@ function assertApiKey(apiKey: PublicApiKey | null | undefined) {
 
 function channelToForm(channel: ChannelRecord): ChannelFormState {
   return {
+    provider: channel.provider,
     name: channel.name,
     credentialIds: channel.credentialIds.join("\n"),
     enabled: channel.enabled,
@@ -6158,6 +7831,7 @@ function channelToForm(channel: ChannelRecord): ChannelFormState {
 function channelFormToPayload(form: ChannelFormState): ChannelPayload {
   const credentialIds = parseList(form.credentialIds);
   return {
+    provider: form.provider,
     name: form.name.trim(),
     credentialId: credentialIds[0],
     credentialIds,
@@ -6277,7 +7951,7 @@ function proxyPoolRecordText(proxy: ProxyPoolRecord) {
 }
 
 function proxyPoolSelectionText(
-  credential: CodexCredentialRecord,
+  credential: RoutableCredentialRecord,
   proxyPool: ProxyPoolRecord[],
 ) {
   if (!credential.proxyPoolId) {
@@ -6288,7 +7962,7 @@ function proxyPoolSelectionText(
 }
 
 function credentialProxyForm(
-  credential: CodexCredentialRecord,
+  credential: RoutableCredentialRecord,
 ): CredentialProxyFormState {
   const proxy = credential.proxy;
   return {
@@ -6301,7 +7975,7 @@ function credentialProxyForm(
   };
 }
 
-function credentialProxyText(credential: CodexCredentialRecord) {
+function credentialProxyText(credential: RoutableCredentialRecord) {
   const proxy = credential.proxy;
   if (!proxy) {
     return "未配置";
@@ -6429,6 +8103,25 @@ function formatDateTime(value: string) {
   return `${part("year")}-${part("month")}-${part("day")} ${part("hour")}:${part("minute")}:${part("second")}`;
 }
 
+function formatMonthDayMinute(value: string) {
+  const date = parseUtcDate(value);
+  if (!date) {
+    return "-";
+  }
+
+  const parts = new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+  const part = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((item) => item.type === type)?.value || "";
+
+  return `${part("month")}-${part("day")} ${part("hour")}:${part("minute")}`;
+}
+
 function metadataString(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -6497,7 +8190,7 @@ function codexPlanLabel(planType: string) {
   return labels[normalized] || planType || "未知";
 }
 
-function usageHealthScore(health: CodexCredentialRecord["usageHealth"]) {
+function usageHealthScore(health: RoutableCredentialRecord["usageHealth"]) {
   return clamp(health?.score ?? 100, 0, 100);
 }
 
@@ -6572,6 +8265,40 @@ function quotaStatusLabel(status: CodexQuotaReport["status"]) {
     not_cached: "未缓存",
   };
   return labels[status] || status;
+}
+
+function claudeQuotaStatusLabel(status: ClaudeQuotaReport["status"]) {
+  const labels: Record<ClaudeQuotaReport["status"], string> = {
+    unknown: "未知",
+    exhausted: "已耗尽",
+    low: "偏低",
+    medium: "中等",
+    high: "充足",
+    full: "满额",
+    cooling_down: "冷却中",
+    error: "异常",
+  };
+  return labels[status] || status;
+}
+
+function isClaudePercentQuotaWindow(
+  window: ClaudeQuotaReport["windows"][number],
+) {
+  return window.id.startsWith("unified-");
+}
+
+function formatQuotaPercent(value: number | null) {
+  if (value === null || !Number.isFinite(value)) {
+    return "未知";
+  }
+  return `${formatNumber(Math.round(value))}%`;
+}
+
+function formatQuotaAmount(value: number | null) {
+  if (value === null || !Number.isFinite(value)) {
+    return "未知";
+  }
+  return formatNumber(Math.round(value));
 }
 
 function formatDuration(value: number) {

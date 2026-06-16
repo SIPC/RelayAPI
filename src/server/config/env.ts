@@ -129,6 +129,20 @@ export const serverConfig = {
     process.env.CODEX_BASE_URL || "https://chatgpt.com/backend-api/codex"
   ).replace(/\/+$/, ""),
   codexDefaultModel: process.env.CODEX_DEFAULT_MODEL || "gpt-5.3-codex",
+  claudeRedirectUri:
+    process.env.CLAUDE_REDIRECT_URI || "http://localhost:54545/callback",
+  claudeBaseUrl: (
+    process.env.CLAUDE_BASE_URL || "https://api.anthropic.com"
+  ).replace(/\/+$/, ""),
+  claudeDefaultModel: process.env.CLAUDE_DEFAULT_MODEL || "claude-sonnet-4-5",
+  claudeUserAgent:
+    process.env.CLAUDE_USER_AGENT || "claude-cli/2.1.77 (external, cli)",
+  claudeStainlessPackageVersion:
+    process.env.CLAUDE_STAINLESS_PACKAGE_VERSION || "0.87.0",
+  claudeStainlessRuntimeVersion:
+    process.env.CLAUDE_STAINLESS_RUNTIME_VERSION || "v24.8.0",
+  claudeStainlessOs: process.env.CLAUDE_STAINLESS_OS || "MacOS",
+  claudeStainlessArch: process.env.CLAUDE_STAINLESS_ARCH || "arm64",
   requestTimeoutMs: intEnv("REQUEST_TIMEOUT_MS", 300_000),
   streamRequestTimeoutMs: intEnv("STREAM_REQUEST_TIMEOUT_MS", 1_800_000),
   globalProxy: resolveGlobalProxy(),

@@ -25,6 +25,21 @@ import {
   parseCodexSseResponse,
 } from "@/src/server/codex/client";
 import { createOpenAIChatSseStream } from "@/src/server/codex/chatStream";
+import {
+  chatCompletionsToClaude,
+  claudeSseTextToOpenAIChatCompletion,
+  claudeSseTextToOpenAIResponse,
+  createOpenAIChatStreamFromClaude,
+  createOpenAIResponsesStreamFromClaude,
+  extractUsageFromClaudeSseText,
+  isClaudeModel,
+  responsesToClaude,
+} from "@/src/server/claude/chat";
+import {
+  claudeFetch,
+  claudeJson,
+  copyClaudeUpstreamHeaders,
+} from "@/src/server/claude/client";
 import { serverConfig } from "@/src/server/config/env";
 import { HttpError, errorToResponse } from "@/src/server/http/errors";
 import {
@@ -43,6 +58,7 @@ import {
   selectChannel,
 } from "@/src/server/services/channels";
 import { listPublicCodexCredentials } from "@/src/server/services/codexCredentials";
+
 import { maybeAutoPruneRequestLogs } from "@/src/server/services/logRetention";
 import { getFullRequestLoggingSetting } from "@/src/server/services/settings";
 import type {
@@ -59,6 +75,7 @@ const SENSITIVE_HEADER_NAMES = new Set([
   "x-api-key",
   "openai-api-key",
   "proxy-authorization",
+  "chatgpt-account-id",
 ]);
 
 export async function handleModels(request: Request) {
@@ -138,6 +155,16 @@ export async function handleOpenAIResponses(request: Request) {
     input = await timing.timeAsync("read_request_body", "读取请求 Body", () =>
       readJsonObject(request),
     );
+    if (isClaudeModel(input.model)) {
+      return await handleClaudeResponsesWithContext({
+        request,
+        startedAt,
+        start,
+        timing,
+        apiKey,
+        input,
+      });
+    }
     const stream = input.stream !== false;
     const payload = timing.time("normalize_payload", "规范化请求 Payload", () =>
       normalizeResponsesPayload(input!, { stream: true }),
@@ -204,6 +231,7 @@ export async function handleOpenAIResponses(request: Request) {
       usage,
       requestBody: input,
       forwardedBody: result.upstreamPayload,
+      forwardedHeaders: result.upstreamRequestHeaders,
       upstreamHeaders: result.response.headers,
       upstreamBody: result.text,
       timing,
@@ -391,6 +419,7 @@ async function handleImagesProxy(
         errorMessage: result.text.slice(0, 500),
         requestBody: imageRequest.requestBody,
         forwardedBody: result.upstreamPayload,
+        forwardedHeaders: result.upstreamRequestHeaders,
         upstreamHeaders: result.response.headers,
         upstreamBody: result.text,
         timing,
@@ -431,6 +460,7 @@ async function handleImagesProxy(
         errorMessage: message.slice(0, 500),
         requestBody: imageRequest.requestBody,
         forwardedBody: result.upstreamPayload,
+        forwardedHeaders: result.upstreamRequestHeaders,
         upstreamHeaders: result.response.headers,
         upstreamBody: result.text,
         error,
@@ -453,6 +483,7 @@ async function handleImagesProxy(
       usage: emptyUsage(),
       requestBody: imageRequest.requestBody,
       forwardedBody: result.upstreamPayload,
+      forwardedHeaders: result.upstreamRequestHeaders,
       upstreamHeaders: result.response.headers,
       upstreamBody: result.text,
       timing,
@@ -489,18 +520,15 @@ async function forwardImagesStream(input: {
   requestType: string;
   timing?: StageTimer;
 }) {
-  const { response, credential, upstreamPayload } = await codexFetch(
-    "/responses",
-    input.imageRequest.payload,
-    {
+  const { response, credential, upstreamPayload, upstreamRequestHeaders } =
+    await codexFetch("/responses", input.imageRequest.payload, {
       stream: true,
       sourceHeaders: input.request.headers,
       channel: input.channel,
       promptCacheKey: null,
       transport: "websocket",
       timing: input.timing,
-    },
-  );
+    });
   const headers = withStreamingHeaders(
     withDefaultContentType(
       copyUpstreamHeaders(response.headers),
@@ -535,6 +563,7 @@ async function forwardImagesStream(input: {
       errorMessage: (errorText || response.statusText).slice(0, 500),
       requestBody: input.imageRequest.requestBody,
       forwardedBody: upstreamPayload,
+      forwardedHeaders: upstreamRequestHeaders,
       upstreamHeaders: response.headers,
       upstreamBody: errorText,
       timing: input.timing,
@@ -573,6 +602,7 @@ async function forwardImagesStream(input: {
               usage: emptyUsage(),
               requestBody: input.imageRequest.requestBody,
               forwardedBody: upstreamPayload,
+              forwardedHeaders: upstreamRequestHeaders,
               upstreamHeaders: response.headers,
               upstreamBody: upstreamCapture.text,
               timing: input.timing,
@@ -601,6 +631,7 @@ async function forwardImagesStream(input: {
               errorMessage: message.slice(0, 500),
               requestBody: input.imageRequest.requestBody,
               forwardedBody: upstreamPayload,
+              forwardedHeaders: upstreamRequestHeaders,
               upstreamHeaders: response.headers,
               upstreamBody: upstreamCapture.text,
               error,
@@ -627,6 +658,16 @@ export async function handleChatCompletions(request: Request) {
     input = await timing.timeAsync("read_request_body", "读取请求 Body", () =>
       readJsonObject(request),
     );
+    if (isClaudeModel(input.model)) {
+      return await handleClaudeChatCompletionsWithContext({
+        request,
+        startedAt,
+        start,
+        timing,
+        apiKey,
+        input,
+      });
+    }
     const stream = Boolean(input.stream);
     const { payload, toolNameMaps } = timing.time(
       "normalize_payload",
@@ -640,18 +681,15 @@ export async function handleChatCompletions(request: Request) {
     channel = selected.channel;
 
     if (stream) {
-      const { response, credential, upstreamPayload } = await codexFetch(
-        "/responses",
-        payload,
-        {
+      const { response, credential, upstreamPayload, upstreamRequestHeaders } =
+        await codexFetch("/responses", payload, {
           stream: true,
           sourceHeaders: request.headers,
           channel,
           promptCacheKey: codexPromptCacheKeyForApiKey(apiKey),
           transport: "websocket",
           timing,
-        },
-      );
+        });
       if (!response.ok) {
         const errorText = await timing.timeAsync(
           "read_upstream_error_body",
@@ -678,6 +716,7 @@ export async function handleChatCompletions(request: Request) {
           errorMessage: (errorText || response.statusText).slice(0, 500),
           requestBody: input,
           forwardedBody: upstreamPayload,
+          forwardedHeaders: upstreamRequestHeaders,
           upstreamHeaders: response.headers,
           upstreamBody: errorText,
           timing,
@@ -717,6 +756,7 @@ export async function handleChatCompletions(request: Request) {
                   usage,
                   requestBody: input,
                   forwardedBody: upstreamPayload,
+                  forwardedHeaders: upstreamRequestHeaders,
                   upstreamHeaders: response.headers,
                   upstreamBody: upstreamCapture.text,
                   timing,
@@ -745,6 +785,7 @@ export async function handleChatCompletions(request: Request) {
                   errorMessage: message.slice(0, 500),
                   requestBody: input,
                   forwardedBody: upstreamPayload,
+                  forwardedHeaders: upstreamRequestHeaders,
                   upstreamHeaders: response.headers,
                   upstreamBody: upstreamCapture.text,
                   error,
@@ -785,6 +826,7 @@ export async function handleChatCompletions(request: Request) {
         errorMessage: result.text.slice(0, 500),
         requestBody: input,
         forwardedBody: result.upstreamPayload,
+        forwardedHeaders: result.upstreamRequestHeaders,
         upstreamHeaders: result.response.headers,
         upstreamBody: result.text,
         timing,
@@ -814,6 +856,7 @@ export async function handleChatCompletions(request: Request) {
       usage,
       requestBody: input,
       forwardedBody: result.upstreamPayload,
+      forwardedHeaders: result.upstreamRequestHeaders,
       upstreamHeaders: result.response.headers,
       upstreamBody: result.text,
       timing,
@@ -843,6 +886,446 @@ export async function handleChatCompletions(request: Request) {
     );
     return errorToResponse(error);
   }
+}
+
+async function handleClaudeChatCompletionsWithContext(input: {
+  request: Request;
+  startedAt: string;
+  start: number;
+  timing: StageTimer;
+  apiKey: RelayApiKeyContext;
+  input: Record<string, unknown>;
+}) {
+  const stream = Boolean(input.input.stream);
+  const conversion = input.timing.time(
+    "normalize_payload",
+    "Chat 转换为 Claude Payload",
+    () => chatCompletionsToClaude(input.input, { stream: true }),
+  );
+  const model =
+    stringValue(input.input.model) || serverConfig.claudeDefaultModel;
+  const selected = input.timing.time("select_channel", "选择 Claude 通道", () =>
+    selectChannel({ provider: "claude", model, apiKey: input.apiKey }),
+  );
+  const channel = selected.channel;
+
+  if (stream) {
+    const { response, credential, upstreamPayload, upstreamRequestHeaders } =
+      await claudeFetch(conversion.payload, {
+        stream: true,
+        sourceHeaders: input.request.headers,
+        credentialId: selected.credential.id,
+        baseUrl: channel.baseUrl,
+        timing: input.timing,
+      });
+    const headers = withStreamingHeaders(
+      withDefaultContentType(
+        copyClaudeUpstreamHeaders(response.headers),
+        "text/event-stream; charset=utf-8",
+      ),
+    );
+    if (!response.ok) {
+      const errorText = await input.timing.timeAsync(
+        "read_upstream_error_body",
+        "读取 Claude 上游错误响应 Body",
+        () => response.text(),
+      );
+      recordChannelFailure(channel, {
+        statusCode: response.status,
+        message: errorText.slice(0, 500) || response.statusText,
+      });
+      appendSuccessLog({
+        request: input.request,
+        startedAt: input.startedAt,
+        start: input.start,
+        apiKey: input.apiKey,
+        channel,
+        credentialId: credential.id,
+        credentialEmail: credential.email,
+        requestType: "chat.completions.claude",
+        stream: true,
+        model,
+        statusCode: response.status,
+        usage: emptyUsage(),
+        errorCode: "upstream_error",
+        errorMessage: (errorText || response.statusText).slice(0, 500),
+        requestBody: input.input,
+        forwardedBody: upstreamPayload,
+        forwardedHeaders: upstreamRequestHeaders,
+        upstreamHeaders: response.headers,
+        upstreamBody: errorText,
+        timing: input.timing,
+      });
+      return upstreamErrorResponse(response.status);
+    }
+
+    const fullLog = getFullRequestLoggingSetting();
+    const upstreamCapture = createTextCapture();
+    const body = response.body
+      ? createOpenAIChatStreamFromClaude(
+          tapStream(
+            response.body,
+            fullLog ? upstreamCapture : null,
+            input.timing,
+          ),
+          {
+            model,
+            reverseToolNameMap: conversion.reverseToolNameMap,
+            onFirstToken: () => {
+              input.timing.mark("stream_first_token", "收到首字输出");
+            },
+            onCompleted: (usage) => {
+              recordChannelSuccess(channel);
+              appendSuccessLog({
+                request: input.request,
+                startedAt: input.startedAt,
+                start: input.start,
+                apiKey: input.apiKey,
+                channel,
+                credentialId: credential.id,
+                credentialEmail: credential.email,
+                requestType: "chat.completions.claude",
+                stream: true,
+                model,
+                statusCode: response.status,
+                usage,
+                requestBody: input.input,
+                forwardedBody: upstreamPayload,
+                forwardedHeaders: upstreamRequestHeaders,
+                upstreamHeaders: response.headers,
+                upstreamBody: upstreamCapture.text,
+                timing: input.timing,
+              });
+            },
+            onError: (error, usage) => {
+              const message =
+                error instanceof Error ? error.message : String(error);
+              recordChannelFailure(channel, {
+                statusCode: 502,
+                message,
+              });
+              appendSuccessLog({
+                request: input.request,
+                startedAt: input.startedAt,
+                start: input.start,
+                apiKey: input.apiKey,
+                channel,
+                credentialId: credential.id,
+                credentialEmail: credential.email,
+                requestType: "chat.completions.claude",
+                stream: true,
+                model,
+                statusCode: 502,
+                usage,
+                errorCode: "stream_error",
+                errorMessage: message.slice(0, 500),
+                requestBody: input.input,
+                forwardedBody: upstreamPayload,
+                forwardedHeaders: upstreamRequestHeaders,
+                upstreamHeaders: response.headers,
+                upstreamBody: upstreamCapture.text,
+                error,
+                timing: input.timing,
+              });
+            },
+          },
+        )
+      : null;
+    return new Response(body, { status: response.status, headers });
+  }
+
+  const result = await claudeJson(conversion.payload, {
+    stream: true,
+    sourceHeaders: input.request.headers,
+    credentialId: selected.credential.id,
+    baseUrl: channel.baseUrl,
+    timing: input.timing,
+  });
+  const usage = input.timing.time(
+    "extract_usage",
+    "提取 Claude Token 用量",
+    () => extractUsageFromClaudeSseText(result.text),
+  );
+  if (!result.response.ok) {
+    recordChannelFailure(channel, {
+      statusCode: result.response.status,
+      message: result.text.slice(0, 500),
+    });
+    appendSuccessLog({
+      request: input.request,
+      startedAt: input.startedAt,
+      start: input.start,
+      apiKey: input.apiKey,
+      channel,
+      credentialId: result.credential.id,
+      credentialEmail: result.credential.email,
+      requestType: "chat.completions.claude",
+      stream: false,
+      model,
+      statusCode: result.response.status,
+      usage: emptyUsage(),
+      errorCode: "upstream_error",
+      errorMessage: result.text.slice(0, 500),
+      requestBody: input.input,
+      forwardedBody: result.upstreamPayload,
+      forwardedHeaders: result.upstreamRequestHeaders,
+      upstreamHeaders: result.response.headers,
+      upstreamBody: result.text,
+      timing: input.timing,
+    });
+    return upstreamErrorResponse(result.response.status);
+  }
+  const responsePayload = input.timing.time(
+    "transform_response",
+    "转换为 OpenAI Chat 响应",
+    () =>
+      claudeSseTextToOpenAIChatCompletion(result.text, {
+        model,
+        reverseToolNameMap: conversion.reverseToolNameMap,
+      }),
+  );
+  recordChannelSuccess(channel);
+  appendSuccessLog({
+    request: input.request,
+    startedAt: input.startedAt,
+    start: input.start,
+    apiKey: input.apiKey,
+    channel,
+    credentialId: result.credential.id,
+    credentialEmail: result.credential.email,
+    requestType: "chat.completions.claude",
+    stream: false,
+    model,
+    statusCode: 200,
+    usage,
+    requestBody: input.input,
+    forwardedBody: result.upstreamPayload,
+    forwardedHeaders: result.upstreamRequestHeaders,
+    upstreamHeaders: result.response.headers,
+    upstreamBody: result.text,
+    timing: input.timing,
+  });
+  return Response.json(responsePayload, { status: 200 });
+}
+
+async function handleClaudeResponsesWithContext(input: {
+  request: Request;
+  startedAt: string;
+  start: number;
+  timing: StageTimer;
+  apiKey: RelayApiKeyContext;
+  input: Record<string, unknown>;
+}) {
+  const stream = input.input.stream !== false;
+  const conversion = input.timing.time(
+    "normalize_payload",
+    "Responses 转换为 Claude Payload",
+    () => responsesToClaude(input.input, { stream: true }),
+  );
+  const model =
+    stringValue(input.input.model) || serverConfig.claudeDefaultModel;
+  const selected = input.timing.time("select_channel", "选择 Claude 通道", () =>
+    selectChannel({ provider: "claude", model, apiKey: input.apiKey }),
+  );
+  const channel = selected.channel;
+
+  if (stream) {
+    const { response, credential, upstreamPayload, upstreamRequestHeaders } =
+      await claudeFetch(conversion.payload, {
+        stream: true,
+        sourceHeaders: input.request.headers,
+        credentialId: selected.credential.id,
+        baseUrl: channel.baseUrl,
+        timing: input.timing,
+      });
+    const headers = withStreamingHeaders(
+      withDefaultContentType(
+        copyClaudeUpstreamHeaders(response.headers),
+        "text/event-stream; charset=utf-8",
+      ),
+    );
+    if (!response.ok) {
+      const errorText = await input.timing.timeAsync(
+        "read_upstream_error_body",
+        "读取 Claude 上游错误响应 Body",
+        () => response.text(),
+      );
+      recordChannelFailure(channel, {
+        statusCode: response.status,
+        message: errorText.slice(0, 500) || response.statusText,
+      });
+      appendSuccessLog({
+        request: input.request,
+        startedAt: input.startedAt,
+        start: input.start,
+        apiKey: input.apiKey,
+        channel,
+        credentialId: credential.id,
+        credentialEmail: credential.email,
+        requestType: "responses.claude",
+        stream: true,
+        model,
+        statusCode: response.status,
+        usage: emptyUsage(),
+        errorCode: "upstream_error",
+        errorMessage: (errorText || response.statusText).slice(0, 500),
+        requestBody: input.input,
+        forwardedBody: upstreamPayload,
+        forwardedHeaders: upstreamRequestHeaders,
+        upstreamHeaders: response.headers,
+        upstreamBody: errorText,
+        timing: input.timing,
+      });
+      return upstreamErrorResponse(response.status);
+    }
+
+    const fullLog = getFullRequestLoggingSetting();
+    const upstreamCapture = createTextCapture();
+    const body = response.body
+      ? createOpenAIResponsesStreamFromClaude(
+          tapStream(
+            response.body,
+            fullLog ? upstreamCapture : null,
+            input.timing,
+          ),
+          {
+            model,
+            reverseToolNameMap: conversion.reverseToolNameMap,
+            onFirstToken: () => {
+              input.timing.mark("stream_first_token", "收到首字输出");
+            },
+            onCompleted: (usage) => {
+              recordChannelSuccess(channel);
+              appendSuccessLog({
+                request: input.request,
+                startedAt: input.startedAt,
+                start: input.start,
+                apiKey: input.apiKey,
+                channel,
+                credentialId: credential.id,
+                credentialEmail: credential.email,
+                requestType: "responses.claude",
+                stream: true,
+                model,
+                statusCode: response.status,
+                usage,
+                requestBody: input.input,
+                forwardedBody: upstreamPayload,
+                forwardedHeaders: upstreamRequestHeaders,
+                upstreamHeaders: response.headers,
+                upstreamBody: upstreamCapture.text,
+                timing: input.timing,
+              });
+            },
+            onError: (error, usage) => {
+              const message =
+                error instanceof Error ? error.message : String(error);
+              recordChannelFailure(channel, {
+                statusCode: 502,
+                message,
+              });
+              appendSuccessLog({
+                request: input.request,
+                startedAt: input.startedAt,
+                start: input.start,
+                apiKey: input.apiKey,
+                channel,
+                credentialId: credential.id,
+                credentialEmail: credential.email,
+                requestType: "responses.claude",
+                stream: true,
+                model,
+                statusCode: 502,
+                usage,
+                errorCode: "stream_error",
+                errorMessage: message.slice(0, 500),
+                requestBody: input.input,
+                forwardedBody: upstreamPayload,
+                forwardedHeaders: upstreamRequestHeaders,
+                upstreamHeaders: response.headers,
+                upstreamBody: upstreamCapture.text,
+                error,
+                timing: input.timing,
+              });
+            },
+          },
+        )
+      : null;
+    return new Response(body, { status: response.status, headers });
+  }
+
+  const result = await claudeJson(conversion.payload, {
+    stream: true,
+    sourceHeaders: input.request.headers,
+    credentialId: selected.credential.id,
+    baseUrl: channel.baseUrl,
+    timing: input.timing,
+  });
+  const usage = input.timing.time(
+    "extract_usage",
+    "提取 Claude Token 用量",
+    () => extractUsageFromClaudeSseText(result.text),
+  );
+  if (!result.response.ok) {
+    recordChannelFailure(channel, {
+      statusCode: result.response.status,
+      message: result.text.slice(0, 500),
+    });
+    appendSuccessLog({
+      request: input.request,
+      startedAt: input.startedAt,
+      start: input.start,
+      apiKey: input.apiKey,
+      channel,
+      credentialId: result.credential.id,
+      credentialEmail: result.credential.email,
+      requestType: "responses.claude",
+      stream: false,
+      model,
+      statusCode: result.response.status,
+      usage: emptyUsage(),
+      errorCode: "upstream_error",
+      errorMessage: result.text.slice(0, 500),
+      requestBody: input.input,
+      forwardedBody: result.upstreamPayload,
+      forwardedHeaders: result.upstreamRequestHeaders,
+      upstreamHeaders: result.response.headers,
+      upstreamBody: result.text,
+      timing: input.timing,
+    });
+    return upstreamErrorResponse(result.response.status);
+  }
+  const responsePayload = input.timing.time(
+    "transform_response",
+    "转换为 OpenAI Responses 响应",
+    () =>
+      claudeSseTextToOpenAIResponse(result.text, {
+        model,
+        reverseToolNameMap: conversion.reverseToolNameMap,
+      }),
+  );
+  recordChannelSuccess(channel);
+  appendSuccessLog({
+    request: input.request,
+    startedAt: input.startedAt,
+    start: input.start,
+    apiKey: input.apiKey,
+    channel,
+    credentialId: result.credential.id,
+    credentialEmail: result.credential.email,
+    requestType: "responses.claude",
+    stream: false,
+    model,
+    statusCode: 200,
+    usage,
+    requestBody: input.input,
+    forwardedBody: result.upstreamPayload,
+    forwardedHeaders: result.upstreamRequestHeaders,
+    upstreamHeaders: result.response.headers,
+    upstreamBody: result.text,
+    timing: input.timing,
+  });
+  return Response.json(responsePayload, { status: 200 });
 }
 
 async function handleRawCodexProxy(
@@ -936,6 +1419,7 @@ async function handleRawCodexProxy(
           }),
       requestBody: rawPayload,
       forwardedBody: result.upstreamPayload,
+      forwardedHeaders: result.upstreamRequestHeaders,
       upstreamHeaders: result.response.headers,
       upstreamBody: result.text,
       timing,
@@ -989,18 +1473,15 @@ async function forwardCodexStream(input: {
 }) {
   const model =
     stringValue(input.payload.model) || serverConfig.codexDefaultModel;
-  const { response, credential, upstreamPayload } = await codexFetch(
-    input.upstreamPath,
-    input.payload,
-    {
+  const { response, credential, upstreamPayload, upstreamRequestHeaders } =
+    await codexFetch(input.upstreamPath, input.payload, {
       stream: true,
       sourceHeaders: input.request.headers,
       channel: input.channel,
       promptCacheKey: input.promptCacheKey,
       transport: input.upstreamPath === "/responses" ? "websocket" : "http",
       timing: input.timing,
-    },
-  );
+    });
   const headers = withStreamingHeaders(
     withDefaultContentType(
       copyUpstreamHeaders(response.headers),
@@ -1035,6 +1516,7 @@ async function forwardCodexStream(input: {
       errorMessage: (errorText || response.statusText).slice(0, 500),
       requestBody: input.requestBody,
       forwardedBody: upstreamPayload,
+      forwardedHeaders: upstreamRequestHeaders,
       upstreamHeaders: response.headers,
       upstreamBody: errorText,
       timing: input.timing,
@@ -1070,6 +1552,7 @@ async function forwardCodexStream(input: {
               usage,
               requestBody: input.requestBody,
               forwardedBody: upstreamPayload,
+              forwardedHeaders: upstreamRequestHeaders,
               upstreamHeaders: response.headers,
               upstreamBody: upstreamCapture.text,
               timing: input.timing,
@@ -1098,6 +1581,7 @@ async function forwardCodexStream(input: {
               errorMessage: message.slice(0, 500),
               requestBody: input.requestBody,
               forwardedBody: upstreamPayload,
+              forwardedHeaders: upstreamRequestHeaders,
               upstreamHeaders: response.headers,
               upstreamBody: upstreamCapture.text,
               error,
@@ -1258,7 +1742,8 @@ function appendSuccessLog(input: {
   startedAt: string;
   start: number;
   apiKey: RelayApiKeyContext;
-  channel: ChannelRecord;
+  channel?: ChannelRecord | null;
+  credentialId?: string | null;
   credentialEmail?: string;
   requestType: string;
   stream: boolean;
@@ -1269,6 +1754,7 @@ function appendSuccessLog(input: {
   errorMessage?: string;
   requestBody?: unknown;
   forwardedBody?: unknown;
+  forwardedHeaders?: Headers | Record<string, string>;
   upstreamHeaders?: Headers;
   upstreamBody?: unknown;
   error?: unknown;
@@ -1286,9 +1772,9 @@ function appendSuccessLog(input: {
     apiKeyId: input.apiKey.id,
     apiKeyPrefix: input.apiKey.prefix,
     apiKeyName: input.apiKey.name,
-    channelId: input.channel.id,
-    channelName: input.channel.name,
-    credentialId: input.channel.credentialId,
+    channelId: input.channel?.id,
+    channelName: input.channel?.name,
+    credentialId: input.credentialId ?? input.channel?.credentialId,
     credentialEmail: input.credentialEmail || "",
     usage: input.usage,
     errorCode: input.errorCode,
@@ -1304,6 +1790,7 @@ function appendSuccessLog(input: {
     full: getFullRequestLoggingSetting(),
     requestBody: input.requestBody,
     forwardedBody: input.forwardedBody,
+    forwardedHeaders: input.forwardedHeaders,
     upstreamStatusCode: input.statusCode,
     upstreamHeaders: input.upstreamHeaders,
     upstreamBody: input.upstreamBody,
@@ -1372,6 +1859,7 @@ function appendOptionalRequestDetail(
     full: boolean;
     requestBody?: unknown;
     forwardedBody?: unknown;
+    forwardedHeaders?: Headers | Record<string, string>;
     upstreamStatusCode?: number | null;
     upstreamHeaders?: Headers;
     upstreamBody?: unknown;
@@ -1398,6 +1886,9 @@ function appendOptionalRequestDetail(
   const errorDetail = input.error ? errorLogDetail(input.error) : null;
   appendRequestLogDetail(logId, {
     requestHeaders: sanitizeHeaders(input.request.headers),
+    forwardedHeaders: input.forwardedHeaders
+      ? sanitizeHeaders(input.forwardedHeaders)
+      : null,
     requestBodyText: requestBody.text,
     requestBodyTruncated: requestBody.truncated,
     requestBodyBytes: requestBody.bytes,
@@ -1440,13 +1931,22 @@ function emptySerializedText() {
   return { text: null as string | null, truncated: false, bytes: 0 };
 }
 
-function sanitizeHeaders(headers: Headers) {
+function sanitizeHeaders(headers: Headers | Record<string, string>) {
   const result: Record<string, string> = {};
-  headers.forEach((value, key) => {
+  const append = (key: string, value: string) => {
     result[key] = SENSITIVE_HEADER_NAMES.has(key.toLowerCase())
       ? "[REDACTED]"
       : value;
-  });
+  };
+
+  if (headers instanceof Headers) {
+    headers.forEach((value, key) => append(key, value));
+    return result;
+  }
+
+  for (const [key, value] of Object.entries(headers)) {
+    append(key, value);
+  }
   return result;
 }
 

@@ -1,6 +1,8 @@
 import type {
   AdminOverviewStats,
   ChannelRecord,
+  ClaudeCredentialRecord,
+  ClaudeQuotaReport as SharedClaudeQuotaReport,
   CodexUpstreamTransport,
   CreatedApiKey,
   PublicApiKey,
@@ -10,6 +12,8 @@ import type {
   JsonValue,
   ProxyPoolRecord,
 } from "@/src/shared/types/entities";
+
+export type ClaudeQuotaReport = SharedClaudeQuotaReport;
 
 export type AdminListResponse<T> = {
   object: "list";
@@ -79,6 +83,7 @@ export type RequestLogDetail = {
   };
   detail: {
     request_headers: Record<string, string> | null;
+    forwarded_headers: Record<string, string> | null;
     request_body_text: string | null;
     request_body_truncated: boolean;
     request_body_bytes: number;
@@ -162,6 +167,7 @@ export type ProxyPoolPayload = {
 };
 
 export type ChannelPayload = {
+  provider?: ChannelRecord["provider"];
   name?: string;
   baseUrl?: string;
   credentialId?: string;
@@ -196,6 +202,7 @@ export type CodexQuotaWindow = {
   used_percent: number | null;
   remaining_percent: number | null;
   reset_label: string;
+  reset_at?: string | null;
   exhausted: boolean;
 };
 
@@ -232,6 +239,7 @@ export type AdminDashboardSnapshot = {
   apiKeys: PublicApiKey[];
   channels: ChannelRecord[];
   credentials: CodexCredentialRecord[];
+  claudeCredentials: ClaudeCredentialRecord[];
   proxyPool: ProxyPoolRecord[];
   globalSettings: GlobalSettingsRecord;
   requestLogs: AdminDashboardRequestLogRow[];
@@ -377,11 +385,106 @@ export function refreshCredential(id: string) {
   );
 }
 
+export function resetCredentialHealth(id: string) {
+  return adminRequest<CodexCredentialRecord>(
+    `/api/admin/codex/credentials/${encodePath(id)}/health`,
+    { method: "POST" },
+  );
+}
+
 export function downloadCredentialsExport(id?: string) {
   const path = id
     ? `/api/admin/codex/credentials/${encodePath(id)}/export`
     : "/api/admin/codex/credentials/export";
   return downloadAdminFile(path);
+}
+
+export function listClaudeCredentials() {
+  return adminRequest<ClaudeCredentialRecord[]>(
+    "/api/admin/claude/credentials",
+  );
+}
+
+export function importClaudeCredentialJson(
+  credential: Record<string, unknown>,
+  filename?: string,
+) {
+  return adminRequest<ClaudeCredentialRecord>(
+    "/api/admin/claude/credentials/import",
+    {
+      method: "POST",
+      body: { credential, filename },
+    },
+  );
+}
+
+export function updateClaudeCredentialRouting(
+  id: string,
+  payload: {
+    enabled?: boolean;
+    priority?: number;
+    weight?: number;
+    userAgent?: string | null;
+    useGlobalProxy?: boolean;
+    proxyPoolId?: string | null;
+    proxy?: CredentialProxyPayload;
+  },
+) {
+  return adminRequest<ClaudeCredentialRecord>(
+    `/api/admin/claude/credentials/${encodePath(id)}`,
+    { method: "PATCH", body: payload },
+  );
+}
+
+export function deleteClaudeCredential(id: string) {
+  return adminRequest<AdminDeleteResponse>(
+    `/api/admin/claude/credentials/${encodePath(id)}`,
+    { method: "DELETE" },
+  );
+}
+
+export function refreshClaudeCredential(id: string) {
+  return adminRequest<ClaudeCredentialRecord>(
+    `/api/admin/claude/credentials/${encodePath(id)}/refresh`,
+    { method: "POST" },
+  );
+}
+
+export function resetClaudeCredentialHealth(id: string) {
+  return adminRequest<ClaudeCredentialRecord>(
+    `/api/admin/claude/credentials/${encodePath(id)}/health`,
+    { method: "POST" },
+  );
+}
+
+export function downloadClaudeCredentialsExport(id?: string) {
+  const path = id
+    ? `/api/admin/claude/credentials/${encodePath(id)}/export`
+    : "/api/admin/claude/credentials/export";
+  return downloadAdminFile(path);
+}
+
+export function getClaudeCredentialQuota(id: string) {
+  return adminRequest<ClaudeQuotaReport>(
+    `/api/admin/claude/credentials/${encodePath(id)}/quota`,
+  );
+}
+
+export function startClaudeOAuth() {
+  return adminRequest<OAuthStartResponse>(
+    "/api/admin/claude/credentials/oauth/start",
+    { method: "POST" },
+  );
+}
+
+export function finishClaudeOAuth(callbackUrl: string) {
+  return adminRequest<ClaudeCredentialRecord>(
+    "/api/admin/claude/credentials/oauth/callback",
+    {
+      method: "POST",
+      body: { callbackUrl },
+    },
+  );
 }
 
 export function getCredentialQuota(
@@ -532,6 +635,7 @@ export async function getDashboardSnapshot(
     apiKeys,
     channels,
     credentials,
+    claudeCredentials,
     proxyPool,
     globalSettings,
     requestLogs,
@@ -540,6 +644,7 @@ export async function getDashboardSnapshot(
     listApiKeys(),
     listChannels(),
     listCredentials(),
+    listClaudeCredentials(),
     listProxyPoolItems(),
     getGlobalSettings(),
     getRequestLogs(requestLogLimit),
@@ -550,6 +655,7 @@ export async function getDashboardSnapshot(
     apiKeys,
     channels,
     credentials,
+    claudeCredentials,
     proxyPool,
     globalSettings,
     requestLogs,

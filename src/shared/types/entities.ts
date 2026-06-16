@@ -12,6 +12,8 @@ export type ChannelStatus =
   | "cooling_down"
   | "disabled";
 
+export type ChannelProvider = "codex" | "claude";
+
 export type CodexAccountUsageStatus = "normal" | "warning" | "error" | "unused";
 
 export interface CodexAccountUsageHealth {
@@ -146,6 +148,52 @@ export type CodexCredentialWithTokens = Omit<CodexCredentialRecord, "proxy"> & {
   tokens: CodexTokenBundle;
 };
 
+export interface ClaudeTokenBundle {
+  access_token: string;
+  refresh_token: string;
+  expired: string;
+  last_refresh: string;
+}
+
+export interface ClaudeCredentialRecord {
+  id: string;
+  provider: "claude";
+  email: string;
+  accountId: string;
+  enabled: boolean;
+  priority: number;
+  weight: number;
+  userAgent: string | null;
+  useGlobalProxy: boolean;
+  proxyPoolId: string | null;
+  proxy: PublicCredentialProxyConfig | null;
+  usageHealth?: CodexAccountUsageHealth;
+  expiresAt: string | null;
+  lastRefreshAt: string | null;
+  lastUsedAt: string | null;
+  cooldownUntil: string | null;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+  metadata: Record<string, unknown>;
+}
+
+export type ClaudeCredentialWithTokens = Omit<
+  ClaudeCredentialRecord,
+  "proxy"
+> & {
+  proxy: CredentialProxyConfig | null;
+  tokens: ClaudeTokenBundle;
+};
+
+export type RoutableCredentialRecord =
+  | CodexCredentialRecord
+  | ClaudeCredentialRecord;
+
+export type RoutableCredentialWithTokens =
+  | CodexCredentialWithTokens
+  | ClaudeCredentialWithTokens;
+
 export interface GlobalSettingsRecord {
   proxy: PublicCredentialProxyConfig | null;
   proxySource: "database" | "environment" | "none";
@@ -161,7 +209,7 @@ export interface GlobalSettingsRecord {
 export interface ChannelRecord {
   id: string;
   name: string;
-  provider: "codex";
+  provider: ChannelProvider;
   baseUrl: string;
   credentialId: string;
   credentialIds: string[];
@@ -200,7 +248,7 @@ export interface RelayRequestContext {
 
 export interface SelectedChannel {
   channel: ChannelRecord;
-  credential: CodexCredentialWithTokens;
+  credential: RoutableCredentialWithTokens;
 }
 
 export interface UsageSnapshot {
@@ -208,6 +256,63 @@ export interface UsageSnapshot {
   completionTokens: number;
   totalTokens: number;
   cachedTokens: number;
+}
+
+export interface CredentialUsageWindow {
+  id: string;
+  label: string;
+  since: string;
+  until: string;
+  requestCount: number;
+  successCount: number;
+  errorCount: number;
+  streamCount: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  cachedTokens: number;
+  cacheHitRate: number;
+  avgLatencyMs: number;
+  firstRequestAt: string | null;
+  lastRequestAt: string | null;
+}
+
+export type ClaudeQuotaStatus =
+  | "unknown"
+  | "exhausted"
+  | "low"
+  | "medium"
+  | "high"
+  | "full"
+  | "cooling_down"
+  | "error";
+
+export interface ClaudeQuotaWindow {
+  id: string;
+  label: string;
+  limit: number | null;
+  remaining: number | null;
+  used: number | null;
+  used_percent: number | null;
+  remaining_percent: number | null;
+  reset_label: string;
+  reset_at: string | null;
+  exhausted: boolean;
+}
+
+export interface ClaudeQuotaReport {
+  provider: "claude";
+  source: "anthropic_headers";
+  credential_id: string;
+  account_id: string;
+  email: string;
+  status: ClaudeQuotaStatus;
+  windows: ClaudeQuotaWindow[];
+  local_windows: CredentialUsageWindow[];
+  retrieved_at: string;
+  cooldown_until: string | null;
+  last_error: string | null;
+  message: string;
 }
 
 export interface UsageStatsRow {

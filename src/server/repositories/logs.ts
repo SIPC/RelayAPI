@@ -9,6 +9,7 @@ import type {
   ApiKeyModelUsageStatsRow,
   ApiKeyUsageStatsRow,
   CodexAccountUsageHealth,
+  CredentialUsageWindow,
   DailyUsageStatsRow,
   UsageSnapshot,
   UsageStatsRow,
@@ -68,6 +69,7 @@ export interface PruneRequestLogsResult {
 
 export interface RequestLogDetailInput {
   requestHeaders?: Record<string, string> | null;
+  forwardedHeaders?: Record<string, string> | null;
   requestBodyText?: string | null;
   requestBodyTruncated?: boolean;
   requestBodyBytes?: number;
@@ -154,16 +156,17 @@ export function appendRequestLogDetail(
     .prepare(
       `INSERT INTO request_log_details (
         request_log_id, created_at, updated_at, request_headers_json,
-        request_body_text, request_body_truncated, request_body_bytes,
-        forwarded_body_text, forwarded_body_truncated, forwarded_body_bytes,
-        upstream_status_code, upstream_headers_json, upstream_body_text,
-        upstream_body_truncated, upstream_body_bytes, error_name,
-        error_message, error_stack, error_cause_json, detail_json,
+        forwarded_headers_json, request_body_text, request_body_truncated,
+        request_body_bytes, forwarded_body_text, forwarded_body_truncated,
+        forwarded_body_bytes, upstream_status_code, upstream_headers_json,
+        upstream_body_text, upstream_body_truncated, upstream_body_bytes,
+        error_name, error_message, error_stack, error_cause_json, detail_json,
         stage_timings_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(request_log_id) DO UPDATE SET
         updated_at = excluded.updated_at,
         request_headers_json = COALESCE(excluded.request_headers_json, request_log_details.request_headers_json),
+        forwarded_headers_json = COALESCE(excluded.forwarded_headers_json, request_log_details.forwarded_headers_json),
         request_body_text = COALESCE(excluded.request_body_text, request_log_details.request_body_text),
         request_body_truncated = CASE WHEN excluded.request_body_text IS NULL THEN request_log_details.request_body_truncated ELSE excluded.request_body_truncated END,
         request_body_bytes = CASE WHEN excluded.request_body_text IS NULL THEN request_log_details.request_body_bytes ELSE excluded.request_body_bytes END,
@@ -187,6 +190,7 @@ export function appendRequestLogDetail(
       now,
       now,
       input.requestHeaders ? jsonStringify(input.requestHeaders) : null,
+      input.forwardedHeaders ? jsonStringify(input.forwardedHeaders) : null,
       input.requestBodyText ?? null,
       input.requestBodyTruncated ? 1 : 0,
       Math.max(0, Math.floor(input.requestBodyBytes || 0)),
@@ -436,6 +440,116 @@ export function getApiKeyDailyUsage(apiKeyId: string, day = new Date()) {
   return Number(row?.total_tokens || 0);
 }
 
+export function latestCredentialUpstreamHeaders(
+  credentialId: string,
+): Record<string, string> | null {
+  const id = credentialId.trim();
+  if (!id) {
+    return null;
+  }
+  const rows = getLogDb()
+    .prepare(
+      `SELECT request_log_details.upstream_headers_json AS upstream_headers_json
+       FROM request_logs INDEXED BY idx_request_logs_credential
+       INNER JOIN request_log_details
+         ON request_log_details.request_log_id = request_logs.id
+       WHERE request_logs.credential_id = ?
+         AND request_log_details.upstream_headers_json IS NOT NULL
+         AND request_log_details.upstream_headers_json LIKE '%anthropic-ratelimit-unified-%'
+       ORDER BY request_logs.started_at DESC
+       LIMIT 20`,
+    )
+    .all(id) as Array<Record<string, unknown>>;
+
+  for (const row of rows) {
+    const headers = parseJsonObject(row.upstream_headers_json);
+    if (headers && hasAnthropicUnifiedHeaders(headers)) {
+      return headers;
+    }
+  }
+  return null;
+}
+
+export function credentialUsageWindows(
+  credentialId: string,
+  now = new Date(),
+): CredentialUsageWindow[] {
+  const id = credentialId.trim();
+  if (!id) {
+    return [];
+  }
+
+  const todayStart = new Date(now);
+  todayStart.setHours(0, 0, 0, 0);
+  const until = now.toISOString();
+  return [
+    buildCredentialUsageWindow(id, "today", "今日", todayStart, until),
+    buildCredentialUsageWindow(
+      id,
+      "5h",
+      "近 5 小时",
+      new Date(now.getTime() - 5 * 60 * 60 * 1000),
+      until,
+    ),
+    buildCredentialUsageWindow(
+      id,
+      "7d",
+      "近 7 天",
+      new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000),
+      until,
+    ),
+  ];
+}
+
+function buildCredentialUsageWindow(
+  credentialId: string,
+  id: string,
+  label: string,
+  since: Date,
+  until: string,
+): CredentialUsageWindow {
+  const row = getLogDb()
+    .prepare(
+      `SELECT
+        COUNT(*) AS request_count,
+        SUM(CASE WHEN status_code >= 200 AND status_code < 400 THEN 1 ELSE 0 END) AS success_count,
+        SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS error_count,
+        SUM(stream) AS stream_count,
+        COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+        COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+        COALESCE(SUM(total_tokens), 0) AS total_tokens,
+        COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+        COALESCE(AVG(latency_ms), 0) AS avg_latency_ms,
+        MIN(started_at) AS first_request_at,
+        MAX(started_at) AS last_request_at
+      FROM request_logs INDEXED BY idx_request_logs_credential
+      WHERE credential_id = ? AND started_at >= ? AND started_at <= ?`,
+    )
+    .get(credentialId, since.toISOString(), until) as
+    | Record<string, unknown>
+    | undefined;
+  const promptTokens = numberValue(row?.prompt_tokens);
+  const cachedTokens = numberValue(row?.cached_tokens);
+  return {
+    id,
+    label,
+    since: since.toISOString(),
+    until,
+    requestCount: numberValue(row?.request_count),
+    successCount: numberValue(row?.success_count),
+    errorCount: numberValue(row?.error_count),
+    streamCount: numberValue(row?.stream_count),
+    promptTokens,
+    completionTokens: numberValue(row?.completion_tokens),
+    totalTokens: numberValue(row?.total_tokens),
+    cachedTokens,
+    cacheHitRate: cacheHitRate(cachedTokens, promptTokens),
+    avgLatencyMs: Math.round(numberValue(row?.avg_latency_ms)),
+    firstRequestAt: nullableString(row?.first_request_at),
+    lastRequestAt: nullableString(row?.last_request_at),
+  };
+}
+
 export interface PublicRequestLogRow {
   id: string;
   started_at: string;
@@ -466,6 +580,7 @@ export interface PublicRequestLogDetail {
   };
   detail: {
     request_headers: Record<string, string> | null;
+    forwarded_headers: Record<string, string> | null;
     request_body_text: string | null;
     request_body_truncated: boolean;
     request_body_bytes: number;
@@ -536,10 +651,11 @@ export function getRequestLogDetail(id: string): PublicRequestLogDetail | null {
   const detailRow = getLogDb()
     .prepare(
       `SELECT
-        created_at, updated_at, request_headers_json, request_body_text,
-        request_body_truncated, request_body_bytes, forwarded_body_text,
-        forwarded_body_truncated, forwarded_body_bytes, upstream_status_code,
-        upstream_headers_json, upstream_body_text, upstream_body_truncated,
+        created_at, updated_at, request_headers_json, forwarded_headers_json,
+        request_body_text, request_body_truncated, request_body_bytes,
+        forwarded_body_text, forwarded_body_truncated, forwarded_body_bytes,
+        upstream_status_code, upstream_headers_json, upstream_body_text,
+        upstream_body_truncated,
         upstream_body_bytes, error_name, error_message, error_stack,
         error_cause_json, detail_json, stage_timings_json
       FROM request_log_details
@@ -722,12 +838,22 @@ const CREDENTIAL_USAGE_WARNING_THRESHOLD = 50;
 
 export function credentialUsageHealth(
   credentialIds: string[],
-  windowSize = DEFAULT_CREDENTIAL_USAGE_WINDOW_SIZE,
+  options:
+    | number
+    | {
+        windowSize?: number;
+        resetSinceById?: Record<string, string | null | undefined>;
+      } = DEFAULT_CREDENTIAL_USAGE_WINDOW_SIZE,
 ): Record<string, CodexAccountUsageHealth> {
+  const windowSize =
+    typeof options === "number"
+      ? options
+      : (options.windowSize ?? DEFAULT_CREDENTIAL_USAGE_WINDOW_SIZE);
   return requestWindowUsageHealth(
     credentialIds,
     "credential_id",
     Math.max(1, Math.floor(windowSize)),
+    typeof options === "number" ? undefined : options.resetSinceById,
   );
 }
 
@@ -746,6 +872,7 @@ function requestWindowUsageHealth(
   ids: string[],
   columnName: "credential_id" | "channel_id",
   windowSize: number,
+  resetSinceById?: Record<string, string | null | undefined>,
 ): Record<string, CodexAccountUsageHealth> {
   const uniqueIds = [...new Set(ids.map((id) => id.trim()).filter(Boolean))];
   const healthById: Record<string, CodexAccountUsageHealth> = {};
@@ -764,15 +891,36 @@ function requestWindowUsageHealth(
      ORDER BY started_at DESC
      LIMIT ?`,
   );
+  const statementSince = getLogDb().prepare(
+    `SELECT ${columnName} AS target_id, started_at, status_code, error_code
+     FROM request_logs INDEXED BY ${requestLogWindowIndex(columnName)}
+     WHERE ${columnName} = ? AND started_at >= ?
+     ORDER BY started_at DESC
+     LIMIT ?`,
+  );
 
   for (const id of uniqueIds) {
-    const rows = statement.all(id, windowSize) as Array<
-      Record<string, unknown>
-    >;
+    const resetSince = nullableIsoString(resetSinceById?.[id]);
+    const rows = (
+      resetSince
+        ? statementSince.all(id, resetSince, windowSize)
+        : statement.all(id, windowSize)
+    ) as Array<Record<string, unknown>>;
     healthById[id] = calculateUsageHealth(rows, windowSize);
   }
 
   return healthById;
+}
+
+function nullableIsoString(value: unknown) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed || !Number.isFinite(Date.parse(trimmed))) {
+    return null;
+  }
+  return trimmed;
 }
 
 function requestLogWindowIndex(columnName: "credential_id" | "channel_id") {
@@ -1443,6 +1591,7 @@ function firstTokenLatencySelect(tableAlias: string) {
 function toPublicRequestLogDetailRow(row: Record<string, unknown>) {
   return {
     request_headers: parseJsonObject(row.request_headers_json),
+    forwarded_headers: parseJsonObject(row.forwarded_headers_json),
     request_body_text: nullableString(row.request_body_text),
     request_body_truncated: Boolean(row.request_body_truncated),
     request_body_bytes: numberValue(row.request_body_bytes),
@@ -1526,6 +1675,12 @@ function attachApiKeyNames(rows: Array<Record<string, unknown>>) {
 
 function nullableString(value: unknown) {
   return value === null || value === undefined ? null : String(value);
+}
+
+function hasAnthropicUnifiedHeaders(headers: Record<string, string>) {
+  return Object.keys(headers).some((name) =>
+    name.toLowerCase().startsWith("anthropic-ratelimit-unified-"),
+  );
 }
 
 function safeDetailJson(value: unknown) {
