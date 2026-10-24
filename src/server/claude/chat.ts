@@ -1,5 +1,7 @@
 import "server-only";
 
+import { applyClaudeThinkingEffort } from "@/src/server/claude/wire";
+
 import crypto from "node:crypto";
 import { serverConfig } from "@/src/server/config/env";
 import { parseClaudeModelSuffixes } from "@/src/server/claude/modelSuffix";
@@ -54,10 +56,14 @@ export function chatCompletionsToClaude(
     max_tokens:
       integerValue(payload.max_tokens) ||
       integerValue(payload.max_completion_tokens) ||
-      32000,
+      (model.includes("fable") ? 64000 : 32000),
     messages: [],
     stream: Boolean(input.stream),
   };
+
+  for (const key of ["metadata", "thinking", "output_config", "context_management", "speed", "betas", "prompt_cache_options", "fallbacks"]) {
+    if (payload[key] !== undefined) out[key] = structuredClone(payload[key]);
+  }
 
   if (payload.temperature !== undefined) {
     out.temperature = numberValue(payload.temperature);
@@ -69,10 +75,12 @@ export function chatCompletionsToClaude(
   }
   applyReasoningEffort(
     out,
-    payload.reasoning_effort ||
+    parsedModel.thinkingEffort || payload.reasoning_effort ||
       objectValue(payload.reasoning)?.effort ||
-      parsedModel.thinkingEffort,
+      "",
   );
+
+  if (parsedModel.hasContextSuffix) out.betas = ["context-1m-2025-08-07"];
 
   const messages = Array.isArray(payload.messages) ? payload.messages : [];
   for (const rawMessage of messages) {
@@ -136,6 +144,30 @@ export function chatCompletionsToClaude(
     }
   }
 
+  if (payload.parallel_tool_calls === false) {
+    const choice = objectValue(out.tool_choice);
+    if (choice && choice.type !== "none") choice.disable_parallel_tool_use = true;
+    else if (!choice && Array.isArray(out.tools) && out.tools.length > 0) {
+      out.tool_choice = { type: "auto", disable_parallel_tool_use: true };
+    }
+  }
+  const format = objectValue(payload.response_format);
+  if (format && ["json_object", "json_schema"].includes(stringValue(format.type))) {
+    const schema = objectValue(format.json_schema) || format;
+    const jsonOnly = "You must format your entire response as a valid JSON object. Do not include any explanations, markdown code blocks (such as ```json), or any text outside of the JSON object.";
+    const instruction = format.type === "json_schema" && schema.schema
+      ? "You must format your entire response as valid JSON that conforms strictly to the following JSON schema:\n"
+        + (schema.name ? `Schema Name: ${schema.name}\n` : "")
+        + (schema.description ? `Schema Description: ${schema.description}\n` : "")
+        + "JSON Schema:\n" + JSON.stringify(schema.schema)
+        + "\nDo not include any explanations, markdown code blocks (such as ```json), or any text outside of the JSON object."
+      : jsonOnly;
+    appendSystemContent(out, instruction);
+  }
+  if ((out.messages as unknown[]).length === 0 && out.system) {
+    out.messages = [{ role: "user", content: [{ type: "text", text: "" }] }];
+  }
+
   stripUndefinedDeep(out);
   const prepared = prepareClaudeOAuthToolNamesForUpstream(out);
   return {
@@ -168,7 +200,14 @@ export function responsesToClaude(
     reasoning_effort: payload.reasoning_effort,
     tools: responsesToolsToChatTools(payload.tools),
     tool_choice: responsesToolChoiceToChatToolChoice(payload.tool_choice),
+    parallel_tool_calls: payload.parallel_tool_calls,
+    response_format: objectValue(payload.text)?.format
+      ? { ...objectValue(objectValue(payload.text)?.format) }
+      : payload.response_format,
   };
+  for (const key of ["metadata", "thinking", "output_config", "context_management", "speed", "betas", "prompt_cache_options", "fallbacks"]) {
+    if (payload[key] !== undefined) chatPayload[key] = structuredClone(payload[key]);
+  }
   stripUndefinedDeep(chatPayload);
   return chatCompletionsToClaude(chatPayload, input);
 }
@@ -449,6 +488,12 @@ export function extractUsageFromClaudeSseText(text: string) {
     mergeClaudeUsage(usage, objectValue(event.message)?.usage);
     mergeClaudeUsage(usage, event.usage);
   }
+  return usage;
+}
+
+export function extractUsageFromClaudeMessage(value: unknown) {
+  const usage = emptyUsage();
+  mergeClaudeUsage(usage, objectValue(value)?.usage);
   return usage;
 }
 
@@ -1393,6 +1438,7 @@ function toolResultContent(content: unknown) {
 }
 
 function normalizeToolChoice(toolChoice: unknown) {
+  if (toolChoice === "required") return { type: "any" };
   if (toolChoice === "auto" || toolChoice === "none" || toolChoice === "any") {
     return { type: toolChoice === "any" ? "any" : toolChoice };
   }
@@ -1416,37 +1462,8 @@ function normalizeStopSequences(stop: unknown) {
   return value ? [value] : undefined;
 }
 
-function applyReasoningEffort(
-  out: Record<string, unknown>,
-  rawEffort: unknown,
-) {
-  const effort = stringValue(rawEffort).toLowerCase();
-  if (!effort) {
-    return;
-  }
-  if (effort === "none") {
-    out.thinking = { type: "disabled" };
-    return;
-  }
-  if (effort === "auto" || effort === "-1") {
-    out.thinking = { type: "adaptive" };
-    return;
-  }
-  const mapped =
-    effort === "minimal" || effort === "xhigh"
-      ? effort === "minimal"
-        ? "low"
-        : "high"
-      : effort;
-  if (["low", "medium", "high", "max"].includes(mapped)) {
-    out.thinking = { type: "adaptive" };
-    out.output_config = { effort: mapped };
-    return;
-  }
-  const budget = Number.parseInt(effort, 10);
-  if (Number.isFinite(budget) && budget > 0) {
-    out.thinking = { type: "enabled", budget_tokens: budget };
-  }
+function applyReasoningEffort(out: Record<string, unknown>, rawEffort: unknown) {
+  applyClaudeThinkingEffort(out, rawEffort);
 }
 
 function mapClaudeStopReason(reason: string) {

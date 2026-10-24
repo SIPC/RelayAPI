@@ -7,6 +7,11 @@ import {
   claudeModelAllowlistCandidates,
 } from "@/src/server/claude/modelSuffix";
 import { serverConfig } from "@/src/server/config/env";
+import {
+  CODEX_IMAGE_MODELS,
+  CODEX_IMAGE_MODEL_IDS,
+  isCodexImageModel,
+} from "@/src/server/codex/imageModels";
 
 const CREATED_2024_01_01 = 1704067200;
 const REMOTE_CATALOG_CACHE_MS = 3 * 60 * 60 * 1000;
@@ -39,7 +44,9 @@ const FALLBACK_MODEL_BY_ID = new Map(
     model("gpt-5.4-mini", "GPT 5.4 Mini", 1773705600),
     model("gpt-5.5", "GPT 5.5", 1776902400),
     model("codex-auto-review", "Codex Auto Review", 1776902400),
-    model("gpt-image-2", "GPT Image 2", CREATED_2024_01_01),
+    ...CODEX_IMAGE_MODELS.map(({ id, displayName, created }) =>
+      model(id, displayName, created),
+    ),
   ].map((entry) => [entry.id, entry]),
 );
 
@@ -83,7 +90,7 @@ const FALLBACK_PLAN_MODEL_IDS: Record<string, string[]> = {
     "gpt-5.4-mini",
     "gpt-5.5",
     "codex-auto-review",
-    "gpt-image-2",
+    ...CODEX_IMAGE_MODEL_IDS,
   ],
   team: [
     "gpt-5.2",
@@ -92,7 +99,7 @@ const FALLBACK_PLAN_MODEL_IDS: Record<string, string[]> = {
     "gpt-5.4-mini",
     "gpt-5.5",
     "codex-auto-review",
-    "gpt-image-2",
+    ...CODEX_IMAGE_MODEL_IDS,
   ],
   plus: [
     "gpt-5.2",
@@ -102,7 +109,7 @@ const FALLBACK_PLAN_MODEL_IDS: Record<string, string[]> = {
     "gpt-5.4-mini",
     "gpt-5.5",
     "codex-auto-review",
-    "gpt-image-2",
+    ...CODEX_IMAGE_MODEL_IDS,
   ],
   pro: [
     "gpt-5.2",
@@ -112,7 +119,7 @@ const FALLBACK_PLAN_MODEL_IDS: Record<string, string[]> = {
     "gpt-5.4-mini",
     "gpt-5.5",
     "codex-auto-review",
-    "gpt-image-2",
+    ...CODEX_IMAGE_MODEL_IDS,
   ],
 };
 
@@ -254,7 +261,7 @@ function getCodexModelsFromCatalog(
   }
   models = upsertById(
     models.map(normalizeModelEntry),
-    fallbackModelById("gpt-image-2"),
+    ...CODEX_IMAGE_MODEL_IDS.map(fallbackModelById),
   );
   if (
     options.includeDefault &&
@@ -363,7 +370,7 @@ function model(id: string, displayName: string, created: number): ModelEntry {
     context_length: 400000,
     max_completion_tokens: 128000,
     supported_parameters: ["tools"],
-    ...(id === "gpt-image-2"
+    ...(isCodexImageModel(id)
       ? {}
       : { thinking: { levels: ["low", "medium", "high", "xhigh"] } }),
   };
@@ -559,7 +566,7 @@ function supportsClaudeThinkingSuffix(entry: ModelEntry) {
 }
 
 function supportsThinkingSuffix(entry: ModelEntry) {
-  if (!entry.id || entry.id.includes("(") || entry.id === "gpt-image-2") {
+  if (!entry.id || entry.id.includes("(") || isCodexImageModel(entry.id)) {
     return false;
   }
   if (entry.thinking === false) {

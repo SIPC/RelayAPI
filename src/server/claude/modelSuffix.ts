@@ -10,7 +10,7 @@ export const CLAUDE_THINKING_SUFFIX_LEVELS = [
 ] as const;
 
 const CLAUDE_CONTEXT_SUFFIXES = new Set([CLAUDE_LONG_CONTEXT_SUFFIX]);
-const CLAUDE_THINKING_SUFFIXES = new Set<string>(CLAUDE_THINKING_SUFFIX_LEVELS);
+const CLAUDE_THINKING_SUFFIXES = new Set<string>([...CLAUDE_THINKING_SUFFIX_LEVELS, "none", "auto", "minimal", "xhigh"]);
 
 export interface ClaudeModelSuffixes {
   baseModel: string;
@@ -52,7 +52,7 @@ export function parseClaudeModelSuffixes(
       continue;
     }
 
-    if (CLAUDE_THINKING_SUFFIXES.has(suffix) && !thinkingEffort) {
+    if ((CLAUDE_THINKING_SUFFIXES.has(suffix) || /^-?\d+$/.test(suffix)) && !thinkingEffort) {
       thinkingEffort = suffix;
       hasSuffix = true;
       baseModel = nextBaseModel;

@@ -52,7 +52,7 @@ const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const OAUTH_SCOPE =
   "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 const OAUTH_STATE_TTL_MS = 15 * 60 * 1000;
-const DEFAULT_CLAUDE_USER_AGENT = "claude-cli/2.1.77 (external, cli)";
+const DEFAULT_CLAUDE_USER_AGENT = "claude-cli/2.1.280 (external, cli)";
 const TOKEN_REFRESH_ERROR_PREFIX = "Claude token 自动刷新失败";
 const TOKEN_REFRESH_METADATA_KEYS = [
   "token_refresh_attempt_count",
@@ -877,6 +877,7 @@ async function requestClaudeQuotaProbe(
       accessToken: credential.tokens.access_token,
       sourceHeaders,
       claudeUserAgent,
+      ...ensureClaudeRequestIdentity(credential),
     },
   );
 
@@ -927,6 +928,17 @@ async function requestClaudeQuotaProbe(
     body: responseBody,
     source: "probe",
   };
+}
+
+export function ensureClaudeRequestIdentity(credential: ClaudeCredentialWithTokens) {
+  const stored = credential.metadata.device_ids;
+  let deviceId = Array.isArray(stored) ? String(stored[0] || "") : String(credential.metadata.device_id || "");
+  if (!/^[a-f0-9]{64}$/i.test(deviceId)) {
+    deviceId = crypto.randomBytes(32).toString("hex");
+    credential.metadata = { ...credential.metadata, device_id: deviceId, device_ids: [deviceId] };
+    updateClaudeCredential(credential.id, { metadata: credential.metadata });
+  }
+  return { deviceId, accountId: String(credential.metadata.account_uuid || credential.accountId || "") };
 }
 
 function buildClaudeQuotaProbeHeaders(

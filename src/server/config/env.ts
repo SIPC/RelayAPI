@@ -91,7 +91,7 @@ function resolveGlobalProxy(): CredentialProxyConfig | null {
 }
 
 const DEFAULT_CODEX_USER_AGENT =
-  "codex_cli_rs/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9";
+  "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)";
 const codexUserAgentFromEnv = process.env.CODEX_USER_AGENT?.trim() || "";
 const codexUserAgentSource: "environment" | "default" = codexUserAgentFromEnv
   ? "environment"
@@ -128,7 +128,7 @@ export const serverConfig = {
   codexBaseUrl: (
     process.env.CODEX_BASE_URL || "https://chatgpt.com/backend-api/codex"
   ).replace(/\/+$/, ""),
-  codexDefaultModel: process.env.CODEX_DEFAULT_MODEL || "gpt-5.3-codex",
+  codexDefaultModel: process.env.CODEX_DEFAULT_MODEL || "gpt-6.1-sol",
   claudeRedirectUri:
     process.env.CLAUDE_REDIRECT_URI || "http://localhost:54545/callback",
   claudeBaseUrl: (
@@ -136,11 +136,11 @@ export const serverConfig = {
   ).replace(/\/+$/, ""),
   claudeDefaultModel: process.env.CLAUDE_DEFAULT_MODEL || "claude-sonnet-4-5",
   claudeUserAgent:
-    process.env.CLAUDE_USER_AGENT || "claude-cli/2.1.77 (external, cli)",
+    process.env.CLAUDE_USER_AGENT || "claude-cli/2.1.280 (external, cli)",
   claudeStainlessPackageVersion:
-    process.env.CLAUDE_STAINLESS_PACKAGE_VERSION || "0.87.0",
+    process.env.CLAUDE_STAINLESS_PACKAGE_VERSION || "0.112.1",
   claudeStainlessRuntimeVersion:
-    process.env.CLAUDE_STAINLESS_RUNTIME_VERSION || "v24.8.0",
+    process.env.CLAUDE_STAINLESS_RUNTIME_VERSION || "v26.3.0",
   claudeStainlessOs: process.env.CLAUDE_STAINLESS_OS || "MacOS",
   claudeStainlessArch: process.env.CLAUDE_STAINLESS_ARCH || "arm64",
   requestTimeoutMs: intEnv("REQUEST_TIMEOUT_MS", 300_000),
@@ -148,7 +148,7 @@ export const serverConfig = {
   globalProxy: resolveGlobalProxy(),
   userAgent: codexUserAgentFromEnv || DEFAULT_CODEX_USER_AGENT,
   userAgentSource: codexUserAgentSource,
-  codexOriginator: process.env.CODEX_ORIGINATOR || "codex_cli_rs",
+  codexOriginator: process.env.CODEX_ORIGINATOR || "codex-tui",
   autoImportLegacyCredentials:
     process.env.RELAY_IMPORT_LEGACY_CREDENTIALS === "1",
   legacyCredentialDirs: [

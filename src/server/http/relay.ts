@@ -1,8 +1,12 @@
 import "server-only";
 
+import { createClaudeNativeSseStream } from "@/src/server/claude/nativeStream";
+import { claudePolicy } from "@/src/server/claude/wire";
+import { extractUsageFromClaudeMessage } from "@/src/server/claude/chat";
+
 import { createModelsResponse } from "@/src/server/codex/models";
 import {
-  buildImagesApiResponseFromSseText,
+  buildImagesApiResponseFromJsonText,
   buildImagesEditsJsonRequest,
   buildImagesEditsMultipartRequest,
   buildImagesGenerationsRequest,
@@ -165,7 +169,7 @@ export async function handleOpenAIResponses(request: Request) {
         input,
       });
     }
-    const stream = input.stream !== false;
+    const stream = Boolean(input.stream);
     const payload = timing.time("normalize_payload", "规范化请求 Payload", () =>
       normalizeResponsesPayload(input!, { stream: true }),
     );
@@ -390,12 +394,12 @@ async function handleImagesProxy(
       });
     }
 
-    const result = await codexJson("/responses", imageRequest.payload, {
-      stream: true,
+    const result = await codexJson(imageRequest.upstreamPath, imageRequest.payload, {
+      stream: false,
       sourceHeaders: request.headers,
       channel,
       promptCacheKey: null,
-      transport: "websocket",
+      transport: "http",
       timing,
     });
     if (!result.response.ok) {
@@ -430,9 +434,10 @@ async function handleImagesProxy(
     let responsePayload: Record<string, unknown>;
     try {
       responsePayload = timing.time("transform_response", "转换图片响应", () =>
-        buildImagesApiResponseFromSseText(
+        buildImagesApiResponseFromJsonText(
           result.text,
           imageRequest!.responseFormat,
+          imageRequest!.model,
         ),
       );
     } catch (error) {
@@ -521,12 +526,12 @@ async function forwardImagesStream(input: {
   timing?: StageTimer;
 }) {
   const { response, credential, upstreamPayload, upstreamRequestHeaders } =
-    await codexFetch("/responses", input.imageRequest.payload, {
+    await codexFetch(input.imageRequest.upstreamPath, input.imageRequest.payload, {
       stream: true,
       sourceHeaders: input.request.headers,
       channel: input.channel,
       promptCacheKey: null,
-      transport: "websocket",
+      transport: "http",
       timing: input.timing,
     });
   const headers = withStreamingHeaders(
@@ -571,10 +576,13 @@ async function forwardImagesStream(input: {
     return upstreamErrorResponse(response.status);
   }
 
+  if (!response.body) {
+    throw new HttpError(502, "image_generation_incomplete", "Upstream returned no image stream");
+  }
+  headers.set("Content-Type", "text/event-stream; charset=utf-8");
   const fullLog = getFullRequestLoggingSetting();
   const upstreamCapture = createTextCapture();
-  const body = response.body
-    ? createImagesSseStream(
+  const body = createImagesSseStream(
         tapStream(
           response.body,
           fullLog ? upstreamCapture : null,
@@ -583,6 +591,7 @@ async function forwardImagesStream(input: {
         {
           responseFormat: input.imageRequest.responseFormat,
           streamPrefix: input.imageRequest.streamPrefix,
+          requestedModel: input.imageRequest.model,
           onFirstEvent: () => {
             input.timing?.mark("stream_first_token", "收到图片流首个事件");
           },
@@ -639,8 +648,7 @@ async function forwardImagesStream(input: {
             });
           },
         },
-      )
-    : null;
+      );
   return new Response(body, { status: response.status, headers });
 }
 
@@ -687,7 +695,7 @@ export async function handleChatCompletions(request: Request) {
           sourceHeaders: request.headers,
           channel,
           promptCacheKey: codexPromptCacheKeyForApiKey(apiKey),
-          transport: "websocket",
+          transport: "http",
           timing,
         });
       if (!response.ok) {
@@ -1116,7 +1124,7 @@ async function handleClaudeResponsesWithContext(input: {
   apiKey: RelayApiKeyContext;
   input: Record<string, unknown>;
 }) {
-  const stream = input.input.stream !== false;
+  const stream = Boolean(input.input.stream);
   const conversion = input.timing.time(
     "normalize_payload",
     "Responses 转换为 Claude Payload",
@@ -1479,7 +1487,7 @@ async function forwardCodexStream(input: {
       sourceHeaders: input.request.headers,
       channel: input.channel,
       promptCacheKey: input.promptCacheKey,
-      transport: input.upstreamPath === "/responses" ? "websocket" : "http",
+      transport: "http",
       timing: input.timing,
     });
   const headers = withStreamingHeaders(
@@ -2075,6 +2083,92 @@ function withStreamingHeaders(headers: Headers) {
   headers.set("Connection", "keep-alive");
   headers.set("X-Accel-Buffering", "no");
   return headers;
+}
+
+export async function handleClaudeMessages(request: Request) {
+  return handleClaudeNativeRequest(request, false);
+}
+export async function handleClaudeCountTokens(request: Request) {
+  return handleClaudeNativeRequest(request, true);
+}
+async function handleClaudeNativeRequest(request: Request, countTokens: boolean) {
+  const startedAt = new Date().toISOString();
+  const start = Date.now();
+  const timing = createStageTimer();
+  const requestType = countTokens ? "claude.messages.count_tokens" : "claude.messages";
+  let apiKey: RelayApiKeyContext | null = null;
+  let channel: ChannelRecord | null = null;
+  let payload: Record<string, unknown> | undefined;
+  try {
+    apiKey = authenticateRelayRequest(request);
+    payload = await readJsonObject(request);
+    const model = stringValue(payload.model);
+    if (!isClaudeModel(model)) throw new HttpError(400, "unsupported_claude_model", "A Claude model is required");
+    if (!Array.isArray(payload.messages) || payload.messages.length === 0) {
+      throw new HttpError(400, "invalid_messages", "messages must be a non-empty array");
+    }
+    const selected = selectChannel({ provider: "claude", model, apiKey });
+    channel = selected.channel;
+    const stream = !countTokens && payload.stream === true;
+    const forwarded = structuredClone(payload);
+    if (!countTokens && !forwarded.max_tokens) forwarded.max_tokens = claudePolicy(model)?.max_completion_tokens || 32000;
+    const result = await claudeFetch(forwarded, {
+      stream, sourceHeaders: request.headers, credentialId: channel.credentialId,
+      baseUrl: channel.baseUrl, upstreamPath: countTokens ? "/v1/messages/count_tokens" : "/v1/messages", timing,
+    });
+    const context = {
+      request, startedAt, start, apiKey, channel, requestType, model, stream,
+      credentialEmail: result.credential.email, requestBody: payload,
+      forwardedBody: result.upstreamPayload, forwardedHeaders: result.upstreamRequestHeaders,
+      upstreamHeaders: result.response.headers, timing,
+    };
+    if (!result.response.ok) {
+      const body = await result.response.text();
+      recordChannelFailure(channel, { statusCode: result.response.status, message: body.slice(0, 500) });
+      appendSuccessLog({ ...context, statusCode: result.response.status, usage: emptyUsage(),
+        errorCode: "upstream_error", errorMessage: body.slice(0, 500), upstreamBody: body });
+      let errorPayload;
+      try { errorPayload = JSON.parse(body); } catch { errorPayload = { type: "error", error: { type: "api_error", message: "Upstream request failed" } }; }
+      return Response.json(errorPayload, { status: result.response.status });
+    }
+    if (!stream) {
+      const body = await result.response.text();
+      let parsed;
+      try { parsed = JSON.parse(body); } catch { throw new HttpError(502, "invalid_claude_response", "Upstream returned invalid Claude JSON"); }
+      recordChannelSuccess(channel);
+      appendSuccessLog({ ...context, statusCode: result.response.status,
+        usage: countTokens ? emptyUsage() : extractUsageFromClaudeMessage(parsed), upstreamBody: body });
+      return Response.json(parsed, { status: result.response.status, headers: copyClaudeUpstreamHeaders(result.response.headers) });
+    }
+    if (!result.response.body) throw new HttpError(502, "claude_stream_incomplete", "Upstream returned no Claude stream");
+    const capture = createTextCapture();
+    const body = createClaudeNativeSseStream(tapStream(result.response.body,
+      getFullRequestLoggingSetting() ? capture : null, timing), {
+      onCompleted(usage) {
+        recordChannelSuccess(channel!);
+        appendSuccessLog({ ...context, statusCode: 200, usage, upstreamBody: capture.text });
+      },
+      onError(error) {
+        const message = error instanceof Error ? error.message : String(error);
+        recordChannelFailure(channel!, { statusCode: 502, message });
+        appendSuccessLog({ ...context, statusCode: 502, usage: emptyUsage(), errorCode: "stream_error",
+          errorMessage: message, upstreamBody: capture.text, error });
+      },
+    });
+    const headers = withStreamingHeaders(copyClaudeUpstreamHeaders(result.response.headers));
+    headers.set("Content-Type", "text/event-stream; charset=utf-8");
+    return new Response(body, { status: result.response.status, headers });
+  } catch (error) {
+    appendErrorLog(request, startedAt, start, requestType, error, apiKey, channel, payload, timing);
+    const status = error instanceof HttpError ? error.status : 500;
+    if (channel && status >= 500) recordChannelFailure(channel, {
+      statusCode: status, message: error instanceof Error ? error.message : "Claude request failed",
+    });
+    return Response.json({ type: "error", error: {
+      type: status === 401 ? "authentication_error" : status === 403 ? "permission_error" : status < 500 ? "invalid_request_error" : "api_error",
+      message: error instanceof HttpError ? error.message : "Internal Server Error",
+    } }, { status });
+  }
 }
 
 function isFreeCodexPlan(planType: string) {

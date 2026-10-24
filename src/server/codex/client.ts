@@ -56,6 +56,12 @@ const CODEX_IMAGE_GENERATION_TOOL = {
   output_format: "png",
 };
 
+type CodexUpstreamPath =
+  | "/responses"
+  | "/responses/compact"
+  | "/images/generations"
+  | "/images/edits";
+
 export interface ToolNameMaps {
   originalToShort: Map<string, string>;
   shortToOriginal: Map<string, string>;
@@ -82,7 +88,7 @@ function resolveCodexPromptCacheKey(
 }
 
 export async function codexFetch(
-  upstreamPath: "/responses" | "/responses/compact",
+  upstreamPath: CodexUpstreamPath,
   payload: Record<string, unknown>,
   input: {
     stream: boolean;
@@ -102,29 +108,27 @@ export async function codexFetch(
   if (!credential.tokens.access_token) {
     throw new Error("Saved Codex credential does not contain access_token");
   }
-  const promptCacheKey = resolveCodexPromptCacheKey(
+  const directImages = upstreamPath === "/images/generations" || upstreamPath === "/images/edits";
+  const promptCacheKey = directImages ? "" : resolveCodexPromptCacheKey(
     payload,
-    input.promptCacheKey,
+    input.sourceHeaders.get("session_id") || input.sourceHeaders.get("session-id") || input.promptCacheKey,
   );
   const useWebSocket =
     input.transport === "websocket" &&
     credential.upstreamTransport === "websocket" &&
     upstreamPath === "/responses";
-  const upstreamPayload =
-    input.timing?.time("prepare_upstream_payload", "构造上游 Payload", () =>
-      prepareCodexPayloadForUpstream(payload, {
+  const preparePayload = () => directImages
+    ? structuredClone(payload)
+    : prepareCodexPayloadForUpstream(payload, {
         fastServiceTier: shouldUsePriorityServiceTier(credential),
         promptCacheKey,
         planType: credential.planType,
         transport: useWebSocket ? "websocket" : "http",
-      }),
-    ) ??
-    prepareCodexPayloadForUpstream(payload, {
-      fastServiceTier: shouldUsePriorityServiceTier(credential),
-      promptCacheKey,
-      planType: credential.planType,
-      transport: useWebSocket ? "websocket" : "http",
-    });
+        responsesLite: input.sourceHeaders.get("x-openai-internal-codex-responses-lite") === "true",
+      });
+  const upstreamPayload = input.timing
+    ? input.timing.time("prepare_upstream_payload", "构造上游 Payload", preparePayload)
+    : preparePayload();
   const proxy = resolveCredentialProxy({
     proxy: credential.proxy,
     proxyPoolId: credential.proxyPoolId,
@@ -136,6 +140,10 @@ export async function codexFetch(
     sourceHeaders: input.sourceHeaders,
     promptCacheKey,
   });
+  if (!directImages && upstreamPath === "/responses") {
+    const tier = stringValue(upstreamPayload.service_tier);
+    headers["X-Codex-Routing-Hint"] = `model=${upstreamPayload.model}${tier ? `;tier=${tier}` : ""}`;
+  }
   if (useWebSocket) {
     const response = await codexWebSocketResponse({
       httpUrl: url,
@@ -230,7 +238,7 @@ export async function codexFetch(
 }
 
 export async function codexJson(
-  upstreamPath: "/responses" | "/responses/compact",
+  upstreamPath: CodexUpstreamPath,
   payload: Record<string, unknown>,
   input: {
     stream: boolean;
@@ -260,7 +268,7 @@ export async function codexJson(
 }
 
 export function toCodexUrl(baseUrl: string, upstreamPath: string) {
-  if (upstreamPath !== "/responses" && upstreamPath !== "/responses/compact") {
+  if (!["/responses", "/responses/compact", "/images/generations", "/images/edits"].includes(upstreamPath)) {
     throw new Error(`Unsupported Codex upstream path: ${upstreamPath}`);
   }
   return `${baseUrl.replace(/\/+$/, "")}${upstreamPath}`;
@@ -287,6 +295,9 @@ function buildCodexHeaders(
     "x-codex-turn-metadata",
     "x-codex-turn-state",
     "x-client-request-id",
+    "x-codex-window-id",
+    "thread-id",
+    "x-openai-internal-codex-responses-lite",
     "x-codex-beta-features",
     "x-responsesapi-include-timing-metrics",
   ]) {
@@ -305,12 +316,7 @@ function buildCodexHeaders(
     input.sourceHeaders.get("session-id") ||
     "";
   if (sessionId) {
-    headers.Session_id = sessionId;
-  } else if (headers["User-Agent"].includes("Mac OS")) {
-    headers.Session_id = crypto.randomUUID();
-  }
-  if (promptCacheKey) {
-    headers.Conversation_id = promptCacheKey;
+    headers["Session-Id"] = sessionId;
   }
   return headers;
 }
@@ -331,6 +337,7 @@ export function prepareCodexPayloadForUpstream(
     promptCacheKey?: string | null;
     planType?: string | null;
     transport?: "http" | "websocket";
+    responsesLite?: boolean;
   } = {},
 ): Record<string, unknown> {
   if (!isRecord(payload)) {
@@ -344,13 +351,8 @@ export function prepareCodexPayloadForUpstream(
   if (promptCacheKey) {
     upstreamPayload.prompt_cache_key = promptCacheKey;
   }
-  if (
-    upstreamPayload.service_tier &&
-    upstreamPayload.service_tier !== "priority"
-  ) {
-    delete upstreamPayload.service_tier;
-  }
-  if (options.fastServiceTier) {
+  normalizeCodexServiceTier(upstreamPayload);
+  if (options.fastServiceTier && !upstreamPayload.service_tier) {
     upstreamPayload.service_tier = "priority";
   }
   applyModelThinkingSuffix(upstreamPayload);
@@ -358,9 +360,11 @@ export function prepareCodexPayloadForUpstream(
     preservePreviousResponseId: options.transport === "websocket",
   });
   normalizeCodexBuiltinTools(upstreamPayload);
-  ensureImageGenerationTool(upstreamPayload, {
-    planType: options.planType,
-  });
+  if (options.responsesLite) upstreamPayload.parallel_tool_calls = false;
+  else ensureImageGenerationTool(upstreamPayload, { planType: options.planType });
+  if (!options.responsesLite && (!Array.isArray(upstreamPayload.tools) || upstreamPayload.tools.length === 0)) {
+    delete upstreamPayload.parallel_tool_calls;
+  }
   return upstreamPayload;
 }
 
@@ -473,8 +477,8 @@ export function normalizeResponsesPayload(
   payload.instructions = payload.instructions ?? "";
   payload.stream = Boolean(input.stream);
   payload.store = false;
-  payload.parallel_tool_calls = true;
-  payload.include = [...CODEX_REASONING_INCLUDE];
+  payload.parallel_tool_calls = payload.parallel_tool_calls !== false;
+  payload.include = codexRequiredInclude(payload.include);
 
   if (typeof payload.input === "string") {
     payload.input = [textMessage("user", payload.input, false)];
@@ -482,7 +486,7 @@ export function normalizeResponsesPayload(
 
   if (Array.isArray(payload.input)) {
     payload.input = payload.input.map((item) => {
-      if (isRecord(item) && item.type === "message" && item.role === "system") {
+      if (isRecord(item) && item.role === "system") {
         return { ...item, role: "developer" };
       }
       return item;
@@ -505,8 +509,8 @@ export function normalizeCompactPayload(inputPayload: unknown) {
 export function normalizeRawCodexResponsesPayload(inputPayload: unknown) {
   const payload = cloneJsonObject(inputPayload);
   payload.store = false;
-  payload.parallel_tool_calls = true;
-  payload.include = [...CODEX_REASONING_INCLUDE];
+  payload.parallel_tool_calls = payload.parallel_tool_calls !== false;
+  payload.include = codexRequiredInclude(payload.include);
   normalizeRawCodexPayloadForUpstream(payload);
   return payload;
 }
@@ -574,18 +578,30 @@ export function chatCompletionsToCodex(
   }
 
   if (payload.reasoning_effort) {
-    out.reasoning = { effort: payload.reasoning_effort, summary: "auto" };
+    out.reasoning = { effort: payload.reasoning_effort };
   } else if (isRecord(payload.reasoning)) {
     out.reasoning = {
       ...cloneJsonObject(payload.reasoning),
       effort: payload.reasoning.effort ?? "medium",
-      summary: payload.reasoning.summary ?? "auto",
     };
   } else {
-    out.reasoning = { effort: "medium", summary: "auto" };
+    out.reasoning = { effort: "medium" };
   }
-  out.parallel_tool_calls = true;
+  const reasoning = out.reasoning as Record<string, unknown>;
+  const explicitSummary = isRecord(payload.reasoning) ? payload.reasoning.summary : undefined;
+  if (typeof explicitSummary === "string" && explicitSummary !== "none") {
+    reasoning.summary = explicitSummary;
+  } else if (explicitSummary === undefined && (payload.include_reasoning === true || (payload.reasoning_effort && payload.reasoning_effort !== "none"))) {
+    reasoning.summary = "auto";
+  }
+  if (payload.include_reasoning === false || explicitSummary === null || explicitSummary === "none") {
+    delete reasoning.summary;
+  }
+  out.parallel_tool_calls = payload.parallel_tool_calls !== false;
   out.include = [...CODEX_REASONING_INCLUDE];
+  if (payload.prompt_cache_key) out.prompt_cache_key = payload.prompt_cache_key;
+  if (payload.service_tier) out.service_tier = payload.service_tier;
+  normalizeCodexServiceTier(out);
 
   if (Array.isArray(payload.tools) && payload.tools.length > 0) {
     out.tools = payload.tools.map((rawTool) => {
@@ -1158,6 +1174,7 @@ function normalizeRawCodexPayloadForUpstream(
   delete payload.context_management;
   delete payload.truncation;
   delete payload.prompt_cache_retention;
+  delete payload.prompt_cache_options;
   delete payload.safety_identifier;
 
   normalizeReasoningForCodex(payload);
@@ -1179,11 +1196,23 @@ function stripUnsupportedCodexFields(
   delete payload.context_management;
   delete payload.truncation;
   delete payload.prompt_cache_retention;
+  delete payload.prompt_cache_options;
   delete payload.safety_identifier;
   normalizeReasoningForCodex(payload);
-  if (payload.service_tier && payload.service_tier !== "priority") {
-    delete payload.service_tier;
-  }
+  normalizeCodexServiceTier(payload);
+}
+
+function normalizeCodexServiceTier(payload: Record<string, unknown>) {
+  const tier = stringValue(payload.service_tier).trim().toLowerCase();
+  if (tier === "priority" || tier === "fast") payload.service_tier = "priority";
+  else if (tier === "ultrafast") payload.service_tier = "ultrafast";
+  else delete payload.service_tier;
+}
+
+function codexRequiredInclude(value: unknown) {
+  return Array.isArray(value) && value.includes("web_search_call.action.sources")
+    ? [...CODEX_REASONING_INCLUDE, "web_search_call.action.sources"]
+    : [...CODEX_REASONING_INCLUDE];
 }
 
 function normalizeReasoningForCodex(payload: Record<string, unknown>) {

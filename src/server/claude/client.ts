@@ -1,11 +1,13 @@
 import "server-only";
 
 import crypto from "node:crypto";
+import { claudeBetas, isNativeClaudeCodeRequest } from "@/src/server/claude/wire";
 import { prepareClaudeOAuthUpstreamPayload } from "@/src/server/claude/compat";
 import { serverConfig } from "@/src/server/config/env";
 import { proxiedFetch } from "@/src/server/net/proxy";
 import {
   ensureFreshClaudeCredential,
+  ensureClaudeRequestIdentity,
   getEffectiveClaudeUserAgent,
   resolveClaudeCredentialProxy,
 } from "@/src/server/services/claudeCredentials";
@@ -32,18 +34,6 @@ const SENSITIVE_UPSTREAM_RESPONSE_HEADERS = new Set([
   "x-api-key",
 ]);
 
-const CLAUDE_BETA = [
-  "claude-code-20250219",
-  "oauth-2025-04-20",
-  "interleaved-thinking-2025-05-14",
-  "context-management-2025-06-27",
-  "prompt-caching-scope-2026-01-05",
-  "structured-outputs-2025-12-15",
-  "fast-mode-2026-02-01",
-  "redact-thinking-2026-02-12",
-  "token-efficient-tools-2026-03-28",
-].join(",");
-
 export async function claudeFetch(
   payload: Record<string, unknown>,
   input: {
@@ -51,6 +41,7 @@ export async function claudeFetch(
     sourceHeaders: Headers;
     credentialId: string;
     baseUrl?: string;
+    upstreamPath?: "/v1/messages" | "/v1/messages/count_tokens";
     timing?: StageTimer;
   },
 ) {
@@ -66,11 +57,14 @@ export async function claudeFetch(
   const claudeUserAgent = resolveClaudeUpstreamUserAgent(
     input.sourceHeaders,
     getEffectiveClaudeUserAgent(credential),
+    isNativeClaudeCodeRequest(input.sourceHeaders, payload, input.upstreamPath === "/v1/messages/count_tokens"),
   );
   const prepared = prepareClaudeOAuthUpstreamPayload(cloneJsonObject(payload), {
     accessToken: credential.tokens.access_token,
     sourceHeaders: input.sourceHeaders,
     claudeUserAgent,
+    ...ensureClaudeRequestIdentity(credential),
+    countTokens: input.upstreamPath === "/v1/messages/count_tokens",
   });
   const upstreamPayload = prepared.payload;
   const proxy = resolveClaudeCredentialProxy({
@@ -78,12 +72,16 @@ export async function claudeFetch(
     proxyPoolId: credential.proxyPoolId,
     useGlobalProxy: credential.useGlobalProxy,
   });
-  const url = `${normalizeClaudeBaseUrl(input.baseUrl)}/v1/messages?beta=true`;
+  const url = `${normalizeClaudeBaseUrl(input.baseUrl)}${input.upstreamPath || "/v1/messages"}?beta=true`;
   const headers = buildClaudeHeaders(credential, {
     stream: input.stream,
     sourceHeaders: input.sourceHeaders,
     claudeUserAgent,
     extraBetas: prepared.extraBetas,
+    native: prepared.native,
+    sessionId: prepared.sessionId,
+    payload: upstreamPayload,
+    countTokens: input.upstreamPath === "/v1/messages/count_tokens",
   });
   const response =
     (await input.timing?.timeAsync("upstream_fetch", "Claude 上游 Fetch", () =>
@@ -131,6 +129,7 @@ export async function claudeJson(
     sourceHeaders: Headers;
     credentialId: string;
     baseUrl?: string;
+    upstreamPath?: "/v1/messages" | "/v1/messages/count_tokens";
     timing?: StageTimer;
   },
 ) {
@@ -177,75 +176,81 @@ function buildClaudeHeaders(
     sourceHeaders: Headers;
     claudeUserAgent: string;
     extraBetas: string[];
+    native: boolean;
+    sessionId: string;
+    payload: Record<string, unknown>;
+    countTokens: boolean;
   },
 ) {
-  const beta = mergeClaudeBeta(
-    input.sourceHeaders.get("anthropic-beta"),
-    input.extraBetas,
-  );
+  const beta = input.countTokens
+    ? "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,token-counting-2024-11-01"
+    : claudeBetas(input.payload, input.sourceHeaders.get("anthropic-beta"), input.extraBetas, input.native);
+  const profileHeaders = input.native ? input.sourceHeaders : new Headers();
   const headers: Record<string, string> = {
     Authorization: `Bearer ${credential.tokens.access_token}`,
     "Content-Type": "application/json",
     Connection: "keep-alive",
     Accept: input.stream ? "text/event-stream" : "application/json",
-    "Accept-Encoding": input.stream ? "identity" : "gzip, deflate, br, zstd",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Anthropic-Dangerous-Direct-Browser-Access": "true",
     "Anthropic-Version":
-      input.sourceHeaders.get("anthropic-version") || "2023-06-01",
+      input.native ? input.sourceHeaders.get("anthropic-version") || "2023-06-01" : "2023-06-01",
     "Anthropic-Beta": beta,
     "X-App": "cli",
     "X-Stainless-Retry-Count": "0",
     "X-Stainless-Runtime": "node",
     "X-Stainless-Lang": "js",
     "X-Stainless-Timeout": sourceOrDefault(
-      input.sourceHeaders,
+      profileHeaders,
       "x-stainless-timeout",
       "600",
     ),
-    "X-Claude-Code-Session-Id": deterministicUuid(
-      `relayapi:claude:${credential.id}`,
-    ),
-    "x-client-request-id": crypto.randomUUID(),
-    "User-Agent": sourceClaudeCliUserAgent(
-      input.sourceHeaders,
-      input.claudeUserAgent,
-    ),
+    "X-Claude-Code-Session-Id": input.sessionId,
+    "x-client-request-id": input.native ? input.sourceHeaders.get("x-client-request-id") || crypto.randomUUID() : crypto.randomUUID(),
+    "User-Agent": input.claudeUserAgent,
     "X-Stainless-Package-Version": sourceOrDefault(
-      input.sourceHeaders,
+      profileHeaders,
       "x-stainless-package-version",
       serverConfig.claudeStainlessPackageVersion,
     ),
     "X-Stainless-Runtime-Version": sourceOrDefault(
-      input.sourceHeaders,
+      profileHeaders,
       "x-stainless-runtime-version",
       serverConfig.claudeStainlessRuntimeVersion,
     ),
     "X-Stainless-Os": sourceOrDefault(
-      input.sourceHeaders,
+      profileHeaders,
       "x-stainless-os",
       serverConfig.claudeStainlessOs,
     ),
     "X-Stainless-Arch": sourceOrDefault(
-      input.sourceHeaders,
+      profileHeaders,
       "x-stainless-arch",
       serverConfig.claudeStainlessArch,
     ),
   };
+  if (input.countTokens) delete headers["X-Stainless-Timeout"];
+  if (input.native) {
+    for (const name of ["x-stainless-async", "x-claude-code-agent-id", "x-claude-code-parent-agent-id",
+      "x-claude-remote-container-id", "x-claude-remote-session-id", "x-client-app", "x-anthropic-additional-protection",
+      "x-claude-code-request-class", "x-claude-code-agent-type", "x-claude-code-compaction", "x-claude-code-context-compacted"]) {
+      const value = input.sourceHeaders.get(name);
+      if (value) headers[name] = value;
+    }
+  }
   return headers;
 }
 
 function resolveClaudeUpstreamUserAgent(
   sourceHeaders: Headers,
   fallback: string,
+  native: boolean,
 ) {
   const userAgent = sourceHeaders.get("user-agent")?.trim() || "";
-  if (userAgent.startsWith("claude-cli/")) {
+  if (native) {
     return userAgent;
   }
   return fallback;
-}
-
-function sourceClaudeCliUserAgent(sourceHeaders: Headers, fallback: string) {
-  return resolveClaudeUpstreamUserAgent(sourceHeaders, fallback);
 }
 
 function sourceOrDefault(
@@ -263,38 +268,8 @@ function sourceOrDefault(
   return fallback;
 }
 
-function mergeClaudeBeta(sourceValue: string | null, extraBetas: string[]) {
-  const values = new Set(
-    (sourceValue || CLAUDE_BETA)
-      .split(",")
-      .map((item) => item.trim())
-      .filter(Boolean),
-  );
-  for (const beta of extraBetas) {
-    values.add(beta);
-  }
-  for (const required of [
-    "oauth-2025-04-20",
-    "interleaved-thinking-2025-05-14",
-  ]) {
-    values.add(required);
-  }
-  return [...values].join(",");
-}
-
 function normalizeClaudeBaseUrl(value: string | undefined) {
   return (value || serverConfig.claudeBaseUrl).replace(/\/+$/, "");
-}
-
-function deterministicUuid(seed: string) {
-  const hash = crypto.createHash("sha1").update(seed).digest();
-  hash[6] = (hash[6] & 0x0f) | 0x50;
-  hash[8] = (hash[8] & 0x3f) | 0x80;
-  const hex = hash.subarray(0, 16).toString("hex");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(
-    12,
-    16,
-  )}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
 function cloneJsonObject(value: unknown) {

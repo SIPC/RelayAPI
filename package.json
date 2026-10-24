@@ -10,7 +10,10 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:images": "node --test tests/codex-images*.test.mjs",
+    "test:chat": "node --test tests/chat-*.test.mjs",
+    "test": "node --test tests/*.test.mjs"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
