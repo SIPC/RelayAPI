@@ -1,5 +1,7 @@
 import "server-only";
 
+import { withAccountQuotaHeaders } from "@/src/server/http/accountQuota";
+
 import crypto from "node:crypto";
 import { serverConfig } from "@/src/server/config/env";
 import { parseCodexSseFrames } from "@/src/server/codex/sse";
@@ -185,14 +187,14 @@ export async function codexFetch(
           proxy,
         ));
       return {
-        response: fallbackResponse,
+        response: withAccountQuotaHeaders(fallbackResponse, "codex", credential.id),
         credential,
         upstreamPayload,
         upstreamRequestHeaders: headers,
       };
     }
     return {
-      response,
+      response: withAccountQuotaHeaders(response, "codex", credential.id),
       credential,
       upstreamPayload,
       upstreamRequestHeaders: headers,
@@ -230,7 +232,7 @@ export async function codexFetch(
       proxy,
     ));
   return {
-    response,
+    response: withAccountQuotaHeaders(response, "codex", credential.id),
     credential,
     upstreamPayload,
     upstreamRequestHeaders: headers,

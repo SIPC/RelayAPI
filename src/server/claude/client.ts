@@ -1,5 +1,7 @@
 import "server-only";
 
+import { withAccountQuotaHeaders } from "@/src/server/http/accountQuota";
+
 import crypto from "node:crypto";
 import { claudeBetas, isNativeClaudeCodeRequest } from "@/src/server/claude/wire";
 import { prepareClaudeOAuthUpstreamPayload } from "@/src/server/claude/compat";
@@ -115,7 +117,7 @@ export async function claudeFetch(
       proxy,
     ));
   return {
-    response,
+    response: withAccountQuotaHeaders(response, "claude", credential.id),
     credential,
     upstreamPayload,
     upstreamRequestHeaders: headers,

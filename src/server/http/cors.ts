@@ -1,5 +1,7 @@
 import "server-only";
 
+import { isAccountQuotaHeader } from "@/src/server/http/accountQuota";
+
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -26,6 +28,10 @@ export function addCorsHeaders(response: Response) {
   for (const [name, value] of Object.entries(CORS_HEADERS)) {
     headers.set(name, value);
   }
+  const exposed = new Set((headers.get("Access-Control-Expose-Headers") || "")
+    .split(",").map((name) => name.trim()).filter(Boolean));
+  for (const name of headers.keys()) if (isAccountQuotaHeader(name)) exposed.add(name);
+  if (exposed.size) headers.set("Access-Control-Expose-Headers", [...exposed].join(", "));
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,

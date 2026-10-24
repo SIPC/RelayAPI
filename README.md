@@ -39,6 +39,25 @@ RelayAPI 是一个基于 Next.js App Router 的分层中继服务，用于管理
 
 回归验证使用临时数据库、合成凭据和本机模拟上游：`pnpm test`。实际账号可用性需要部署后验证。
 
+### 对话响应中的账号额度
+
+以上对话接口在 JSON 和 SSE 响应头中返回本次所选上游账号的额度快照，正文格式保持兼容。例如：
+
+```http
+X-Relay-Quota-Provider: codex
+X-Relay-Quota-Source: upstream
+X-Relay-Quota-Observed-At: 2026-10-24T12:00:00.000Z
+X-Relay-Quota-Age-Seconds: 0
+X-Relay-Quota-5h-Used-Percent: 25
+X-Relay-Quota-5h-Remaining-Percent: 75
+X-Relay-Quota-5h-Reset-At: 2026-10-24T13:00:00.000Z
+X-Relay-Quota-7d-Remaining-Percent: 60
+```
+
+`Provider` 为 `codex` 或 `claude`。`Source` 为 `upstream`（本次上游响应头）、`cache`（同账号 5 分钟内的缓存）或 `unavailable`（没有可用额度数据）。缓存优先使用当前进程收到的额度，Codex 也可读取管理台刷新后已有的额度缓存；缓存超过 5 分钟或窗口已重置时不再返回该窗口。未知数值省略，不会填成 0。请求数、Token 限流等其他窗口以各自名称返回 `Limit` / `Remaining` 等字段；它们与账号 5 小时、7 天的使用比例分别表示。
+
+可用的原生 `x-codex-*` / `anthropic-ratelimit-*` 额度头也会保留，浏览器可通过 CORS 暴露头读取。不会返回邮箱、账号 ID 或凭据。每次对话不额外发送额度探测请求。SSE 响应头发送后无法更新，因此这是收到上游响应头时的快照，不保证包含本次对话结束后的消耗；普通客户端是否显示额度取决于其是否读取这些响应头。
+
 ## 图片生成与编辑
 
 `POST /v1/images/generations` 和 `POST /v1/images/edits` 接受以下请求模型 ID，`GET /v1/models` 也会返回这些 ID；这不代表 Codex 订阅上游实际提供了这些图片模型：

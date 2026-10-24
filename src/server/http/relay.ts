@@ -1,5 +1,7 @@
 import "server-only";
 
+import { copyAccountQuotaHeaders } from "@/src/server/http/accountQuota";
+
 import { createClaudeNativeSseStream } from "@/src/server/claude/nativeStream";
 import { claudePolicy } from "@/src/server/claude/wire";
 import { extractUsageFromClaudeMessage } from "@/src/server/claude/chat";
@@ -241,9 +243,9 @@ export async function handleOpenAIResponses(request: Request) {
       timing,
     });
     if (!result.response.ok) {
-      return upstreamErrorResponse(result.response.status);
+      return upstreamErrorResponse(result.response.status, result.response.headers);
     }
-    return Response.json(raw, { status: result.response.status });
+    return Response.json(raw, { status: result.response.status, headers: copyAccountQuotaHeaders(result.response.headers) });
   } catch (error) {
     if (channel) {
       recordChannelFailure(channel, {
@@ -428,7 +430,7 @@ async function handleImagesProxy(
         upstreamBody: result.text,
         timing,
       });
-      return upstreamErrorResponse(result.response.status);
+      return upstreamErrorResponse(result.response.status, result.response.headers);
     }
 
     let responsePayload: Record<string, unknown>;
@@ -493,7 +495,7 @@ async function handleImagesProxy(
       upstreamBody: result.text,
       timing,
     });
-    return Response.json(responsePayload, { status: 200 });
+    return Response.json(responsePayload, { status: 200, headers: copyAccountQuotaHeaders(result.response.headers) });
   } catch (error) {
     if (channel) {
       recordChannelFailure(channel, {
@@ -573,7 +575,7 @@ async function forwardImagesStream(input: {
       upstreamBody: errorText,
       timing: input.timing,
     });
-    return upstreamErrorResponse(response.status);
+    return upstreamErrorResponse(response.status, response.headers);
   }
 
   if (!response.body) {
@@ -729,14 +731,14 @@ export async function handleChatCompletions(request: Request) {
           upstreamBody: errorText,
           timing,
         });
-        return upstreamErrorResponse(response.status);
+        return upstreamErrorResponse(response.status, response.headers);
       }
-      const headers = new Headers({
+      const headers = copyAccountQuotaHeaders(response.headers, new Headers({
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache, no-transform",
         Connection: "keep-alive",
         "X-Accel-Buffering": "no",
-      });
+      }));
       const fullLog = getFullRequestLoggingSetting();
       const upstreamCapture = createTextCapture();
       const body = response.body
@@ -839,7 +841,7 @@ export async function handleChatCompletions(request: Request) {
         upstreamBody: result.text,
         timing,
       });
-      return upstreamErrorResponse(result.response.status);
+      return upstreamErrorResponse(result.response.status, result.response.headers);
     }
     const raw = timing.time(
       "parse_upstream_response",
@@ -874,7 +876,7 @@ export async function handleChatCompletions(request: Request) {
       "转换为 OpenAI Chat 响应",
       () => codexResponseToChatCompletion(raw, model, toolNameMaps),
     );
-    return Response.json(responsePayload, { status: 200 });
+    return Response.json(responsePayload, { status: 200, headers: copyAccountQuotaHeaders(result.response.headers) });
   } catch (error) {
     if (channel) {
       recordChannelFailure(channel, {
@@ -964,7 +966,7 @@ async function handleClaudeChatCompletionsWithContext(input: {
         upstreamBody: errorText,
         timing: input.timing,
       });
-      return upstreamErrorResponse(response.status);
+      return upstreamErrorResponse(response.status, response.headers);
     }
 
     const fullLog = getFullRequestLoggingSetting();
@@ -1081,7 +1083,7 @@ async function handleClaudeChatCompletionsWithContext(input: {
       upstreamBody: result.text,
       timing: input.timing,
     });
-    return upstreamErrorResponse(result.response.status);
+    return upstreamErrorResponse(result.response.status, result.response.headers);
   }
   const responsePayload = input.timing.time(
     "transform_response",
@@ -1113,7 +1115,7 @@ async function handleClaudeChatCompletionsWithContext(input: {
     upstreamBody: result.text,
     timing: input.timing,
   });
-  return Response.json(responsePayload, { status: 200 });
+  return Response.json(responsePayload, { status: 200, headers: copyAccountQuotaHeaders(result.response.headers) });
 }
 
 async function handleClaudeResponsesWithContext(input: {
@@ -1184,7 +1186,7 @@ async function handleClaudeResponsesWithContext(input: {
         upstreamBody: errorText,
         timing: input.timing,
       });
-      return upstreamErrorResponse(response.status);
+      return upstreamErrorResponse(response.status, response.headers);
     }
 
     const fullLog = getFullRequestLoggingSetting();
@@ -1301,7 +1303,7 @@ async function handleClaudeResponsesWithContext(input: {
       upstreamBody: result.text,
       timing: input.timing,
     });
-    return upstreamErrorResponse(result.response.status);
+    return upstreamErrorResponse(result.response.status, result.response.headers);
   }
   const responsePayload = input.timing.time(
     "transform_response",
@@ -1333,7 +1335,7 @@ async function handleClaudeResponsesWithContext(input: {
     upstreamBody: result.text,
     timing: input.timing,
   });
-  return Response.json(responsePayload, { status: 200 });
+  return Response.json(responsePayload, { status: 200, headers: copyAccountQuotaHeaders(result.response.headers) });
 }
 
 async function handleRawCodexProxy(
@@ -1433,7 +1435,7 @@ async function handleRawCodexProxy(
       timing,
     });
     if (!result.response.ok && !input.exposeUpstreamErrors) {
-      return upstreamErrorResponse(result.response.status);
+      return upstreamErrorResponse(result.response.status, result.response.headers);
     }
     return new Response(result.text, {
       status: result.response.status,
@@ -1532,7 +1534,7 @@ async function forwardCodexStream(input: {
     if (input.exposeUpstreamErrors) {
       return new Response(errorText, { status: response.status, headers });
     }
-    return upstreamErrorResponse(response.status);
+    return upstreamErrorResponse(response.status, response.headers);
   }
   const fullLog = getFullRequestLoggingSetting();
   const upstreamCapture = createTextCapture();
@@ -2058,7 +2060,7 @@ async function readJsonObject(request: Request) {
   return parsed as Record<string, unknown>;
 }
 
-function upstreamErrorResponse(status: number) {
+function upstreamErrorResponse(status: number, upstreamHeaders?: Headers) {
   const safeStatus = status >= 400 && status <= 599 ? status : 502;
   return Response.json(
     {
@@ -2067,7 +2069,7 @@ function upstreamErrorResponse(status: number) {
         message: "Upstream request failed",
       },
     },
-    { status: safeStatus },
+    { status: safeStatus, headers: upstreamHeaders ? copyAccountQuotaHeaders(upstreamHeaders) : undefined },
   );
 }
 
@@ -2129,7 +2131,7 @@ async function handleClaudeNativeRequest(request: Request, countTokens: boolean)
         errorCode: "upstream_error", errorMessage: body.slice(0, 500), upstreamBody: body });
       let errorPayload;
       try { errorPayload = JSON.parse(body); } catch { errorPayload = { type: "error", error: { type: "api_error", message: "Upstream request failed" } }; }
-      return Response.json(errorPayload, { status: result.response.status });
+      return Response.json(errorPayload, { status: result.response.status, headers: copyAccountQuotaHeaders(result.response.headers) });
     }
     if (!stream) {
       const body = await result.response.text();

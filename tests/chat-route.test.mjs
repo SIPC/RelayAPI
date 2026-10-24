@@ -37,11 +37,24 @@ const upstream = http.createServer(async (req, res) => {
   for await (const chunk of req) chunks.push(chunk);
   const payload = JSON.parse(Buffer.concat(chunks).toString());
   calls.push({ path: req.url, headers: req.headers, payload });
+  const reset = String(Math.floor(Date.now() / 1000) + 3600);
+  const quotaHeaders = req.url.endsWith("/responses") ? {
+    "x-codex-primary-used-percent": "25", "x-codex-primary-window-minutes": "300",
+    "x-codex-secondary-used-percent": "40", "x-codex-secondary-window-minutes": "10080",
+    "x-codex-primary-reset-at": reset, "x-codex-secondary-reset-at": reset,
+  } : {
+    "anthropic-ratelimit-unified-5h-utilization": "0.25", "anthropic-ratelimit-unified-7d-utilization": "0.4",
+    "anthropic-ratelimit-unified-5h-reset": reset, "anthropic-ratelimit-unified-7d-reset": reset,
+  };
+  if (mode === "rate-limited") {
+    res.writeHead(429, { "content-type": "application/json", ...quotaHeaders });
+    res.end('{"type":"error","error":{"type":"rate_limit_error","message":"synthetic limit"}}'); return;
+  }
   if (mode === "reject") {
     res.writeHead(400, { "content-type": "application/json" });
     res.end('{"type":"error","error":{"type":"invalid_request_error","message":"synthetic rejection"}}'); return;
   }
-  const headers = { "content-type": "application/json", "set-cookie": "private", "anthropic-organization-id": "private-org" };
+  const headers = { "content-type": "application/json", "set-cookie": "private", "anthropic-organization-id": "private-org", ...quotaHeaders };
   if (req.url.includes("count_tokens")) { res.writeHead(200, headers); res.end('{"input_tokens":12}'); return; }
   if (req.url.endsWith("/responses")) {
     res.writeHead(200, { ...headers, "content-type": "text/event-stream" });
@@ -106,6 +119,15 @@ function request(key, payload, url = "/v1/chat/completions", extra = {}) {
 function log(channel) {
   return getLogDb().prepare("SELECT * FROM request_logs WHERE channel_id=? ORDER BY rowid DESC LIMIT 1").get(channel.id);
 }
+function assertQuota(response, provider) {
+  assert.equal(response.headers.get("x-relay-quota-provider"), provider);
+  assert.equal(response.headers.get("x-relay-quota-source"), "upstream");
+  assert.equal(response.headers.get("x-relay-quota-5h-remaining-percent"), "75");
+  assert.equal(response.headers.get("x-relay-quota-7d-remaining-percent"), "60");
+  assert.ok(response.headers.get("x-relay-quota-5h-reset-at"));
+  const raw = provider === "codex" ? "x-codex-primary-used-percent" : "anthropic-ratelimit-unified-5h-utilization";
+  assert.ok(response.headers.get(raw));
+}
 for (const protocol of ["chat", "responses"]) for (const stream of [false, true]) {
   test("OAI " + protocol + ", stream=" + stream + ": real HTTP request and parameter fidelity", async () => {
     mode = "normal";
@@ -115,6 +137,7 @@ for (const protocol of ["chat", "responses"]) for (const stream of [false, true]
     else payload.input = "Hi";
     const response = await (protocol === "chat" ? handleChatCompletions : handleResponses)(request(key, payload, "/v1/" + protocol, { "thread-id": "caller-thread" }));
     assert.equal(response.status, 200);
+    assertQuota(response, "codex");
     assert.ok((await response.text()).includes("你好"));
     const call = calls.at(-1);
     assert.equal(call.path, "/backend-api/codex/responses");
@@ -138,6 +161,7 @@ for (const protocol of ["chat", "responses"]) for (const stream of [false, true]
     const run = () => (protocol === "chat" ? handleChatCompletions : handleResponses)(request(key, payload));
     const first = await run();
     assert.equal(first.status, 200);
+    assertQuota(first, "claude");
     assert.ok((await first.text()).includes("你好"));
     const call = calls.at(-1);
     assert.equal(call.path, "/v1/messages?beta=true");
@@ -163,6 +187,7 @@ for (const stream of [false, true]) {
       model, stream, max_tokens: 100, system, messages: [{ role: "user", content: "Hi" }],
     }, "/v1/messages"));
     assert.equal(response.status, 200);
+    assertQuota(response, "claude");
     assert.equal(response.headers.get("set-cookie"), null);
     assert.equal(response.headers.get("anthropic-organization-id"), null);
     const body = await response.text();
@@ -185,6 +210,7 @@ test("Native Claude token counting keeps caller instructions in the counted payl
     model, system, messages: [{ role: "user", content: "Hi" }],
   }, "/v1/messages/count_tokens"));
   assert.equal(response.status, 200);
+  assertQuota(response, "claude");
   assert.deepEqual(await response.json(), { input_tokens: 12 });
   const call = calls.at(-1);
   assert.equal(call.path, "/v1/messages/count_tokens?beta=true");
@@ -243,4 +269,28 @@ test("Native Claude Code HTTP request preserves native body and rebinds selected
   assert.equal(call.headers["x-claude-code-session-id"], sessionId);
   assert.equal(JSON.parse(call.payload.metadata.user_id).session_id, sessionId);
   assert.notEqual(JSON.parse(call.payload.metadata.user_id).device_id, "cd".repeat(32));
+});
+
+for (const provider of ["codex", "claude"]) for (const protocol of ["chat", "responses"]) for (const stream of [false, true]) {
+  test(provider + " " + protocol + " stream=" + stream + ": quota survives upstream 429 without another probe", async () => {
+    mode = "rate-limited";
+    const { key, model } = setup(provider);
+    const payload = { model, stream };
+    if (protocol === "chat") payload.messages = [{ role: "user", content: "Hi" }];
+    else payload.input = "Hi";
+    const before = calls.length;
+    const response = await (protocol === "chat" ? handleChatCompletions : handleResponses)(request(key, payload));
+    assert.equal(response.status, 429);
+    assertQuota(response, provider);
+    await response.text();
+    assert.equal(calls.length, before + 1);
+  });
+}
+for (const stream of [false, true]) test("Native Claude stream=" + stream + ": quota survives upstream 429", async () => {
+  mode = "rate-limited";
+  const { key, model } = setup("claude");
+  const response = await handleClaudeMessages(request(key, { model, stream, messages: [{ role: "user", content: "Hi" }] }));
+  assert.equal(response.status, 429);
+  assertQuota(response, "claude");
+  assert.equal((await response.json()).error.type, "rate_limit_error");
 });
