@@ -37,7 +37,7 @@ interface ToolCallState {
 }
 
 export function isClaudeModel(model: unknown) {
-  return stringValue(model).toLowerCase().startsWith("claude-");
+  return parseClaudeModelSuffixes(model).baseModel.toLowerCase().startsWith("claude-");
 }
 
 export function chatCompletionsToClaude(

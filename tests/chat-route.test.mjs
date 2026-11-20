@@ -97,9 +97,8 @@ after(async () => {
   assert.ok(path.basename(dataDir).startsWith("relay-chat-route-"));
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
-function setup(provider) {
+function setup(provider, model = provider === "claude" ? "claude-sonnet-4-6" : "gpt-6.1-sol") {
   const id = "synthetic-" + randomUUID();
-  const model = provider === "claude" ? "claude-sonnet-4-6" : "gpt-6.1-sol";
   const input = { id, email: "test@example.invalid", accountId,
     tokens: { access_token: provider === "claude" ? "sk-ant-oat01-synthetic" : "synthetic-codex",
       expired: "2099-01-01T00:00:00Z" }, metadata: { upstream_transport: "websocket" } };
@@ -128,6 +127,70 @@ function assertQuota(response, provider) {
   const raw = provider === "codex" ? "x-codex-primary-used-percent" : "anthropic-ratelimit-unified-5h-utilization";
   assert.ok(response.headers.get(raw));
 }
+test("Claude model aliases route and normalize across JSON, SSE and token counting", async () => {
+  mode = "normal";
+  const { channel, key } = setup("claude", "claude-opus-5-5");
+  const handlers = [
+    [handleChatCompletions, "/v1/chat/completions"],
+    [handleResponses, "/v1/responses"],
+    [handleClaudeMessages, "/v1/messages"],
+    [handleClaudeCountTokens, "/v1/messages/count_tokens"],
+  ];
+  for (const model of ["anthropic/claude-opus-5-5", "anthropic/claude-opus-5.5", "claude-opus-5.5"]) {
+    for (const [handler, url] of handlers) for (const stream of [false, true]) {
+      const payload = url === "/v1/responses"
+        ? { model, stream, input: "Hi" }
+        : { model, stream, messages: [{ role: "user", content: "Hi" }] };
+      const before = calls.length;
+      const response = await handler(request(key, payload, url));
+      assert.equal(response.status, 200, model + " " + url + " stream=" + stream);
+      assert.ok(response.headers.get("content-type").startsWith(
+        stream && !url.endsWith("count_tokens") ? "text/event-stream" : "application/json",
+      ));
+      const body = await response.text();
+      assert.ok(body.includes(url.endsWith("count_tokens") ? '"input_tokens":12' : "你好"));
+      assert.equal(calls.length, before + 1);
+      assert.ok(calls.at(-1).path.startsWith("/v1/messages"));
+      assert.equal(calls.at(-1).payload.model, "claude-opus-5-5");
+      assert.equal(log(channel).status_code, 200);
+    }
+  }
+  const response = await handleResponses(request(key, {
+    model: "anthropic/claude-opus-5.5(1m)(high)", input: "Hi",
+  }, "/v1/responses"));
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal(calls.at(-1).payload.model, "claude-opus-5-5");
+  assert.equal(calls.at(-1).payload.output_config.effort, "high");
+  assert.ok(calls.at(-1).headers["anthropic-beta"].includes("context-1m-2025-08-07"));
+  const aliasKey = createApiKey({ channelAllowlist: [channel.id], modelAllowlist: ["anthropic/claude-opus-5.5"] });
+  const aliasResponse = await handleChatCompletions(request(aliasKey, {
+    model: "anthropic/claude-opus-5.5", messages: [{ role: "user", content: "Hi" }],
+  }));
+  assert.equal(aliasResponse.status, 200);
+  await aliasResponse.text();
+  assert.equal(calls.at(-1).payload.model, "claude-opus-5-5");
+});
+
+test("Claude model aliases still enforce model and channel authorization", async () => {
+  mode = "normal";
+  const { key } = setup("claude", "claude-opus-5-5");
+  const before = calls.length;
+  for (const model of ["anthropic/claude-sonnet-4.6", "other/claude-opus-5-5", "anthropic/not-a-claude"]) {
+    const response = await handleChatCompletions(request(key, {
+      model, messages: [{ role: "user", content: "Hi" }],
+    }));
+    assert.equal(response.status, 403);
+    assert.equal((await response.json()).error.code, "model_not_allowed");
+  }
+  const restricted = createApiKey({ channelAllowlist: ["nonexistent-channel"], modelAllowlist: ["claude-opus-5-5"] });
+  const response = await handleChatCompletions(request(restricted, {
+    model: "anthropic/claude-opus-5.5", messages: [{ role: "user", content: "Hi" }],
+  }));
+  assert.equal(response.status, 503);
+  assert.equal(calls.length, before);
+});
+
 for (const protocol of ["chat", "responses"]) for (const stream of [false, true]) {
   test("OAI " + protocol + ", stream=" + stream + ": real HTTP request and parameter fidelity", async () => {
     mode = "normal";

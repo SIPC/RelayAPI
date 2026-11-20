@@ -79,7 +79,7 @@ export function stripClaudeModelSuffixes(modelId: unknown) {
 export function claudeModelAllowlistCandidates(modelId: unknown) {
   const value = normalizeModelId(modelId);
   const parsed = parseClaudeModelSuffixes(value);
-  const candidates = [value];
+  const candidates = [String(modelId || "").trim(), value];
   if (parsed.hasContextSuffix && parsed.hasThinkingSuffix) {
     candidates.push(
       `${parsed.baseModel}(${parsed.contextSuffix})(${parsed.thinkingEffort})`,
@@ -98,5 +98,8 @@ export function claudeModelAllowlistCandidates(modelId: unknown) {
 }
 
 function normalizeModelId(modelId: unknown) {
-  return String(modelId || "").trim();
+  return String(modelId || "")
+    .trim()
+    .replace(/^anthropic\/(?=claude-)/i, "")
+    .replace(/^(claude-(?:opus|sonnet|haiku)-\d+)\.(\d+)(?=$|[-(])/i, "$1-$2");
 }
