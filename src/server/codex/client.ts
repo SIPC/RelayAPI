@@ -357,6 +357,9 @@ export function prepareCodexPayloadForUpstream(
   if (options.fastServiceTier && !upstreamPayload.service_tier) {
     upstreamPayload.service_tier = "priority";
   }
+  if (typeof upstreamPayload.model === "string") {
+    upstreamPayload.model = upstreamPayload.model.trim().replace(/^openai\//i, "");
+  }
   applyModelThinkingSuffix(upstreamPayload);
   normalizeRawCodexPayloadForUpstream(upstreamPayload, {
     preservePreviousResponseId: options.transport === "websocket",

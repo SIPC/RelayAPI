@@ -545,8 +545,9 @@ function modelAllowlistCandidates(provider: ChannelProvider, model: string) {
   if (provider === "claude") {
     return claudeModelAllowlistCandidates(model);
   }
-  const baseModel = stripCodexModelThinkingSuffix(model);
-  return [...new Set([model, baseModel].map(cleanString).filter(Boolean))];
+  const unprefixed = cleanString(model).replace(/^openai\//i, "");
+  const baseModel = stripCodexModelThinkingSuffix(unprefixed);
+  return [...new Set([model, unprefixed, baseModel].map(cleanString).filter(Boolean))];
 }
 
 function modelMatchesAllowlist(candidates: string[], allowlist: string[]) {

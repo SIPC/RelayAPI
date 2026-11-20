@@ -214,6 +214,32 @@ test("Claude model aliases still enforce model and channel authorization", async
   assert.equal(calls.length, before);
 });
 
+test("Codex accepts openai/ model prefixes without bypassing model authorization", async () => {
+  mode = "normal";
+  const { channel, key } = setup("codex", "gpt-6.2-sol");
+  for (const [model, effort] of [["openai/gpt-6.2-sol", undefined], ["OpenAI/gpt-6.2-sol(high)", "high"]]) {
+    for (const [handler, url] of [[handleChatCompletions, "/v1/chat/completions"], [handleResponses, "/v1/responses"]]) {
+      const payload = url === "/v1/responses" ? { model, input: "Hi" } : { model, messages: [{ role: "user", content: "Hi" }] };
+      const response = await handler(request(key, payload, url));
+      assert.equal(response.status, 200, model + " " + url);
+      await response.text();
+      const call = calls.at(-1);
+      assert.equal(call.path, "/backend-api/codex/responses");
+      assert.equal(call.payload.model, "gpt-6.2-sol");
+      assert.ok(call.headers["x-codex-routing-hint"].startsWith("model=gpt-6.2-sol"));
+      if (effort) assert.equal(call.payload.reasoning?.effort, effort);
+      assert.equal(log(channel).status_code, 200);
+    }
+  }
+  const before = calls.length;
+  for (const model of ["openai/gpt-6.1-sol", "other/gpt-6.2-sol"]) {
+    const response = await handleChatCompletions(request(key, { model, messages: [{ role: "user", content: "Hi" }] }));
+    assert.equal(response.status, 403, model);
+    assert.equal((await response.json()).error.code, "model_not_allowed");
+  }
+  assert.equal(calls.length, before);
+});
+
 for (const protocol of ["chat", "responses"]) for (const stream of [false, true]) {
   test("OAI " + protocol + ", stream=" + stream + ": real HTTP request and parameter fidelity", async () => {
     mode = "normal";
