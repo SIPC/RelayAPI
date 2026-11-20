@@ -51,8 +51,43 @@ const MODEL_INFO: Record<string, AntigravityModelInfo> = {
   "gemini-3.5-flash-lite": { thinking: { min: 1, max: 65535, levels: ["minimal", ...GEMINI_LEVELS] } },
 };
 
+// Antigravity publishes one ID per thinking tier (claude-opus-5-5-high, gemini-4-argon-low, gpt-oss-120b-medium,
+// claude-opus-4-6-thinking). Relay exposes the standard name so these models share routing with other providers,
+// and picks the tier per account when sending.
+const TIER_SUFFIX = /-(minimal|low|medium|high|xhigh|max|thinking)$/;
+const TIER_ORDER = ["", "-high", "-xhigh", "-medium", "-thinking", "-low", "-minimal", "-max"];
+
+// Clients may send vendor-prefixed names (openai/gpt-oss-120b, anthropic/claude-opus-5-5, google/gemini-4-argon).
+export function antigravityModelName(model: string) {
+  return model.trim().toLowerCase().replace(/^(openai|anthropic|google)\//, "");
+}
+
+export function antigravityStandardModel(model: string) {
+  return antigravityModelName(model).replace(TIER_SUFFIX, "");
+}
+
+// Standard names offered by a catalog; internal IDs (tab_*, *-disabled) are hidden.
+export function antigravityStandardModels(catalog: string[]) {
+  return [...new Set(catalog.filter(id => isAntigravityModelId(id) && !id.endsWith("-disabled"))
+    .map(antigravityStandardModel))].sort();
+}
+
+// The upstream ID an account serves for a requested name: an exact catalog ID first, then the tier matching the
+// requested reasoning effort, then the default tier. An unknown catalog passes the name through.
+export function resolveAntigravityModel(catalog: string[] | null, model: string, effort = "") {
+  const requested = antigravityModelName(model);
+  if (!catalog || catalog.includes(requested)) return requested;
+  const base = antigravityStandardModel(requested);
+  const suffixes = effort ? ["-" + effort.toLowerCase(), ...TIER_ORDER] : TIER_ORDER;
+  return suffixes.map(suffix => base + suffix).find(id => catalog.includes(id)) ?? null;
+}
+
 export function antigravityModelInfo(model: string): AntigravityModelInfo | undefined {
-  return MODEL_INFO[model.toLowerCase()];
+  const id = model.toLowerCase();
+  if (MODEL_INFO[id]) return MODEL_INFO[id];
+  const base = antigravityStandardModel(id);
+  const sibling = Object.keys(MODEL_INFO).find(key => antigravityStandardModel(key) === base);
+  return sibling ? MODEL_INFO[sibling] : undefined;
 }
 
 // CPA always uses the streaming endpoint for these models and aggregates non-stream responses.

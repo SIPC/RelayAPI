@@ -37,7 +37,7 @@ const { POST: postCountTokens } = await import("../app/v1/messages/count_tokens/
 const { GET: getModels } = await import("../app/v1/models/route.ts");
 const { createApiKey } = await import("../src/server/services/apiKeys.ts");
 const { getMainDb, getLogDb } = await import("../src/server/db/sqlite.ts");
-const { getAntigravityCredentialWithTokens, replaceAntigravityTokens } =
+const { getAntigravityCredentialWithTokens, replaceAntigravityModels, replaceAntigravityTokens } =
   await import("../src/server/repositories/antigravityCredentials.ts");
 const { ANTIGRAVITY_DEFAULT_CLIENT_ID, ANTIGRAVITY_DEFAULT_CLIENT_SECRET } =
   await import("../src/server/antigravity/oauthClient.ts");
@@ -392,6 +392,30 @@ test("Antigravity OAuth, CPA request shape, 429 failover and every relay protoco
   const outsideCatalog = upstreamCalls.length;
   assert.notEqual((await postResponses(request("/v1/responses", { model: "gemini-not-in-catalog", input: "Hi" }, catalogHeaders))).status, 200);
   assert.equal(upstreamCalls.length, outsideCatalog);
+
+  // Tiered upstream IDs are listed and routed by their standard name; the tier follows the requested effort.
+  replaceAntigravityModels(credentialA.id, ["claude-opus-5-5-high", "claude-opus-5-5-low", "gemini-4-carbon-disabled",
+    "tab_flash_lite_preview", model]);
+  const tieredModels = await getModels(request("/v1/models", undefined, catalogHeaders));
+  assert.deepEqual((await tieredModels.json()).data.map(item => item.id), ["claude-opus-5-5", claudeModel, model]);
+  for (const [requested, effort, expected] of [
+    ["claude-opus-5-5", "low", "claude-opus-5-5-low"],
+    ["claude-opus-5-5", undefined, "claude-opus-5-5-high"],
+    // Vendor prefixes resolve like the bare name.
+    ["anthropic/claude-opus-5-5", "low", "claude-opus-5-5-low"],
+    ["google/" + model, undefined, model],
+  ]) {
+    // Claude always uses the streaming endpoint; Gemini answers non-stream requests with JSON.
+    const frame = responseFrame([{ text: "tiered" }], "STOP", usage);
+    inference.push(() => expected.startsWith("claude") ? sse(frame) : Response.json(frame));
+    const tiered = await postResponses(request("/v1/responses", {
+      model: requested, input: "Hi", ...(effort && { reasoning: { effort } }),
+    }, catalogHeaders));
+    assert.equal(tiered.status, 200, await tiered.clone().text());
+    assert.equal(upstreamCalls.at(-1).account, "a");
+    assert.equal(upstreamCalls.at(-1).payload.model, expected);
+    assert.equal((await tiered.json()).model, requested);
+  }
 
   // Deleting a credential removes it from every channel that bound it.
   const removed = await deleteCredential(adminCall("DELETE", "/credentials/" + credentialB.id), context(credentialB.id));

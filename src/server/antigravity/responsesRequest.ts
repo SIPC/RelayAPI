@@ -16,7 +16,7 @@ export const ANTIGRAVITY_SIGNATURE_PREFIX = "relay-antigravity:";
 export const ANTIGRAVITY_CALL_ID_PREFIX = "call_relay_agy_";
 // CPA replays function calls without a stored signature with Gemini's documented bypass value.
 const SKIP_SIGNATURE = "skip_thought_signature_validator";
-const CLAUDE_55 = /^claude-(opus|sonnet)-5-5(?:-(high|reasoning))?(?:-[0-9]{8})?(?:\[[^[\]]+\])?$/;
+const CLAUDE_55 = /^claude-(opus|sonnet)-5-5(?:-(low|medium|high|reasoning))?(?:-[0-9]{8})?(?:\[[^[\]]+\])?$/;
 const LEVEL_BUDGETS: Record<string, number> = {
   none: 0, auto: -1, minimal: 512, low: 1024, medium: 8192, high: 24576, xhigh: 32768, max: 128000,
 };

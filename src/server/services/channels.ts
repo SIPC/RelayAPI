@@ -15,7 +15,14 @@ import type {
 import { claudeModelAllowlistCandidates } from "@/src/server/claude/modelSuffix";
 import { isClaudeModel } from "@/src/server/claude/chat";
 import { isCodexImageModel } from "@/src/server/codex/imageModels";
-import { ANTIGRAVITY_BASE_URL, isAntigravityGeminiModel, isAntigravityModelId } from "@/src/server/antigravity/protocol";
+import {
+  ANTIGRAVITY_BASE_URL,
+  antigravityModelName,
+  antigravityStandardModel,
+  isAntigravityGeminiModel,
+  isAntigravityModelId,
+  resolveAntigravityModel,
+} from "@/src/server/antigravity/protocol";
 import {
   getAntigravityCredentialWithTokens,
   listAntigravityCredentials,
@@ -281,7 +288,8 @@ export function selectChannelForRequest(input: {
 }): SelectedChannel {
   const model = cleanString(input.model);
   // Antigravity serves Gemini, Claude and GPT-OSS IDs listed on its channels; Gemini IDs exist nowhere else.
-  const oauthProvider = isAntigravityGeminiModel(model) ? "antigravity" : isClaudeModel(model) ? "claude" : "codex";
+  const antigravityModel = antigravityModelName(model);
+  const oauthProvider = isAntigravityGeminiModel(antigravityModel) ? "antigravity" : isClaudeModel(model) ? "claude" : "codex";
   const oauthModelCandidates = modelAllowlistCandidates(oauthProvider, model);
   if (input.apiKey.modelAllowlist.length > 0 && model &&
     !modelMatchesAllowlist(oauthModelCandidates, input.apiKey.modelAllowlist)) {
@@ -299,8 +307,9 @@ export function selectChannelForRequest(input: {
       if (input.apiKey.modelAllowlist.length > 0 && !input.apiKey.modelAllowlist.includes(model)) return false;
     } else if (channel.provider === "antigravity") {
       // An empty allowlist means every model in the bound accounts' catalogs, like empty OAuth allowlists.
-      if (!isAntigravityModelId(model) ||
-        (channel.modelAllowlist.length > 0 && !channel.modelAllowlist.includes(model))) return false;
+      // Allowlists match by standard name, so "claude-opus-5-5" and "claude-opus-5-5-high" are one model.
+      if (!isAntigravityModelId(antigravityModel) || (channel.modelAllowlist.length > 0 &&
+        !channel.modelAllowlist.some(allowed => antigravityStandardModel(allowed) === antigravityStandardModel(model)))) return false;
     } else {
       if (channel.provider !== oauthProvider) return false;
       if ((input.operation === "images_generations" || input.operation === "images_edits") &&
@@ -318,7 +327,7 @@ export function selectChannelForRequest(input: {
   const candidates = channels.flatMap((channel) => {
     const credentials = availableCredentialsForChannel(channel, maps.get(channel.provider)!, now)
       .filter((credential) => !excluded.has(credential.id) && antigravityServesModel(credential, model, now,
-        channel.modelAllowlist.length === 0 && !isAntigravityGeminiModel(model)));
+        channel.modelAllowlist.length === 0 && !isAntigravityGeminiModel(antigravityModel)));
     return credentials.length ? [{ channel, credentials }] : [];
   });
   if (!candidates.length) {
@@ -344,10 +353,10 @@ export function selectChannelForRequest(input: {
 // is known to include them.
 function antigravityServesModel(credential: RoutableCredentialRecord, model: string, now: number, requireCatalog: boolean) {
   if (credential.provider !== "antigravity") return true;
-  const cooldown = credential.modelCooldowns[model];
+  const cooldown = credential.modelCooldowns[antigravityStandardModel(model)];
   if (cooldown && Date.parse(cooldown.until) > now) return false;
   if (!credential.models) return !requireCatalog;
-  return credential.models.includes(model.toLowerCase());
+  return resolveAntigravityModel(credential.models, model) !== null;
 }
 
 // Protocol conversions ride on the native capability: Anthropic Messages also serves Chat / Responses, and
@@ -549,7 +558,7 @@ function isChannelAvailable(
   }
   if (
     channel.modelAllowlist.length > 0 &&
-    model &&
+    model && channel.provider !== "antigravity" &&
     !modelMatchesAllowlist(modelCandidates, channel.modelAllowlist)
   ) {
     return false;
@@ -670,7 +679,10 @@ function credentialUsageHealthResetMap(
 }
 
 function modelAllowlistCandidates(provider: ChannelProvider, model: string) {
-  if (isApiProvider(provider) || provider === "antigravity") return [model].filter(Boolean);
+  if (provider === "antigravity") {
+    return [...new Set([model, antigravityModelName(model), antigravityStandardModel(model)])].filter(Boolean);
+  }
+  if (isApiProvider(provider)) return [model].filter(Boolean);
   if (provider === "claude") {
     return claudeModelAllowlistCandidates(model);
   }

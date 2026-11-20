@@ -2,6 +2,7 @@ import "server-only";
 
 import { countAntigravityTokens, sendAntigravity, type AntigravityOutcome } from "@/src/server/antigravity/client";
 import { claudeMessagesToResponses, responsesStreamToClaude, responsesToClaudeMessage } from "@/src/server/antigravity/messages";
+import { antigravityStandardModels } from "@/src/server/antigravity/protocol";
 import { copyAccountQuotaHeaders, withAccountQuotaHeaders } from "@/src/server/http/accountQuota";
 import { forwardApiKeyRequest, type ApiKeyRelayResult } from "@/src/server/upstream/forward";
 import { forwardedPayloadSnapshot, redactText, redactValue } from "@/src/server/upstream/client";
@@ -135,7 +136,7 @@ export async function handleModels(request: Request) {
       if (isAntigravity && !channel.credentialIds.some(id => enabledAntigravity.has(id))) continue;
       // An Antigravity channel without an allowlist offers the catalogs of its bound accounts.
       const channelModels = isAntigravity && channel.modelAllowlist.length === 0
-        ? [...new Set(channel.credentialIds.flatMap(id => enabledAntigravity.get(id)?.models ?? []))].sort()
+        ? antigravityStandardModels(channel.credentialIds.flatMap(id => enabledAntigravity.get(id)?.models ?? []))
         : channel.modelAllowlist;
       for (const model of channelModels) {
         if (seen.has(model) || (apiKey.modelAllowlist.length > 0 && !apiKey.modelAllowlist.includes(model))) continue;

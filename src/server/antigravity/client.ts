@@ -5,9 +5,11 @@ import {
   ANTIGRAVITY_USER_AGENT,
   antigravityObject as object,
   antigravityRequestId,
+  antigravityStandardModel,
   antigravityRequiresStreaming,
   antigravityString as string,
   isAntigravityClaudeModel,
+  resolveAntigravityModel,
 } from "@/src/server/antigravity/protocol";
 import { AntigravityResponsesOutput, antigravityResponseError } from "@/src/server/antigravity/responsesOutput";
 import { antigravityResponsesPayload } from "@/src/server/antigravity/responsesRequest";
@@ -76,10 +78,12 @@ export async function sendAntigravity(input: {
   const upstreamStream = input.stream || antigravityRequiresStreaming(input.model);
 
   try {
-    // Validate input before doing any token exchange or inference request.
-    const base = antigravityResponsesPayload(input.payload, input.model, {
+    const build = (model: string) => antigravityResponsesPayload(input.payload, model, {
       includeThoughtsByDefault: input.includeThoughtsByDefault,
     });
+    // Validate input before doing any token exchange or inference request.
+    build(input.model);
+    const effort = string(object(input.payload.reasoning).effort);
     const tried: AntigravityCredentialWithTokens[] = [];
     let last: Failure | null = null;
 
@@ -91,10 +95,12 @@ export async function sendAntigravity(input: {
         return { error: responseError(cause) };
       }
       if (!tried.some(item => item.id === credential.id)) tried.push(credential);
+      // Each account may publish a different tier ID for the requested standard name.
+      const upstreamModel = resolveAntigravityModel(credential.models, input.model, effort) ?? input.model;
       const body = {
-        ...base,
+        ...build(upstreamModel),
         project: credential.projectId,
-        requestId: antigravityRequestId(input.model),
+        requestId: antigravityRequestId(upstreamModel),
         ...(credits && { enabledCreditTypes: ["GOOGLE_ONE_AI"] }),
       };
       const path = upstreamStream ? "/v1internal:streamGenerateContent?alt=sse" : "/v1internal:generateContent";
@@ -135,7 +141,7 @@ export async function sendAntigravity(input: {
       if ("upstream" in result) return await respond(result.upstream, result.credential);
       last = result;
       if (result.error.status === 429) {
-        markAntigravityModelCooldown(selected.credential.id, input.model, {
+        markAntigravityModelCooldown(selected.credential.id, antigravityStandardModel(input.model), {
           retryAfterMs: "decision" in result && result.decision !== "soft" ? result.retryAfterMs : undefined,
           message: result.error.message,
         });
@@ -175,7 +181,7 @@ export async function sendAntigravity(input: {
   async function respond(upstream: Response, credential: AntigravityCredentialWithTokens): Promise<AntigravityOutcome> {
     const { access_token: token, refresh_token: refreshToken } = credential.tokens;
     const redact = (value: unknown) => redactValue(redactValue(value, token), refreshToken);
-    const onSuccess = () => clearAntigravityModelCooldown(credential.id, input.model);
+    const onSuccess = () => clearAntigravityModelCooldown(credential.id, antigravityStandardModel(input.model));
     if (!input.stream) {
       const output = new AntigravityResponsesOutput(input.model, input.payload);
       try {
@@ -229,8 +235,10 @@ export async function countAntigravityTokens(input: {
   payload: Record<string, unknown>;
   credentialId: string;
 }) {
-  const body = antigravityResponsesPayload(input.payload, input.model, { countTokens: true });
+  antigravityResponsesPayload(input.payload, input.model, { countTokens: true });
   const credential = await ensureFreshAntigravityCredential(input.credentialId);
+  const model = resolveAntigravityModel(credential.models, input.model) ?? input.model;
+  const body = antigravityResponsesPayload(input.payload, model, { countTokens: true });
   let upstream: Response;
   try {
     upstream = await fetch(ANTIGRAVITY_BASE_URL + "/v1internal:countTokens", {
