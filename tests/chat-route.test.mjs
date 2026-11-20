@@ -127,6 +127,29 @@ function assertQuota(response, provider) {
   const raw = provider === "codex" ? "x-codex-primary-used-percent" : "anthropic-ratelimit-unified-5h-utilization";
   assert.ok(response.headers.get(raw));
 }
+test("Chat and Responses accept declared JSON bodies up to 100 MiB and reject larger ones", async () => {
+  mode = "normal";
+  const { key, model } = setup("claude");
+  for (const [handler, url] of [[handleChatCompletions, "/v1/chat/completions"], [handleResponses, "/v1/responses"]]) {
+    for (const [bytes, status] of [[25 * 1024 * 1024 + 1, 200], [100 * 1024 * 1024, 200], [100 * 1024 * 1024 + 1, 413]]) {
+      const payload = url === "/v1/responses"
+        ? { model, input: "Hi" } : { model, messages: [{ role: "user", content: "Hi" }] };
+      const before = calls.length;
+      // Exercise the early Content-Length gate without allocating a 100 MiB fixture.
+      const response = await handler(request(key, payload, url, { "content-length": String(bytes) }));
+      assert.equal(response.status, status, url + " Content-Length=" + bytes);
+      const body = await response.json();
+      if (status === 413) {
+        assert.equal(body.error.code, "body_too_large");
+        assert.equal(calls.length, before);
+      } else {
+        assert.ok(JSON.stringify(body).includes("你好"));
+        assert.equal(calls.length, before + 1);
+      }
+    }
+  }
+});
+
 test("Claude model aliases route and normalize across JSON, SSE and token counting", async () => {
   mode = "normal";
   const { channel, key } = setup("claude", "claude-opus-5-5");

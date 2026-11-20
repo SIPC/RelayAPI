@@ -2041,7 +2041,7 @@ function tapStream(
 
 async function readJsonObject(request: Request) {
   const contentLength = Number(request.headers.get("content-length") || 0);
-  if (contentLength > 25 * 1024 * 1024) {
+  if (contentLength > 100 * 1024 * 1024) {
     throw new HttpError(413, "body_too_large", "Request body is too large");
   }
   let parsed: unknown;
