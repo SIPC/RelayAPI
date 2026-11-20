@@ -1365,7 +1365,7 @@ function reasoningEnabledToEffort(value: unknown) {
   return "";
 }
 
-function deterministicUuid(seed: string) {
+export function deterministicUuid(seed: string) {
   const hash = crypto.createHash("sha1").update(seed).digest();
   hash[6] = (hash[6] & 0x0f) | 0x50;
   hash[8] = (hash[8] & 0x3f) | 0x80;

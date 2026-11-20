@@ -369,6 +369,166 @@ function migrateMainDb(db: DatabaseSync) {
       DROP TABLE channels_legacy_008;
     `);
   });
+
+  applyMigration(db, "010_api_upstream_credentials", (database) => {
+    const extraIndexes = database.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'index'
+        AND tbl_name IN ('channels', 'channel_credentials') AND sql IS NOT NULL
+        AND name NOT IN ('idx_channels_credential', 'idx_channels_routing', 'idx_channel_credentials_credential')
+    `).all() as Array<{ sql: string }>;
+    // Rebuild both sides of the FK together; renaming only channels would retarget it.
+    database.exec(`
+      DROP INDEX IF EXISTS idx_channel_credentials_credential;
+      DROP INDEX IF EXISTS idx_channels_routing;
+      DROP INDEX IF EXISTS idx_channels_credential;
+      ALTER TABLE channel_credentials RENAME TO channel_credentials_legacy_010;
+      ALTER TABLE channels RENAME TO channels_legacy_010;
+
+      CREATE TABLE channels (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        provider TEXT NOT NULL DEFAULT 'codex'
+          CHECK (provider IN ('codex', 'claude', 'openai', 'anthropic')),
+        base_url TEXT NOT NULL,
+        credential_id TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+        priority INTEGER NOT NULL DEFAULT 100,
+        weight INTEGER NOT NULL DEFAULT 1,
+        model_allowlist_json TEXT NOT NULL DEFAULT '[]',
+        capabilities_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT 'healthy',
+        health_score REAL NOT NULL DEFAULT 100,
+        cooldown_until TEXT,
+        last_error TEXT,
+        last_used_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE channel_credentials (
+        channel_id TEXT NOT NULL,
+        credential_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (channel_id, credential_id),
+        FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
+      ) STRICT;
+
+      INSERT INTO channels (
+        id, name, provider, base_url, credential_id, enabled, priority, weight,
+        model_allowlist_json, capabilities_json, status, health_score,
+        cooldown_until, last_error, last_used_at, created_at, updated_at
+      ) SELECT
+        id, name, provider, base_url, credential_id, enabled, priority, weight,
+        model_allowlist_json,
+        CASE WHEN provider = 'claude'
+          THEN '["chat","responses","messages","count_tokens"]'
+          ELSE '["chat","responses","images_generations","images_edits"]' END,
+        status, health_score, cooldown_until, last_error, last_used_at, created_at, updated_at
+      FROM channels_legacy_010;
+
+      INSERT INTO channel_credentials (channel_id, credential_id, created_at)
+      SELECT channel_id, credential_id, created_at FROM channel_credentials_legacy_010;
+
+      CREATE INDEX idx_channels_credential ON channels(credential_id);
+      CREATE INDEX idx_channels_routing ON channels(provider, enabled, status, priority, weight);
+      CREATE INDEX idx_channel_credentials_credential ON channel_credentials(credential_id);
+      DROP TABLE channel_credentials_legacy_010;
+      DROP TABLE channels_legacy_010;
+
+      CREATE TABLE upstream_credentials (
+        id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL CHECK (provider IN ('openai', 'anthropic')),
+        name TEXT NOT NULL,
+        key_prefix TEXT NOT NULL,
+        key_envelope TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+        priority INTEGER NOT NULL DEFAULT 100,
+        weight INTEGER NOT NULL DEFAULT 1,
+        use_global_proxy INTEGER NOT NULL DEFAULT 0 CHECK (use_global_proxy IN (0, 1)),
+        proxy_pool_id TEXT,
+        proxy_envelope TEXT,
+        last_used_at TEXT,
+        cooldown_until TEXT,
+        last_error TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX idx_upstream_credentials_routing
+        ON upstream_credentials(provider, enabled, priority, weight);
+    `);
+    for (const index of extraIndexes) database.exec(index.sql);
+  });
+  applyMigration(db, "011_antigravity_oauth", (database) => {
+    const indexes = database.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'index'
+        AND tbl_name IN ('channels', 'channel_credentials') AND sql IS NOT NULL
+    `).all() as Array<{ sql: string }>;
+    database.exec(`
+      ALTER TABLE channel_credentials RENAME TO channel_credentials_legacy_011;
+      ALTER TABLE channels RENAME TO channels_legacy_011;
+
+      CREATE TABLE channels (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        provider TEXT NOT NULL DEFAULT 'codex'
+          CHECK (provider IN ('codex', 'claude', 'openai', 'anthropic', 'antigravity')),
+        base_url TEXT NOT NULL,
+        credential_id TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+        priority INTEGER NOT NULL DEFAULT 100,
+        weight INTEGER NOT NULL DEFAULT 1,
+        model_allowlist_json TEXT NOT NULL DEFAULT '[]',
+        capabilities_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT 'healthy',
+        health_score REAL NOT NULL DEFAULT 100,
+        cooldown_until TEXT,
+        last_error TEXT,
+        last_used_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE channel_credentials (
+        channel_id TEXT NOT NULL,
+        credential_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (channel_id, credential_id),
+        FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
+      ) STRICT;
+      INSERT INTO channels SELECT * FROM channels_legacy_011;
+      INSERT INTO channel_credentials SELECT * FROM channel_credentials_legacy_011;
+      DROP TABLE channel_credentials_legacy_011;
+      DROP TABLE channels_legacy_011;
+
+      CREATE TABLE antigravity_credentials (
+        id TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL,
+        email TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        token_envelope TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+        priority INTEGER NOT NULL DEFAULT 100,
+        weight INTEGER NOT NULL DEFAULT 1,
+        expires_at TEXT NOT NULL,
+        last_refresh_at TEXT NOT NULL,
+        last_used_at TEXT,
+        cooldown_until TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+    `);
+    for (const index of indexes) database.exec(index.sql);
+  });
+  applyMigration(db, "012_antigravity_cpa_alignment", `
+    ALTER TABLE antigravity_credentials ADD COLUMN models_json TEXT;
+    ALTER TABLE antigravity_credentials ADD COLUMN model_cooldowns_json TEXT NOT NULL DEFAULT '{}';
+  `);
+  // Holds usage_health_reset_at, as on the Codex and Claude credential tables.
+  applyMigration(db, "013_antigravity_credential_metadata", `
+    ALTER TABLE antigravity_credentials ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}';
+  `);
 }
 
 function migrateLogDb(db: DatabaseSync) {

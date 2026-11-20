@@ -1133,9 +1133,8 @@ function buildClaudeUnifiedQuotaWindow(
   const resetAt = parseClaudeResetHeader(values.reset);
   const status = stringValue(values.status).toLowerCase();
   const exhausted =
-    status !== "" && status !== "allowed"
-      ? true
-      : usedPercent !== null && usedPercent >= 100;
+    (status !== "" && status !== "allowed" && status !== "allowed_warning") ||
+    (usedPercent !== null && usedPercent >= 100);
   return {
     id: `unified-${windowId}`,
     label: claudeRateLimitLabel(`unified-${windowId}`),
@@ -1225,10 +1224,21 @@ function deriveClaudeQuotaStatus(
   if (Number.isFinite(cooldownUntil) && cooldownUntil > now.getTime()) {
     return "cooling_down";
   }
-  if (upstreamStatus === 429 || windows.some((window) => window.exhausted)) {
+  if (upstreamStatus === 429) {
     return "exhausted";
   }
-  const remainingValues = windows
+
+  const reportedWindows = windows.filter(
+    (window) => window.remaining_percent !== null || window.exhausted,
+  );
+  const subscriptionWindow =
+    reportedWindows.find((window) => window.id === "unified-5h") ??
+    reportedWindows.find((window) => window.id === "unified-7d");
+  const statusWindows = subscriptionWindow ? [subscriptionWindow] : reportedWindows;
+  if (statusWindows.some((window) => window.exhausted)) {
+    return "exhausted";
+  }
+  const remainingValues = statusWindows
     .map((window) => window.remaining_percent)
     .filter((value): value is number => typeof value === "number");
   if (remainingValues.length === 0) {

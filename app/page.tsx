@@ -2,6 +2,7 @@ import { cookies } from "next/headers";
 
 import { AdminDashboard } from "@/components/admin-dashboard";
 import { WebAccessLogin } from "@/components/auth/web-access-login";
+import { listPublicAntigravityCredentials } from "@/src/server/services/antigravityCredentials";
 import {
   getAdminOverviewStats,
   queryRequestLogs,
@@ -10,6 +11,7 @@ import { listApiKeyPublicRecords } from "@/src/server/services/apiKeys";
 import { listChannelRecords } from "@/src/server/services/channels";
 import { listPublicClaudeCredentials } from "@/src/server/services/claudeCredentials";
 import { listPublicCodexCredentials } from "@/src/server/services/codexCredentials";
+import { listPublicUpstreamCredentials } from "@/src/server/services/upstreamCredentials";
 import { getPublicGlobalSettings } from "@/src/server/services/settings";
 import { listPublicProxyPoolItems } from "@/src/server/services/proxyPool";
 import type { AdminOverviewStats } from "@/src/shared/types/entities";
@@ -58,6 +60,7 @@ export default async function Home() {
   const apiKeys = listApiKeyPublicRecords();
   const codexCredentials = await listPublicCodexCredentials();
   const claudeCredentials = listPublicClaudeCredentials();
+  const upstreamCredentials = await listPublicUpstreamCredentials();
   const channels = listChannelRecords();
   const proxyPool = listPublicProxyPoolItems();
   const requestLogs = queryRequestLogs({
@@ -75,6 +78,8 @@ export default async function Home() {
       initialChannels={channels}
       initialCredentials={codexCredentials}
       initialClaudeCredentials={claudeCredentials}
+      initialAntigravityCredentials={listPublicAntigravityCredentials()}
+      initialUpstreamCredentials={upstreamCredentials}
       initialProxyPool={proxyPool}
       initialRequestLogsPage={{
         object: "list",

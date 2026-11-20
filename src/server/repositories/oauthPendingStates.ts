@@ -56,16 +56,14 @@ export function takeOAuthPendingState(
   pruneExpiredOAuthPendingStates();
   const row = getMainDb()
     .prepare(
-      `SELECT * FROM oauth_pending_states
-       WHERE state = ? AND lower(provider) = lower(?)`,
+      `DELETE FROM oauth_pending_states
+       WHERE state = ? AND lower(provider) = lower(?)
+       RETURNING *`,
     )
     .get(state, provider) as OAuthPendingStateRow | undefined;
   if (!row) {
     return null;
   }
-  getMainDb()
-    .prepare("DELETE FROM oauth_pending_states WHERE state = ?")
-    .run(state);
   return toOAuthPendingStateRecord(row);
 }
 

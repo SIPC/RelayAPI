@@ -42,21 +42,21 @@ export function isClaudeModel(model: unknown) {
 
 export function chatCompletionsToClaude(
   inputPayload: unknown,
-  input: { stream: boolean; defaultModel?: string } = { stream: false },
+  input: { stream: boolean; defaultModel?: string; oauth?: boolean } = { stream: false },
 ): ClaudeChatConversion {
   const payload = cloneJsonObject(inputPayload);
   const requestedModel =
-    stringValue(payload.model) ||
+    (input.oauth === false && typeof payload.model === "string" ? payload.model : stringValue(payload.model)) ||
     input.defaultModel ||
     serverConfig.claudeDefaultModel;
-  const parsedModel = parseClaudeModelSuffixes(requestedModel);
-  const model = parsedModel.baseModel;
+  const parsedModel = input.oauth === false ? undefined : parseClaudeModelSuffixes(requestedModel);
+  const model = parsedModel?.baseModel ?? requestedModel;
   const out: Record<string, unknown> = {
     model,
     max_tokens:
       integerValue(payload.max_tokens) ||
       integerValue(payload.max_completion_tokens) ||
-      (model.includes("fable") ? 64000 : 32000),
+      (input.oauth !== false && model.includes("fable") ? 64000 : 32000),
     messages: [],
     stream: Boolean(input.stream),
   };
@@ -75,12 +75,12 @@ export function chatCompletionsToClaude(
   }
   applyReasoningEffort(
     out,
-    parsedModel.thinkingEffort || payload.reasoning_effort ||
+    parsedModel?.thinkingEffort || payload.reasoning_effort ||
       objectValue(payload.reasoning)?.effort ||
       "",
   );
 
-  if (parsedModel.hasContextSuffix) out.betas = ["context-1m-2025-08-07"];
+  if (parsedModel?.hasContextSuffix) out.betas = ["context-1m-2025-08-07"];
 
   const messages = Array.isArray(payload.messages) ? payload.messages : [];
   for (const rawMessage of messages) {
@@ -169,6 +169,9 @@ export function chatCompletionsToClaude(
   }
 
   stripUndefinedDeep(out);
+  if (input.oauth === false) {
+    return { payload: out, reverseToolNameMap: {} };
+  }
   const prepared = prepareClaudeOAuthToolNamesForUpstream(out);
   return {
     payload: prepared.payload,
@@ -178,12 +181,12 @@ export function chatCompletionsToClaude(
 
 export function responsesToClaude(
   inputPayload: unknown,
-  input: { stream: boolean; defaultModel?: string } = { stream: false },
+  input: { stream: boolean; defaultModel?: string; oauth?: boolean } = { stream: false },
 ): ClaudeChatConversion {
   const payload = cloneJsonObject(inputPayload);
   const chatPayload: Record<string, unknown> = {
     model:
-      stringValue(payload.model) ||
+      (input.oauth === false && typeof payload.model === "string" ? payload.model : stringValue(payload.model)) ||
       input.defaultModel ||
       serverConfig.claudeDefaultModel,
     messages: responsesInputToChatMessages(payload),

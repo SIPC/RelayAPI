@@ -23,6 +23,9 @@ const { accountQuotaHeaders: quota, parseAccountQuotaHeaders: parse, withAccount
 const { addCorsHeaders } = await import("../src/server/http/cors.ts");
 const { upsertCodexQuotaCache } = await import("../src/server/repositories/quota.ts");
 const { upsertCodexCredential } = await import("../src/server/repositories/codexCredentials.ts");
+const { upsertClaudeCredential } = await import("../src/server/repositories/claudeCredentials.ts");
+const { appendRequestLog, appendRequestLogDetail } = await import("../src/server/repositories/logs.ts");
+const { getClaudeQuota } = await import("../src/server/services/claudeCredentials.ts");
 const { getMainDb, getLogDb } = await import("../src/server/db/sqlite.ts");
 const now = Date.parse("2026-10-24T12:00:00Z");
 const live = () => new Headers({
@@ -37,6 +40,57 @@ after(() => {
   assert.ok(path.basename(dataDir).startsWith("relay-chat-quota-"));
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
+
+for (const { name, headers, expected } of [
+  {
+    name: "5h takes priority even when 7d is exhausted",
+    headers: {
+      "anthropic-ratelimit-unified-5h-utilization": "0.25",
+      "anthropic-ratelimit-unified-7d-utilization": "1",
+    },
+    expected: "high",
+  },
+  {
+    name: "a rejected 5h window takes priority even without a percentage",
+    headers: {
+      "anthropic-ratelimit-unified-5h-status": "rejected",
+      "anthropic-ratelimit-unified-7d-utilization": "0",
+    },
+    expected: "exhausted",
+  },
+  {
+    name: "weekly-only quota classifies a warning as low rather than exhausted",
+    headers: {
+      "anthropic-ratelimit-unified-7d-utilization": "0.8",
+      "anthropic-ratelimit-unified-7d-status": "allowed_warning",
+      "anthropic-ratelimit-requests-limit": "10",
+      "anthropic-ratelimit-requests-remaining": "0",
+    },
+    expected: "low",
+  },
+  {
+    name: "a reset-only 5h window falls back to exhausted 7d quota",
+    headers: {
+      "anthropic-ratelimit-unified-5h-reset": "2099-01-01T00:00:00Z",
+      "anthropic-ratelimit-unified-7d-utilization": "1",
+    },
+    expected: "exhausted",
+  },
+]) {
+  test("Claude credential quota: " + name, async () => {
+    const id = randomUUID();
+    upsertClaudeCredential({
+      id, email: "test@example.invalid", accountId: randomUUID(),
+      tokens: { access_token: "sk-ant-oat01-synthetic", expired: "2099-01-01T00:00:00Z" },
+    });
+    const requestLogId = appendRequestLog({
+      credentialId: id, startedAt: new Date().toISOString(), method: "POST",
+      path: "/v1/messages", requestType: "messages", stream: false, statusCode: 200, latencyMs: 1,
+    });
+    appendRequestLogDetail(requestLogId, { upstreamHeaders: headers });
+    assert.equal((await getClaudeQuota(id)).status, expected);
+  });
+}
 
 test("Codex quota maps durations, percentages and absolute/relative resets", () => {
   const headers = quota("codex", randomUUID(), live(), now);

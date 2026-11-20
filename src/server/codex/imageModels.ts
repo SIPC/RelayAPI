@@ -2,6 +2,7 @@ import "server-only";
 
 export const CODEX_IMAGE_MODELS = [
   { id: "gpt-image-2", displayName: "GPT Image 2", created: 1704067200 },
+  { id: "gpt-image-2.5", displayName: "GPT Image 2.5", created: 1704067200 },
   {
     id: "gpt-image-2.5-sunburst",
     displayName: "GPT Image 2.5 Sunburst",
@@ -21,6 +22,17 @@ export const CODEX_IMAGE_MODELS = [
     id: "gpt-image-2.5-flare-2026-09-08",
     displayName: "GPT Image 2.5 Flare (2026-09-08)",
     created: 1788825600,
+  },
+  { id: "gpt-image-2.6", displayName: "GPT Image 2.6", created: 1704067200 },
+  {
+    id: "gpt-image-2.6-sunburst",
+    displayName: "GPT Image 2.6 Sunburst",
+    created: 1704067200,
+  },
+  {
+    id: "gpt-image-2.6-flare",
+    displayName: "GPT Image 2.6 Flare",
+    created: 1704067200,
   },
 ] as const;
 

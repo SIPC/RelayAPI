@@ -56,6 +56,21 @@ const upstream = http.createServer(async (req, res) => {
   }
   const headers = { "content-type": "application/json", "set-cookie": "private", "anthropic-organization-id": "private-org", ...quotaHeaders };
   if (req.url.includes("count_tokens")) { res.writeHead(200, headers); res.end('{"input_tokens":12}'); return; }
+  if (req.url.endsWith("/responses") && mode === "codex-tool") {
+    // Calls the first declared tool by its (possibly shortened) upstream name.
+    res.writeHead(200, { ...headers, "content-type": "text/event-stream" });
+    const item = { type: "function_call", call_id: "call_1", name: payload.tools[0].name, arguments: "{\"q\":\"b\"}" };
+    const response = { id: "resp-tool", object: "response", model: payload.model, output: [item],
+      usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 } };
+    for (const event of [
+      { type: "response.created", response: { ...response, output: [] } },
+      { type: "response.output_item.added", output_index: 0, item: { ...item, arguments: "" } },
+      { type: "response.function_call_arguments.delta", output_index: 0, delta: item.arguments },
+      { type: "response.output_item.done", output_index: 0, item },
+      { type: "response.completed", response },
+    ]) res.write("data: " + JSON.stringify(event) + "\n\n");
+    res.end(); return;
+  }
   if (req.url.endsWith("/responses")) {
     res.writeHead(200, { ...headers, "content-type": "text/event-stream" });
     const response = { id: "resp-test", object: "response", model: payload.model,
@@ -398,6 +413,140 @@ for (const provider of ["codex", "claude"]) for (const protocol of ["chat", "res
     assert.equal(calls.length, before + 1);
   });
 }
+for (const stream of [false, true]) test("Claude Code over Codex, stream=" + stream + ": Messages become Codex Responses", async () => {
+  mode = "normal";
+  const { channel, key, model } = setup("codex");
+  const longTool = "mcp__" + "server_".repeat(10) + "lookup";
+  const longId = "toolu_" + "x".repeat(80);
+  const claudeSignature = "EqQBCkYIBxgCKkA" + "a".repeat(40);
+  const codexSignature = "gAAAAABsynthetic-codex-reasoning";
+  const sessionId = "30000000-0000-4000-8000-000000000003";
+  const payload = {
+    model, stream, max_tokens: 2048,
+    system: [{ type: "text", text: "x-anthropic-billing-header: cc_version=2" }, { type: "text", text: system }],
+    thinking: { type: "enabled", budget_tokens: 2000 },
+    tools: [{ name: longTool, description: "Look up", input_schema: { $schema: "https://json-schema.org/draft/2020-12/schema", type: "object" } },
+      { type: "web_search_20250305", name: "web_search" }],
+    tool_choice: { type: "tool", name: longTool },
+    messages: [
+      { role: "user", content: "Hi" },
+      { role: "assistant", content: [
+        { type: "thinking", thinking: "from claude", signature: claudeSignature },
+        { type: "thinking", thinking: "from codex", signature: codexSignature },
+        { type: "tool_use", id: longId, name: longTool, input: { q: "a" } },
+      ] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: longId, content: "found" }] },
+    ],
+  };
+  const response = await handleClaudeMessages(request(key, payload, "/v1/messages",
+    { "x-api-key": key.key, "x-claude-code-session-id": sessionId }));
+  assert.equal(response.status, 200);
+  assertQuota(response, "codex");
+  const body = await response.text();
+  if (stream) {
+    const events = body.split("\n").filter(line => line.startsWith("data: ")).map(line => JSON.parse(line.slice(6)));
+    assert.equal(events[0].type, "message_start");
+    assert.ok(events.filter(event => event.delta?.type === "text_delta").map(event => event.delta.text).join(""));
+    assert.equal(events.at(-2).usage.input_tokens, 10);
+    assert.equal(events.at(-1).type, "message_stop");
+  } else {
+    const message = JSON.parse(body);
+    assert.equal(message.type, "message");
+    assert.equal(message.content[0].type, "text");
+    assert.equal(message.usage.input_tokens, 10);
+  }
+  const call = calls.at(-1);
+  assert.equal(call.path, "/backend-api/codex/responses");
+  const upstreamPayload = call.payload;
+  // Claude Code's attribution block is dropped; the real system prompt becomes a developer message.
+  assert.deepEqual(upstreamPayload.input[0], { type: "message", role: "developer", content: [{ type: "input_text", text: system }] });
+  // Only the Codex-issued reasoning signature is replayed.
+  const reasoning = upstreamPayload.input.filter(item => item.type === "reasoning");
+  assert.deepEqual(reasoning.map(item => item.encrypted_content), [codexSignature]);
+  const toolCall = upstreamPayload.input.find(item => item.type === "function_call");
+  const toolOutput = upstreamPayload.input.find(item => item.type === "function_call_output");
+  assert.ok(toolCall.name.length <= 64 && toolCall.call_id.length <= 64);
+  assert.equal(toolOutput.call_id, toolCall.call_id);
+  assert.equal(upstreamPayload.tools[0].name, toolCall.name);
+  assert.deepEqual(upstreamPayload.tools[0].parameters, { type: "object", properties: {} });
+  assert.equal(upstreamPayload.tools[1].type, "web_search");
+  assert.deepEqual(upstreamPayload.tool_choice, { type: "function", name: toolCall.name });
+  assert.equal(upstreamPayload.reasoning.effort, "medium");
+  assert.equal(upstreamPayload.max_output_tokens, undefined);
+  // One Claude Code session keeps one Codex prompt cache, independent of the Relay key.
+  const otherKey = createApiKey({ channelAllowlist: [channel.id], modelAllowlist: [model] });
+  await (await handleClaudeMessages(request(otherKey, { model, messages: [{ role: "user", content: "Again" }] }, "/v1/messages",
+    { "x-claude-code-session-id": sessionId }))).text();
+  assert.equal(calls.at(-1).payload.prompt_cache_key, upstreamPayload.prompt_cache_key);
+  assert.equal(log(channel).request_type, "claude.messages.codex");
+});
+
+for (const stream of [false, true]) test("Claude Code over Codex, stream=" + stream + ": shortened tool names map back", async () => {
+  mode = "codex-tool";
+  const { key, model } = setup("codex");
+  const longTool = "mcp__" + "server_".repeat(10) + "lookup";
+  const response = await handleClaudeMessages(request(key, {
+    model, stream, tools: [{ name: longTool, input_schema: { type: "object" } }],
+    messages: [{ role: "user", content: "Look it up" }],
+  }, "/v1/messages"));
+  assert.equal(response.status, 200);
+  assert.notEqual(calls.at(-1).payload.tools[0].name, longTool);
+  const body = await response.text();
+  if (stream) {
+    const events = body.split("\n").filter(line => line.startsWith("data: ")).map(line => JSON.parse(line.slice(6)));
+    const start = events.find(event => event.content_block?.type === "tool_use");
+    assert.equal(start.content_block.name, longTool);
+    assert.equal(events.find(event => event.delta?.type === "input_json_delta").delta.partial_json, "{\"q\":\"b\"}");
+    assert.equal(events.at(-2).delta.stop_reason, "tool_use");
+  } else {
+    const message = JSON.parse(body);
+    assert.deepEqual(message.content, [{ type: "tool_use", id: "call_1", name: longTool, input: { q: "b" } }]);
+    assert.equal(message.stop_reason, "tool_use");
+  }
+});
+
+test("Claude Code over Codex: count_tokens is computed locally from the converted request", async () => {
+  mode = "normal";
+  const { key, model } = setup("codex");
+  const longTool = "mcp__" + "server_".repeat(10) + "lookup";
+  const before = calls.length;
+  // Count tokens locally without calling Codex.
+  const counted = await handleClaudeCountTokens(request(key, {
+    model, system, tools: [{ name: longTool, input_schema: { type: "object", properties: { q: { type: "string" } } } }],
+    messages: [{ role: "user", content: "Hello there" }],
+  }, "/v1/messages/count_tokens"));
+  assert.equal(counted.status, 200);
+  const { input_tokens: tokens } = await counted.json();
+  assert.equal(calls.length, before);
+  assert.ok(tokens > 10 && tokens < 80, String(tokens));
+  const shorter = await handleClaudeCountTokens(request(key, { model, messages: [{ role: "user", content: "Hello there" }] },
+    "/v1/messages/count_tokens"));
+  assert.ok((await shorter.json()).input_tokens < tokens);
+});
+
+test("Errors raised after routing still log the selected channel account", async () => {
+  mode = "normal";
+  const id = "synthetic-expired-" + randomUUID();
+  upsertCodexCredential({ id, email: "expired@example.invalid", accountId, planType: "plus",
+    tokens: { access_token: "synthetic-codex", expired: "2000-01-01T00:00:00Z" } });
+  const channel = createChannel({ provider: "codex", credentialId: id, baseUrl: baseUrl + "/backend-api/codex", modelAllowlist: ["gpt-6.1-sol"] });
+  const key = createApiKey({ channelAllowlist: [channel.id], modelAllowlist: ["gpt-6.1-sol"] });
+  const before = calls.length;
+  for (const [handler, url, payload] of [
+    [handleChatCompletions, "/v1/chat/completions", { model: "gpt-6.1-sol", messages: [{ role: "user", content: "Hi" }] }],
+    [handleClaudeMessages, "/v1/messages", { model: "gpt-6.1-sol", messages: [{ role: "user", content: "Hi" }] }],
+  ]) {
+    const response = await handler(request(key, payload, url));
+    assert.equal(response.status, 503, url);
+    await response.text();
+    const row = log(channel);
+    assert.equal(row.error_code, "codex_token_expired", url);
+    assert.equal(row.credential_id, id, url);
+    assert.equal(row.credential_email, "expired@example.invalid", url);
+  }
+  assert.equal(calls.length, before);
+});
+
 for (const stream of [false, true]) test("Native Claude stream=" + stream + ": quota survives upstream 429", async () => {
   mode = "rate-limited";
   const { key, model } = setup("claude");

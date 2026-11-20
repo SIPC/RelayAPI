@@ -28,6 +28,10 @@ const imageModels = [
   "gpt-image-2.5-flare",
   "gpt-image-2.5-sunburst-2026-09-08",
   "gpt-image-2.5-flare-2026-09-08",
+  "gpt-image-2.5",
+  "gpt-image-2.6",
+  "gpt-image-2.6-sunburst",
+  "gpt-image-2.6-flare",
 ];
 const imageUrl = "data:image/png;base64,aW1hZ2U=";
 
@@ -89,7 +93,7 @@ test("default, prefixed routing and non-stream payloads", () => {
 });
 
 test("invalid requests fail before contacting upstream", () => {
-  for (const model of ["gpt-6.1-sol", "gpt-image-2.5-unknown", "gpt-image-2.5"]) {
+  for (const model of ["gpt-6.1-sol", "gpt-image-2.5-unknown", "gpt-image-2.6-unknown"]) {
     assert.throws(() => buildImagesGenerationsRequest({ model, prompt: "Draw" }),
       { status: 400, code: "unsupported_image_model" });
   }
@@ -145,25 +149,28 @@ function frame(prefix, kind, data) {
   return "event: " + prefix + "." + kind + "\r\ndata: "
     + JSON.stringify({ type: prefix + "." + kind, ...data }) + "\r\n\r\n";
 }
-for (const streamPrefix of ["image_generation", "image_edit"]) {
-  for (const responseFormat of ["b64_json", "url"]) {
-    test(streamPrefix + ": chunked native SSE, " + responseFormat, async () => {
-      const upstream = frame(streamPrefix, "partial_image", { b64_json: "cGFydGlhbA==" })
-        + frame(streamPrefix, "completed", { b64_json: "aW1hZ2U=", output_format: "webp" })
-        + frame(streamPrefix, "completed", { b64_json: "c2Vjb25k", output_format: "webp" })
-        + "data: [DONE]\r\n\r\n";
-      let completed = 0;
-      const text = await new Response(createImagesSseStream(chunked(upstream), {
-        responseFormat, streamPrefix, requestedModel: imageModels[1],
-        onCompleted() { completed++; }, onError(error) { assert.fail(error); },
-      })).text();
-      assert.equal(completed, 1);
-      assert.equal((text.match(/event: .*\.completed/g) || []).length, 2);
-      assert.ok(text.includes("[DONE]"));
-      assert.ok(text.includes(responseFormat === "url"
-        ? "data:image/webp;base64,aW1hZ2U=" : '"b64_json":"aW1hZ2U="'));
-      assert.ok(!text.includes("response.completed"));
-    });
+for (const model of imageModels) {
+  for (const streamPrefix of ["image_generation", "image_edit"]) {
+    for (const responseFormat of ["b64_json", "url"]) {
+      test(model + ": " + streamPrefix + ": chunked native SSE, " + responseFormat, async () => {
+        const upstream = frame(streamPrefix, "partial_image", { b64_json: "cGFydGlhbA==" })
+          + frame(streamPrefix, "completed", { model, b64_json: "aW1hZ2U=", output_format: "webp" })
+          + frame(streamPrefix, "completed", { model, b64_json: "c2Vjb25k", output_format: "webp" })
+          + "data: [DONE]\r\n\r\n";
+        let completed = 0;
+        const text = await new Response(createImagesSseStream(chunked(upstream), {
+          responseFormat, streamPrefix, requestedModel: model,
+          onCompleted() { completed++; }, onError(error) { assert.fail(error); },
+        })).text();
+        assert.equal(completed, 1);
+        assert.equal((text.match(/event: .*\.completed/g) || []).length, 2);
+        assert.ok(text.includes("[DONE]"));
+        assert.ok(text.includes(responseFormat === "url"
+          ? "data:image/webp;base64,aW1hZ2U=" : '"b64_json":"aW1hZ2U="'));
+        assert.ok(text.includes('"model":"' + model + '"'));
+        assert.ok(!text.includes("response.completed"));
+      });
+    }
   }
 }
 test("native errors, truncated streams and explicit downgrades never log success", async () => {
@@ -215,9 +222,11 @@ for (const remote of [false, true]) {
         assert.equal(ids.length, new Set(ids).size);
       }
     }
-    const allowed = await createModelsResponse({
-      openAICompatible: true, modelAllowlist: ["gpt-image-2.5-flare"],
-    });
-    assert.deepEqual(allowed.data.map((entry) => entry.id), ["gpt-image-2.5-flare"]);
+    for (const model of imageModels) {
+      const allowed = await createModelsResponse({
+        openAICompatible: true, modelAllowlist: [model],
+      });
+      assert.deepEqual(allowed.data.map((entry) => entry.id), [model]);
+    }
   });
 }

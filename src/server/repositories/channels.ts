@@ -5,6 +5,7 @@ import type {
   ChannelProvider,
   ChannelRecord,
   ChannelStatus,
+  UpstreamOperation,
 } from "@/src/shared/types/entities";
 import { jsonStringify, safeJsonParse } from "@/src/server/services/crypto";
 
@@ -18,6 +19,7 @@ type ChannelRow = {
   priority: number;
   weight: number;
   model_allowlist_json: string;
+  capabilities_json: string;
   status: string;
   health_score: number;
   cooldown_until: string | null;
@@ -38,6 +40,7 @@ export interface SaveChannelInput {
   priority: number;
   weight: number;
   modelAllowlist: string[];
+  capabilities?: UpstreamOperation[];
   status?: ChannelStatus;
 }
 
@@ -89,8 +92,8 @@ export function insertChannel(input: SaveChannelInput) {
     .prepare(
       `INSERT INTO channels (
         id, name, provider, base_url, credential_id, enabled, priority,
-        weight, model_allowlist_json, status, health_score, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 100, ?, ?)`,
+        weight, model_allowlist_json, capabilities_json, status, health_score, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 100, ?, ?)`,
     )
     .run(
       input.id,
@@ -102,6 +105,7 @@ export function insertChannel(input: SaveChannelInput) {
       input.priority,
       input.weight,
       jsonStringify(input.modelAllowlist),
+      jsonStringify(input.capabilities ?? defaultChannelCapabilities(input.provider)),
       input.status || "healthy",
       now,
       now,
@@ -123,6 +127,7 @@ export function updateChannel(
       | "priority"
       | "weight"
       | "modelAllowlist"
+      | "capabilities"
       | "status"
       | "healthScore"
       | "cooldownUntil"
@@ -152,7 +157,7 @@ export function updateChannel(
     .prepare(
       `UPDATE channels SET
         name = ?, base_url = ?, credential_id = ?, enabled = ?,
-        priority = ?, weight = ?, model_allowlist_json = ?, status = ?,
+        priority = ?, weight = ?, model_allowlist_json = ?, capabilities_json = ?, status = ?,
         health_score = ?, cooldown_until = ?, last_error = ?,
         last_used_at = ?, updated_at = ?
       WHERE id = ?`,
@@ -165,6 +170,7 @@ export function updateChannel(
       next.priority,
       next.weight,
       jsonStringify(next.modelAllowlist),
+      jsonStringify(next.capabilities),
       next.status,
       next.healthScore,
       next.cooldownUntil,
@@ -286,6 +292,10 @@ function toChannelRecord(
     priority: row.priority,
     weight: row.weight,
     modelAllowlist: safeJsonParse<string[]>(row.model_allowlist_json, []),
+    capabilities: safeJsonParse<UpstreamOperation[]>(
+      row.capabilities_json,
+      defaultChannelCapabilities(normalizeProvider(row.provider)),
+    ),
     status: normalizeStatus(row.status),
     healthScore: row.health_score,
     cooldownUntil: row.cooldown_until,
@@ -316,8 +326,23 @@ function cleanUniqueStrings(values: unknown[]) {
   ];
 }
 
+export const CHANNEL_SUPPORTED_CAPABILITIES: Record<ChannelProvider, readonly UpstreamOperation[]> = {
+  codex: ["chat", "responses", "images_generations", "images_edits"],
+  claude: ["chat", "responses", "messages", "count_tokens"],
+  openai: ["chat", "responses", "images_generations", "images_edits"],
+  anthropic: ["messages", "count_tokens"],
+  antigravity: ["chat", "responses", "messages", "count_tokens"],
+};
+
+export function defaultChannelCapabilities(provider: ChannelProvider): UpstreamOperation[] {
+  return [...CHANNEL_SUPPORTED_CAPABILITIES[provider]];
+}
+
 function normalizeProvider(value: string): ChannelProvider {
-  return value === "claude" ? "claude" : "codex";
+  if (value === "codex" || value === "claude" || value === "openai" || value === "anthropic" || value === "antigravity") {
+    return value;
+  }
+  throw new Error("Unsupported channel provider");
 }
 
 function normalizeStatus(value: string): ChannelStatus {

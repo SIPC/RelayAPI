@@ -1,5 +1,8 @@
 import type {
   AdminOverviewStats,
+  AntigravityCredentialRecord,
+  AntigravityQuotaReport,
+  ApiUpstreamProvider,
   ChannelRecord,
   ClaudeCredentialRecord,
   ClaudeQuotaReport as SharedClaudeQuotaReport,
@@ -11,9 +14,12 @@ import type {
   GlobalSettingsRecord,
   JsonValue,
   ProxyPoolRecord,
+  UpstreamCredentialRecord,
+  UpstreamOperation,
 } from "@/src/shared/types/entities";
 
 export type ClaudeQuotaReport = SharedClaudeQuotaReport;
+export type { AntigravityQuotaReport };
 
 export type AdminListResponse<T> = {
   object: "list";
@@ -166,6 +172,18 @@ export type ProxyPoolPayload = {
   notes?: string;
 };
 
+export type UpstreamCredentialPayload = {
+  name?: string;
+  provider?: ApiUpstreamProvider;
+  apiKey?: string;
+  enabled?: boolean;
+  priority?: number;
+  weight?: number;
+  useGlobalProxy?: boolean;
+  proxyPoolId?: string | null;
+  proxy?: CredentialProxyPayload;
+};
+
 export type ChannelPayload = {
   provider?: ChannelRecord["provider"];
   name?: string;
@@ -176,6 +194,7 @@ export type ChannelPayload = {
   priority?: number;
   weight?: number;
   modelAllowlist?: string[];
+  capabilities?: UpstreamOperation[];
   status?: ChannelRecord["status"];
   healthScore?: number;
   cooldownUntil?: string | null;
@@ -240,6 +259,8 @@ export type AdminDashboardSnapshot = {
   channels: ChannelRecord[];
   credentials: CodexCredentialRecord[];
   claudeCredentials: ClaudeCredentialRecord[];
+  antigravityCredentials: AntigravityCredentialRecord[];
+  upstreamCredentials: UpstreamCredentialRecord[];
   proxyPool: ProxyPoolRecord[];
   globalSettings: GlobalSettingsRecord;
   requestLogs: AdminDashboardRequestLogRow[];
@@ -399,6 +420,35 @@ export function downloadCredentialsExport(id?: string) {
   return downloadAdminFile(path);
 }
 
+export function listUpstreamCredentials() {
+  return adminRequest<AdminListResponse<UpstreamCredentialRecord>>(
+    "/api/admin/upstream-credentials",
+  ).then((result) => result.data);
+}
+
+export function createUpstreamCredential(
+  payload: UpstreamCredentialPayload & { provider: ApiUpstreamProvider; apiKey: string },
+) {
+  return adminRequest<UpstreamCredentialRecord>("/api/admin/upstream-credentials", {
+    method: "POST",
+    body: payload,
+  });
+}
+
+export function updateUpstreamCredential(id: string, payload: UpstreamCredentialPayload) {
+  return adminRequest<UpstreamCredentialRecord>(
+    `/api/admin/upstream-credentials/${encodePath(id)}`,
+    { method: "PATCH", body: payload },
+  );
+}
+
+export function deleteUpstreamCredential(id: string) {
+  return adminRequest<AdminDeleteResponse>(
+    `/api/admin/upstream-credentials/${encodePath(id)}`,
+    { method: "DELETE" },
+  );
+}
+
 export function listClaudeCredentials() {
   return adminRequest<ClaudeCredentialRecord[]>(
     "/api/admin/claude/credentials",
@@ -484,6 +534,50 @@ export function finishClaudeOAuth(callbackUrl: string) {
       method: "POST",
       body: { callbackUrl },
     },
+  );
+}
+
+export function listAntigravityCredentials() {
+  return adminRequest<AntigravityCredentialRecord[]>("/api/admin/antigravity/credentials");
+}
+
+export function startAntigravityOAuth() {
+  return adminRequest<OAuthStartResponse>("/api/admin/antigravity/credentials/oauth/start", { method: "POST" });
+}
+
+export function finishAntigravityOAuth(callbackUrl: string) {
+  return adminRequest<AntigravityCredentialRecord>("/api/admin/antigravity/credentials/oauth/callback", {
+    method: "POST", body: { callbackUrl },
+  });
+}
+
+export function updateAntigravityCredential(id: string, payload: { enabled?: boolean; priority?: number; weight?: number }) {
+  return adminRequest<AntigravityCredentialRecord>(
+    `/api/admin/antigravity/credentials/${encodePath(id)}`, { method: "PATCH", body: payload },
+  );
+}
+
+export function deleteAntigravityCredential(id: string) {
+  return adminRequest<AdminDeleteResponse>(
+    `/api/admin/antigravity/credentials/${encodePath(id)}`, { method: "DELETE" },
+  );
+}
+
+export function resetAntigravityCredentialHealth(id: string) {
+  return adminRequest<AntigravityCredentialRecord>(
+    `/api/admin/antigravity/credentials/${encodePath(id)}/health`, { method: "POST" },
+  );
+}
+
+export function getAntigravityCredentialQuota(id: string) {
+  return adminRequest<AntigravityQuotaReport>(
+    `/api/admin/antigravity/credentials/${encodePath(id)}/quota`,
+  );
+}
+
+export function refreshAntigravityCredential(id: string) {
+  return adminRequest<AntigravityCredentialRecord>(
+    `/api/admin/antigravity/credentials/${encodePath(id)}`, { method: "POST" },
   );
 }
 
@@ -636,6 +730,8 @@ export async function getDashboardSnapshot(
     channels,
     credentials,
     claudeCredentials,
+    antigravityCredentials,
+    upstreamCredentials,
     proxyPool,
     globalSettings,
     requestLogs,
@@ -645,6 +741,8 @@ export async function getDashboardSnapshot(
     listChannels(),
     listCredentials(),
     listClaudeCredentials(),
+    listAntigravityCredentials(),
+    listUpstreamCredentials(),
     listProxyPoolItems(),
     getGlobalSettings(),
     getRequestLogs(requestLogLimit),
@@ -656,6 +754,8 @@ export async function getDashboardSnapshot(
     channels,
     credentials,
     claudeCredentials,
+    antigravityCredentials,
+    upstreamCredentials,
     proxyPool,
     globalSettings,
     requestLogs,

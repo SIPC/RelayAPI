@@ -5,7 +5,7 @@ import { isAccountQuotaHeader } from "@/src/server/http/accountQuota";
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Authorization, Content-Type, X-API-Key, OpenAI-API-Key, X-Requested-With",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, X-API-Key, OpenAI-API-Key, X-Requested-With, Anthropic-Version, Anthropic-Beta",
   "Access-Control-Max-Age": "86400",
 } as const;
 
@@ -30,7 +30,9 @@ export function addCorsHeaders(response: Response) {
   }
   const exposed = new Set((headers.get("Access-Control-Expose-Headers") || "")
     .split(",").map((name) => name.trim()).filter(Boolean));
-  for (const name of headers.keys()) if (isAccountQuotaHeader(name)) exposed.add(name);
+  for (const name of headers.keys()) {
+    if (isAccountQuotaHeader(name) || ["request-id", "x-request-id", "retry-after"].includes(name)) exposed.add(name);
+  }
   if (exposed.size) headers.set("Access-Control-Expose-Headers", [...exposed].join(", "));
   return new Response(response.body, {
     status: response.status,

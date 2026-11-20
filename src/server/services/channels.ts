@@ -9,9 +9,22 @@ import type {
   RelayApiKeyContext,
   RoutableCredentialRecord,
   RoutableCredentialWithTokens,
+  SelectedChannel,
+  UpstreamOperation,
 } from "@/src/shared/types/entities";
 import { claudeModelAllowlistCandidates } from "@/src/server/claude/modelSuffix";
+import { isClaudeModel } from "@/src/server/claude/chat";
+import { isCodexImageModel } from "@/src/server/codex/imageModels";
+import { ANTIGRAVITY_BASE_URL, isAntigravityGeminiModel, isAntigravityModelId } from "@/src/server/antigravity/protocol";
 import {
+  getAntigravityCredentialWithTokens,
+  listAntigravityCredentials,
+  markAntigravityCredentialUsed,
+  updateAntigravityCredentialHealth,
+} from "@/src/server/repositories/antigravityCredentials";
+import {
+  CHANNEL_SUPPORTED_CAPABILITIES,
+  defaultChannelCapabilities,
   deleteChannel,
   getChannelById,
   insertChannel,
@@ -31,6 +44,12 @@ import {
   markClaudeCredentialUsed,
   updateClaudeCredential,
 } from "@/src/server/repositories/claudeCredentials";
+import {
+  getUpstreamCredentialWithSecret,
+  listUpstreamCredentials,
+  markUpstreamCredentialUsed,
+  updateUpstreamCredential,
+} from "@/src/server/repositories/upstreamCredentials";
 import {
   appendChannelHealthEvent,
   channelUsageHealth,
@@ -60,6 +79,7 @@ export interface CreateChannelInput {
   priority?: number;
   weight?: number;
   modelAllowlist?: string[];
+  capabilities?: UpstreamOperation[];
 }
 
 export function listChannelRecords() {
@@ -76,20 +96,22 @@ export function createChannel(input: CreateChannelInput) {
   const provider = normalizeChannelProvider(input.provider);
   const credentials = assertChannelCredentials(provider, input);
   const primaryCredential = credentials[0];
+  const credentialLabel = "name" in primaryCredential ? primaryCredential.name : primaryCredential.email;
   const channel = insertChannel({
     id: randomId("ch"),
     name:
       cleanString(input.name) ||
-      (primaryCredential.email
-        ? `${providerLabel(provider)} · ${primaryCredential.email}`
+      (credentialLabel
+        ? `${providerLabel(provider)} · ${credentialLabel}`
         : `${providerLabel(provider)} · ${primaryCredential.id}`),
     provider,
-    baseUrl: cleanString(input.baseUrl) || defaultBaseUrl(provider),
+    baseUrl: normalizeBaseUrl(input.baseUrl, provider),
     credentialIds: credentials.map((credential) => credential.id),
-    enabled: input.enabled ?? true,
+    enabled: input.enabled ?? !isApiProvider(provider),
     priority: normalizeInteger(input.priority, 100),
     weight: Math.max(1, normalizeInteger(input.weight, 1)),
-    modelAllowlist: cleanStringArray(input.modelAllowlist),
+    modelAllowlist: normalizeModelAllowlist(provider, input.modelAllowlist),
+    capabilities: normalizeCapabilities(provider, input.capabilities),
     status: "healthy",
   });
   if (!channel) {
@@ -129,8 +151,7 @@ export function patchChannel(
     ...(input.name !== undefined ? { name: cleanString(input.name) } : {}),
     ...(input.baseUrl !== undefined
       ? {
-          baseUrl:
-            cleanString(input.baseUrl) || defaultBaseUrl(existing.provider),
+          baseUrl: normalizeBaseUrl(input.baseUrl, existing.provider),
         }
       : {}),
     ...credentialPatch,
@@ -142,7 +163,10 @@ export function patchChannel(
       ? { weight: Math.max(1, normalizeInteger(input.weight, 1)) }
       : {}),
     ...(input.modelAllowlist !== undefined
-      ? { modelAllowlist: cleanStringArray(input.modelAllowlist) }
+      ? { modelAllowlist: normalizeModelAllowlist(existing.provider, input.modelAllowlist) }
+      : {}),
+    ...(input.capabilities !== undefined
+      ? { capabilities: normalizeCapabilities(existing.provider, input.capabilities) }
       : {}),
     ...(input.status !== undefined ? { status: input.status } : {}),
     ...(input.healthScore !== undefined
@@ -179,7 +203,8 @@ export function selectChannel(input: {
   model: string;
   apiKey: RelayApiKeyContext;
 }) {
-  const provider = normalizeChannelProvider(input.provider);
+  // This legacy entry point intentionally remains OAuth-only, including raw Codex requests.
+  const provider = input.provider === "claude" ? "claude" : "codex";
   const model = cleanString(input.model);
   const modelCandidates = modelAllowlistCandidates(provider, model);
   if (
@@ -246,6 +271,95 @@ export function selectChannel(input: {
   return { channel, credential };
 }
 
+export function selectChannelForRequest(input: {
+  operation: UpstreamOperation;
+  model: string;
+  apiKey: RelayApiKeyContext;
+  // Antigravity failover reselects only Antigravity channels and skips credentials already tried.
+  provider?: ChannelProvider;
+  excludeCredentialIds?: string[];
+}): SelectedChannel {
+  const model = cleanString(input.model);
+  // Antigravity serves Gemini, Claude and GPT-OSS IDs listed on its channels; Gemini IDs exist nowhere else.
+  const oauthProvider = isAntigravityGeminiModel(model) ? "antigravity" : isClaudeModel(model) ? "claude" : "codex";
+  const oauthModelCandidates = modelAllowlistCandidates(oauthProvider, model);
+  if (input.apiKey.modelAllowlist.length > 0 && model &&
+    !modelMatchesAllowlist(oauthModelCandidates, input.apiKey.modelAllowlist)) {
+    throw new HttpError(403, "model_not_allowed", `API key is not allowed to use model: ${model}`);
+  }
+  const now = Date.now();
+  // All request constraints are applied before any weighted selection or secret lookup.
+  const channels = listChannelRecords().filter((channel) => {
+    if (!supportsOperation(channel, input.operation)) return false;
+    if (input.provider && channel.provider !== input.provider) return false;
+    const api = isApiProvider(channel.provider);
+    if (api) {
+      if (!input.apiKey.channelAllowlist.includes(channel.id) ||
+        channel.modelAllowlist.length === 0 || !channel.modelAllowlist.includes(model)) return false;
+      if (input.apiKey.modelAllowlist.length > 0 && !input.apiKey.modelAllowlist.includes(model)) return false;
+    } else if (channel.provider === "antigravity") {
+      // An empty allowlist means every model in the bound accounts' catalogs, like empty OAuth allowlists.
+      if (!isAntigravityModelId(model) ||
+        (channel.modelAllowlist.length > 0 && !channel.modelAllowlist.includes(model))) return false;
+    } else {
+      if (channel.provider !== oauthProvider) return false;
+      if ((input.operation === "images_generations" || input.operation === "images_edits") &&
+        (channel.provider !== "codex" || !isCodexImageModel(model))) return false;
+    }
+    return isChannelAvailable(channel, input.apiKey, model,
+      api ? [model] : oauthModelCandidates, now);
+  });
+  const maps = new Map<ChannelProvider, Map<string, CredentialRoutingRecord>>();
+  for (const provider of new Set(channels.map((channel) => channel.provider))) {
+    maps.set(provider, credentialRoutingMap(provider,
+      channels.filter((channel) => channel.provider === provider).flatMap((channel) => channel.credentialIds)));
+  }
+  const excluded = new Set(input.excludeCredentialIds ?? []);
+  const candidates = channels.flatMap((channel) => {
+    const credentials = availableCredentialsForChannel(channel, maps.get(channel.provider)!, now)
+      .filter((credential) => !excluded.has(credential.id) && antigravityServesModel(credential, model, now,
+        channel.modelAllowlist.length === 0 && !isAntigravityGeminiModel(model)));
+    return credentials.length ? [{ channel, credentials }] : [];
+  });
+  if (!candidates.length) {
+    throw new HttpError(503, "no_available_channel", "No usable channel is available for this request");
+  }
+  const selected = selectRoutingItem(candidates,
+    (candidate) => candidate.channel.priority,
+    (candidate) => candidate.channel.weight,
+    (candidate) => usageHealthScore(candidate.channel.usageHealth));
+  const selectedCredential = selectRoutingItem(selected.credentials,
+    (credential) => credential.priority, (credential) => credential.weight,
+    (credential) => usageHealthScore(credential.usageHealth));
+  const credential = getCredentialWithTokens(selected.channel.provider, selectedCredential.id);
+  if (!credential) throw new HttpError(503, "upstream_credential_not_found", "Selected channel credential was not found");
+  const channel = { ...selected.channel, credentialId: credential.id };
+  markChannelUsed(channel.id);
+  markCredentialUsed(channel.provider, credential.id);
+  return { channel, credential };
+}
+
+// Antigravity cools a model per credential and skips credentials whose catalog lacks the model, as in CPA.
+// Claude and GPT-OSS IDs also exist on other providers, so an empty allowlist only takes them when the catalog
+// is known to include them.
+function antigravityServesModel(credential: RoutableCredentialRecord, model: string, now: number, requireCatalog: boolean) {
+  if (credential.provider !== "antigravity") return true;
+  const cooldown = credential.modelCooldowns[model];
+  if (cooldown && Date.parse(cooldown.until) > now) return false;
+  if (!credential.models) return !requireCatalog;
+  return credential.models.includes(model.toLowerCase());
+}
+
+// Protocol conversions ride on the native capability: Anthropic Messages also serves Chat / Responses, and
+// Codex Responses also serves Claude Messages and local token counting (as CPA does for Claude Code).
+function supportsOperation(channel: ChannelRecord, operation: UpstreamOperation) {
+  return channel.capabilities.includes(operation) ||
+    (channel.provider === "anthropic" && (operation === "chat" || operation === "responses") &&
+      channel.capabilities.includes("messages")) ||
+    (channel.provider === "codex" && (operation === "messages" || operation === "count_tokens") &&
+      channel.capabilities.includes("responses"));
+}
+
 export function recordChannelSuccess(channel: ChannelRecord) {
   clearCredentialCooldown(channel.provider, channel.credentialId);
   const nextScore = clamp(channel.healthScore + 2, 0, 100);
@@ -269,6 +383,11 @@ export function recordChannelFailure(
   input: { statusCode?: number | null; message?: string | null },
 ) {
   const statusCode = input.statusCode ?? null;
+  // Antigravity rate limits cool only the requested model on the credential (see antigravity/client.ts).
+  if (channel.provider === "antigravity" && statusCode === 429) {
+    updateChannel(channel.id, { lastError: input.message || null });
+    return;
+  }
   if (isCredentialScopedFailure(statusCode)) {
     const cooldownUntil = recordCredentialFailure(
       channel.provider,
@@ -386,15 +505,7 @@ function selectCredentialForChannel(
   credentialsById: Map<string, CredentialRoutingRecord>,
   now: number,
 ) {
-  const credentials = channel.credentialIds
-    .map((credentialId) => credentialsById.get(credentialId))
-    .filter((credential): credential is CredentialRoutingRecord =>
-      Boolean(
-        credential?.enabled &&
-        (!credential.cooldownUntil ||
-          Date.parse(credential.cooldownUntil) <= now),
-      ),
-    );
+  const credentials = availableCredentialsForChannel(channel, credentialsById, now);
   if (credentials.length === 0) {
     return null;
   }
@@ -404,6 +515,23 @@ function selectCredentialForChannel(
     (credential) => credential.weight,
     (credential) => usageHealthScore(credential.usageHealth),
   );
+}
+
+function availableCredentialsForChannel(
+  channel: ChannelRecord,
+  credentialsById: Map<string, CredentialRoutingRecord>,
+  now: number,
+) {
+  return channel.credentialIds
+    .map((credentialId) => credentialsById.get(credentialId))
+    .filter((credential): credential is CredentialRoutingRecord =>
+      Boolean(
+        credential?.enabled && credential.provider === channel.provider &&
+        (!("keySet" in credential) || credential.keySet) &&
+        (!credential.cooldownUntil ||
+          Date.parse(credential.cooldownUntil) <= now),
+      ),
+    );
 }
 
 function isChannelAvailable(
@@ -542,6 +670,7 @@ function credentialUsageHealthResetMap(
 }
 
 function modelAllowlistCandidates(provider: ChannelProvider, model: string) {
+  if (isApiProvider(provider) || provider === "antigravity") return [model].filter(Boolean);
   if (provider === "claude") {
     return claudeModelAllowlistCandidates(model);
   }
@@ -579,26 +708,47 @@ function isCodexThinkingSuffix(suffix: string) {
 function listCredentials(
   provider: ChannelProvider,
 ): RoutableCredentialRecord[] {
-  return provider === "claude"
-    ? listClaudeCredentials()
-    : listCodexCredentials();
+  switch (provider) {
+    case "claude": return listClaudeCredentials();
+    case "codex": return listCodexCredentials();
+    case "antigravity": return listAntigravityCredentials();
+    case "openai":
+    case "anthropic": return listUpstreamCredentials(provider);
+  }
+}
+
+// Account label for request logs when the failing path never loaded the credential (e.g. a refresh error).
+export function credentialLogLabel(provider: ChannelProvider, id: string | null | undefined) {
+  if (!id) return "";
+  const credential = listCredentials(provider).find((item) => item.id === id);
+  if (!credential) return "";
+  return "email" in credential ? credential.email : credential.name;
 }
 
 function getCredentialWithTokens(
   provider: ChannelProvider,
   id: string,
 ): RoutableCredentialWithTokens | null {
-  return provider === "claude"
-    ? getClaudeCredentialWithTokens(id)
-    : getCodexCredentialWithTokens(id);
+  switch (provider) {
+    case "claude": return getClaudeCredentialWithTokens(id);
+    case "codex": return getCodexCredentialWithTokens(id);
+    case "antigravity": return getAntigravityCredentialWithTokens(id);
+    case "openai":
+    case "anthropic": {
+      const credential = getUpstreamCredentialWithSecret(id);
+      return credential?.provider === provider ? credential : null;
+    }
+  }
 }
 
 function markCredentialUsed(provider: ChannelProvider, id: string) {
-  if (provider === "claude") {
-    markClaudeCredentialUsed(id);
-    return;
+  switch (provider) {
+    case "claude": markClaudeCredentialUsed(id); break;
+    case "codex": markCodexCredentialUsed(id); break;
+    case "antigravity": markAntigravityCredentialUsed(id); break;
+    case "openai":
+    case "anthropic": markUpstreamCredentialUsed(id); break;
   }
-  markCodexCredentialUsed(id);
 }
 
 function updateCredential(
@@ -606,25 +756,80 @@ function updateCredential(
   id: string,
   patch: { cooldownUntil: string | null; lastError: string | null },
 ) {
-  if (provider === "claude") {
-    updateClaudeCredential(id, patch);
-    return;
+  switch (provider) {
+    case "claude": updateClaudeCredential(id, patch); break;
+    case "codex": updateCodexCredential(id, patch); break;
+    case "antigravity": updateAntigravityCredentialHealth(id, patch); break;
+    case "openai":
+    case "anthropic": updateUpstreamCredential(id, patch); break;
   }
-  updateCodexCredential(id, patch);
 }
 
 function normalizeChannelProvider(value: unknown): ChannelProvider {
-  return value === "claude" ? "claude" : "codex";
+  if (value === undefined) return "codex";
+  if (value === "codex" || value === "claude" || value === "openai" || value === "anthropic" || value === "antigravity") return value;
+  throw new HttpError(400, "invalid_channel_provider", "Unsupported channel provider");
+}
+
+function isApiProvider(provider: ChannelProvider) {
+  return provider === "openai" || provider === "anthropic";
+}
+
+function normalizeCapabilities(provider: ChannelProvider, input: unknown): UpstreamOperation[] {
+  if (input === undefined) return defaultChannelCapabilities(provider);
+  const supported = CHANNEL_SUPPORTED_CAPABILITIES[provider];
+  if (!Array.isArray(input) || input.some((value) => !supported.includes(value))) {
+    throw new HttpError(400, "invalid_channel_capabilities", "Capabilities are not supported by the channel provider");
+  }
+  return [...new Set(input)] as UpstreamOperation[];
+}
+
+function normalizeModelAllowlist(provider: ChannelProvider, input: unknown) {
+  const models = cleanStringArray(input);
+  if (provider === "antigravity" && models.some(model => !isAntigravityModelId(model))) {
+    throw new HttpError(400, "invalid_antigravity_models", "Antigravity channels accept exact Gemini, Claude or GPT-OSS model IDs");
+  }
+  if (isApiProvider(provider) && models.length === 0) {
+    throw new HttpError(400, "missing_channel_models", "API upstream channels require a non-empty model allowlist");
+  }
+  return models;
+}
+
+function normalizeBaseUrl(input: unknown, provider: ChannelProvider) {
+  const value = cleanString(input) || defaultBaseUrl(provider);
+  if (provider === "antigravity" && value.replace(/\/+$/, "") !== ANTIGRAVITY_BASE_URL) {
+    throw new HttpError(400, "invalid_antigravity_endpoint", "Antigravity credentials require the Google Antigravity endpoint");
+  }
+  let url: URL;
+  try { url = new URL(value); } catch {
+    throw new HttpError(400, "invalid_channel_base_url", "Base URL must be an HTTP(S) URL without credentials, query or fragment");
+  }
+  if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password ||
+    value.includes("?") || value.includes("#")) {
+    throw new HttpError(400, "invalid_channel_base_url", "Base URL must be an HTTP(S) URL without credentials, query or fragment");
+  }
+  // API bases already include the version path; executors append only the endpoint.
+  return url.toString().replace(/\/+$/, "");
 }
 
 function defaultBaseUrl(provider: ChannelProvider) {
-  return provider === "claude"
-    ? serverConfig.claudeBaseUrl
-    : serverConfig.codexBaseUrl;
+  switch (provider) {
+    case "claude": return serverConfig.claudeBaseUrl;
+    case "codex": return serverConfig.codexBaseUrl;
+    case "antigravity": return ANTIGRAVITY_BASE_URL;
+    case "openai": return "https://api.openai.com/v1";
+    case "anthropic": return "https://api.anthropic.com/v1";
+  }
 }
 
 function providerLabel(provider: ChannelProvider) {
-  return provider === "claude" ? "Claude" : "Codex";
+  switch (provider) {
+    case "claude": return "Claude";
+    case "codex": return "Codex";
+    case "antigravity": return "Antigravity";
+    case "openai": return "OpenAI";
+    case "anthropic": return "Anthropic";
+  }
 }
 
 function cleanString(value: unknown) {

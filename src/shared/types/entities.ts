@@ -12,7 +12,17 @@ export type ChannelStatus =
   | "cooling_down"
   | "disabled";
 
-export type ChannelProvider = "codex" | "claude";
+export type ChannelProvider = "codex" | "claude" | "antigravity" | "openai" | "anthropic";
+
+export type ApiUpstreamProvider = "openai" | "anthropic";
+
+export type UpstreamOperation =
+  | "chat"
+  | "responses"
+  | "messages"
+  | "count_tokens"
+  | "images_generations"
+  | "images_edits";
 
 export type CodexAccountUsageStatus = "normal" | "warning" | "error" | "unused";
 
@@ -186,13 +196,66 @@ export type ClaudeCredentialWithTokens = Omit<
   tokens: ClaudeTokenBundle;
 };
 
+export type AntigravityCredentialRecord = Omit<ClaudeCredentialRecord, "provider" | "userAgent"> & {
+  provider: "antigravity";
+  // Lower-case model IDs from fetchAvailableModels; null means the catalog is unknown.
+  models: string[] | null;
+  modelCooldowns: Record<string, { until: string; level: number }>;
+};
+
+export type AntigravityCredentialWithTokens = AntigravityCredentialRecord & {
+  projectId: string;
+  tokens: AntigravityTokenBundle;
+  tokenEnvelope: string;
+};
+
+export type AntigravityTokenBundle = {
+  access_token: string;
+  refresh_token: string;
+  expired: string;
+  last_refresh: string;
+};
+
+export interface UpstreamCredentialRecord {
+  id: string;
+  provider: ApiUpstreamProvider;
+  name: string;
+  keyPrefix: string;
+  keySet: boolean;
+  enabled: boolean;
+  priority: number;
+  weight: number;
+  useGlobalProxy: boolean;
+  proxyPoolId: string | null;
+  proxy: PublicCredentialProxyConfig | null;
+  usageHealth?: CodexAccountUsageHealth;
+  lastUsedAt: string | null;
+  cooldownUntil: string | null;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+  metadata: Record<string, unknown>;
+}
+
+export type UpstreamCredentialWithSecret = Omit<
+  UpstreamCredentialRecord,
+  "proxy"
+> & {
+  proxy: CredentialProxyConfig | null;
+  apiKey: string;
+};
+
 export type RoutableCredentialRecord =
   | CodexCredentialRecord
-  | ClaudeCredentialRecord;
+  | ClaudeCredentialRecord
+  | AntigravityCredentialRecord
+  | UpstreamCredentialRecord;
 
 export type RoutableCredentialWithTokens =
   | CodexCredentialWithTokens
-  | ClaudeCredentialWithTokens;
+  | ClaudeCredentialWithTokens
+  | AntigravityCredentialWithTokens
+  | UpstreamCredentialWithSecret;
 
 export interface GlobalSettingsRecord {
   proxy: PublicCredentialProxyConfig | null;
@@ -217,6 +280,7 @@ export interface ChannelRecord {
   priority: number;
   weight: number;
   modelAllowlist: string[];
+  capabilities: UpstreamOperation[];
   status: ChannelStatus;
   healthScore: number;
   usageHealth?: CodexAccountUsageHealth;
@@ -312,6 +376,30 @@ export interface ClaudeQuotaReport {
   retrieved_at: string;
   cooldown_until: string | null;
   last_error: string | null;
+  message: string;
+}
+
+// Antigravity quota mirrors retrieveUserQuotaSummary: groups of models sharing weekly and 5-hour buckets.
+export interface AntigravityQuotaBucket {
+  id: string;
+  label: string;
+  window: string;
+  remaining_percent: number | null;
+  reset_at: string | null;
+}
+
+export interface AntigravityQuotaGroup {
+  label: string;
+  description: string;
+  buckets: AntigravityQuotaBucket[];
+}
+
+export interface AntigravityQuotaReport {
+  provider: "antigravity";
+  credential_id: string;
+  status: ClaudeQuotaStatus;
+  groups: AntigravityQuotaGroup[];
+  retrieved_at: string;
   message: string;
 }
 

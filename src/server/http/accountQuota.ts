@@ -1,8 +1,9 @@
 import "server-only";
 
 import { getCodexQuotaCacheByCredentialId } from "@/src/server/repositories/quota";
+import type { ChannelProvider } from "@/src/shared/types/entities";
 
-type Provider = "codex" | "claude";
+type Provider = ChannelProvider;
 type QuotaWindow = {
   id: string;
   usedPercent?: number;
@@ -50,6 +51,17 @@ function resetAt(value: unknown, now: number, relative?: unknown) {
     return new Date(now + seconds * 1000).toISOString();
   }
 }
+function apiResetAt(value: string | null, now: number) {
+  const text = value?.trim() || "";
+  const parts = [...text.matchAll(/(\d+(?:\.\d+)?)(ms|s|m|h|d)/g)];
+  if (parts.length && parts.map((part) => part[0]).join("") === text) {
+    const units: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+    const reset = now + parts.reduce((total, part) => total + Number(part[1]) * units[part[2]], 0);
+    if (Number.isFinite(new Date(reset).getTime())) return new Date(reset).toISOString();
+    return;
+  }
+  return resetAt(value, now);
+}
 function normalizeId(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-").slice(0, 64);
 }
@@ -77,7 +89,7 @@ export function parseAccountQuotaHeaders(provider: Provider, headers: Headers, n
       });
     }
   } else {
-    for (const id of ["5h", "7d"]) {
+    for (const id of provider === "claude" ? ["5h", "7d"] : []) {
       const prefix = "anthropic-ratelimit-unified-" + id;
       const utilization = number(headers.get(prefix + "-utilization"));
       const status = headers.get(prefix + "-status") || undefined;
@@ -90,13 +102,13 @@ export function parseAccountQuotaHeaders(provider: Provider, headers: Headers, n
     for (const metric of ["requests", "tokens", "input-tokens", "output-tokens", "cache-read-input-tokens", "cache-creation-input-tokens"]) {
       if (windows.length >= MAX_WINDOWS) break;
       const prefix = "anthropic-ratelimit-" + metric;
-      const limit = number(headers.get(prefix + "-limit") ?? headers.get("x-ratelimit-limit-" + metric));
-      const remaining = number(headers.get(prefix + "-remaining") ?? headers.get("x-ratelimit-remaining-" + metric));
+      const limit = number((provider === "openai" ? null : headers.get(prefix + "-limit")) ?? headers.get("x-ratelimit-limit-" + metric));
+      const remaining = number((provider === "openai" ? null : headers.get(prefix + "-remaining")) ?? headers.get("x-ratelimit-remaining-" + metric));
       if (limit === undefined && remaining === undefined) continue;
       const used = limit && remaining !== undefined ? Math.min(100, Math.max(0, (1 - remaining / limit) * 100)) : undefined;
       windows.push({ id: metric, limit, remaining, usedPercent: used,
         remainingPercent: used === undefined ? undefined : 100 - used,
-        resetAt: resetAt(headers.get(prefix + "-reset") ?? headers.get("x-ratelimit-reset-" + metric), now) });
+        resetAt: apiResetAt((provider === "openai" ? null : headers.get(prefix + "-reset")) ?? headers.get("x-ratelimit-reset-" + metric), now) });
     }
   }
   return { observedAt: now, windows, raw };

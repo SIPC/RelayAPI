@@ -29,6 +29,8 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
+import { UpstreamCredentialsPanel } from "@/components/upstream-credentials-panel";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -101,6 +103,7 @@ import {
   deleteProxyPoolItem,
   downloadClaudeCredentialsExport,
   downloadCredentialsExport,
+  finishAntigravityOAuth,
   finishClaudeOAuth,
   finishCodexOAuth,
   getClaudeCredentialQuota,
@@ -111,16 +114,24 @@ import {
   getRequestLogsPage,
   importClaudeCredentialJson,
   importCredentialJson,
+  listAntigravityCredentials,
   listChannels,
   listClaudeCredentials,
   listCredentials,
   listProxyPoolItems,
+  listUpstreamCredentials,
   logoutWebSession,
   pruneRequestLogs,
+  refreshAntigravityCredential,
+  getAntigravityCredentialQuota,
+  resetAntigravityCredentialHealth,
+  updateAntigravityCredential,
+  deleteAntigravityCredential,
   refreshClaudeCredential,
   refreshCredential,
   resetClaudeCredentialHealth,
   resetCredentialHealth,
+  startAntigravityOAuth,
   startClaudeOAuth,
   startCodexOAuth,
   updateGlobalSettings,
@@ -133,6 +144,7 @@ import {
   type AdminDashboardRequestLogRow,
   type ApiKeyPayload,
   type ChannelPayload,
+  type AntigravityQuotaReport,
   type ClaudeQuotaReport,
   type CodexQuotaReport,
   type OAuthStartResponse,
@@ -142,6 +154,7 @@ import {
 } from "@/lib/admin-api";
 import type {
   AdminOverviewStats,
+  AntigravityCredentialRecord,
   ApiKeyUsageStatsRow,
   ChannelRecord,
   ChannelStatus,
@@ -153,7 +166,10 @@ import type {
   GlobalSettingsRecord,
   ProxyPoolRecord,
   PublicApiKey,
+  RoutableCredentialRecord,
   UsageStatsRow,
+  UpstreamCredentialRecord,
+  UpstreamOperation,
 } from "@/src/shared/types/entities";
 
 type AdminDashboardProps = {
@@ -161,6 +177,8 @@ type AdminDashboardProps = {
   initialChannels: ChannelRecord[];
   initialCredentials: CodexCredentialRecord[];
   initialClaudeCredentials: ClaudeCredentialRecord[];
+  initialAntigravityCredentials: AntigravityCredentialRecord[];
+  initialUpstreamCredentials: UpstreamCredentialRecord[];
   initialProxyPool: ProxyPoolRecord[];
   initialRequestLogsPage: RequestLogsPage;
   initialOverviewStats: AdminOverviewStats;
@@ -177,8 +195,6 @@ type SectionId =
   | "settings"
   | "logs";
 type LogStatusFilter = "all" | "success" | "error";
-type RoutableCredentialRecord = CodexCredentialRecord | ClaudeCredentialRecord;
-
 type NavigationItem = {
   id: SectionId;
   label: string;
@@ -240,6 +256,7 @@ type ProxyPoolFormState = CredentialProxyFormState & {
 };
 
 type ChannelFormState = {
+  capabilities: UpstreamOperation[];
   provider: ChannelRecord["provider"];
   name: string;
   credentialIds: string;
@@ -277,7 +294,31 @@ const EMPTY_API_KEY_FORM: ApiKeyFormState = {
   expiresAt: "",
 };
 
+const CHANNEL_PROVIDERS: ChannelRecord["provider"][] = [
+  "codex",
+  "claude",
+  "antigravity",
+  "openai",
+  "anthropic",
+];
+const CHANNEL_CAPABILITIES: Record<ChannelRecord["provider"], UpstreamOperation[]> = {
+  codex: ["chat", "responses", "images_generations", "images_edits"],
+  claude: ["chat", "responses", "messages", "count_tokens"],
+  antigravity: ["chat", "responses", "messages", "count_tokens"],
+  openai: ["chat", "responses", "images_generations", "images_edits"],
+  anthropic: ["messages", "count_tokens"],
+};
+const CAPABILITY_LABELS: Record<UpstreamOperation, string> = {
+  chat: "Chat Completions",
+  responses: "Responses",
+  messages: "Messages",
+  count_tokens: "Count Tokens",
+  images_generations: "Images Generations",
+  images_edits: "Images Edits",
+};
+
 const EMPTY_CHANNEL_FORM: ChannelFormState = {
+  capabilities: [...CHANNEL_CAPABILITIES.codex],
   provider: "codex",
   name: "",
   credentialIds: "",
@@ -293,6 +334,8 @@ export function AdminDashboard({
   initialChannels,
   initialCredentials,
   initialClaudeCredentials,
+  initialAntigravityCredentials,
+  initialUpstreamCredentials,
   initialProxyPool,
   initialRequestLogsPage,
   initialOverviewStats,
@@ -306,6 +349,10 @@ export function AdminDashboard({
   const [credentials, setCredentials] = React.useState(initialCredentials);
   const [claudeCredentials, setClaudeCredentials] = React.useState(
     initialClaudeCredentials,
+  );
+  const [antigravityCredentials, setAntigravityCredentials] = React.useState(initialAntigravityCredentials);
+  const [upstreamCredentials, setUpstreamCredentials] = React.useState(
+    initialUpstreamCredentials,
   );
   const [proxyPool, setProxyPool] = React.useState(initialProxyPool);
   const [globalSettings, setGlobalSettings] = React.useState(
@@ -366,6 +413,8 @@ export function AdminDashboard({
       setChannels(snapshot.channels);
       setCredentials(snapshot.credentials);
       setClaudeCredentials(snapshot.claudeCredentials);
+      setAntigravityCredentials(snapshot.antigravityCredentials);
+      setUpstreamCredentials(snapshot.upstreamCredentials);
       setProxyPool(snapshot.proxyPool);
       setGlobalSettings(snapshot.globalSettings);
       setRequestLogs(snapshot.requestLogs);
@@ -422,19 +471,24 @@ export function AdminDashboard({
   }
 
   async function refreshCredentialAndChannelData() {
-    const [nextCredentials, nextClaudeCredentials, nextChannels] =
+    const [nextCredentials, nextClaudeCredentials, nextAntigravityCredentials, nextUpstreamCredentials, nextChannels] =
       await Promise.all([
         listCredentials(),
         listClaudeCredentials(),
+        listAntigravityCredentials(),
+        listUpstreamCredentials(),
         listChannels(),
       ]);
     setCredentials(nextCredentials);
     setClaudeCredentials(nextClaudeCredentials);
+    setAntigravityCredentials(nextAntigravityCredentials);
+    setUpstreamCredentials(nextUpstreamCredentials);
     setChannels(nextChannels);
     setSnapshotTime(Date.now());
     return {
       credentials: nextCredentials,
       claudeCredentials: nextClaudeCredentials,
+      upstreamCredentials: nextUpstreamCredentials,
       channels: nextChannels,
     };
   }
@@ -499,6 +553,21 @@ export function AdminDashboard({
     );
   }
 
+  function handleUpstreamCredentialUpdated(updated: UpstreamCredentialRecord) {
+    setUpstreamCredentials((current) => [
+      updated,
+      ...current.filter((credential) => credential.id !== updated.id),
+    ]);
+  }
+
+  async function handleUpstreamCredentialDeleted(id: string) {
+    setUpstreamCredentials((current) =>
+      current.filter((credential) => credential.id !== id),
+    );
+    setChannels(await listChannels());
+    setSnapshotTime(Date.now());
+  }
+
   function handleChannelCreated(created: ChannelRecord) {
     setChannels((current) => [
       created,
@@ -537,9 +606,9 @@ export function AdminDashboard({
     {
       id: "credentials",
       label: "凭据",
-      description: "账号凭据",
+      description: "OAuth / 上游 API Key",
       icon: UserRoundIcon,
-      count: credentials.length + claudeCredentials.length,
+      count: credentials.length + claudeCredentials.length + antigravityCredentials.length + upstreamCredentials.length,
     },
     {
       id: "proxyPool",
@@ -558,7 +627,7 @@ export function AdminDashboard({
     {
       id: "apiKeys",
       label: "密钥",
-      description: "API 密钥",
+      description: "下游 Relay Key",
       icon: KeyRoundIcon,
       count: apiKeys.length,
     },
@@ -732,7 +801,7 @@ export function AdminDashboard({
               <OverviewSection
                 apiKeyCount={apiKeys.length}
                 channelCount={channels.length}
-                credentialCount={credentials.length + claudeCredentials.length}
+                credentialCount={credentials.length + claudeCredentials.length + antigravityCredentials.length + upstreamCredentials.length}
                 enabledChannelCount={enabledChannelCount}
                 hasOperationalData={hasOperationalData}
                 overviewStats={overviewStats}
@@ -749,17 +818,38 @@ export function AdminDashboard({
               />
             )}
             {activeSection === "credentials" && (
-              <CredentialsSection
-                claudeCredentials={claudeCredentials}
-                credentials={credentials}
-                globalSettings={globalSettings}
-                proxyPool={proxyPool}
-                onClaudeDeleted={handleClaudeCredentialDeleted}
-                onClaudeUpdated={handleClaudeCredentialUpdated}
-                onDeleted={handleCredentialDeleted}
-                onRefreshData={refreshCredentialAndChannelData}
-                onUpdated={handleCredentialUpdated}
-              />
+              <div className="flex flex-col gap-6">
+                <UpstreamCredentialsPanel
+                  credentials={upstreamCredentials}
+                  globalSettings={globalSettings}
+                  proxyPool={proxyPool}
+                  onSaved={handleUpstreamCredentialUpdated}
+                  onDeleted={handleUpstreamCredentialDeleted}
+                />
+                <CredentialsSection
+                  claudeCredentials={claudeCredentials}
+                  credentials={credentials}
+                  globalSettings={globalSettings}
+                  proxyPool={proxyPool}
+                  onClaudeDeleted={handleClaudeCredentialDeleted}
+                  onClaudeUpdated={handleClaudeCredentialUpdated}
+                  onDeleted={handleCredentialDeleted}
+                  onRefreshData={refreshCredentialAndChannelData}
+                  onUpdated={handleCredentialUpdated}
+                />
+                <AntigravityCredentialsPanel
+                  credentials={antigravityCredentials}
+                  onDeleted={() => {
+                    refreshCredentialAndChannelData().catch((error) => toast.error(adminErrorMessage(error)));
+                  }}
+                  onUpdated={(updated) =>
+                    setAntigravityCredentials((current) =>
+                      current.map((credential) => (credential.id === updated.id ? updated : credential)),
+                    )
+                  }
+                  onReload={async () => setAntigravityCredentials(await listAntigravityCredentials())}
+                />
+              </div>
             )}
             {activeSection === "proxyPool" && (
               <ProxyPoolSection
@@ -769,6 +859,7 @@ export function AdminDashboard({
             )}
             {activeSection === "channels" && (
               <ChannelsSection
+                additionalCredentials={[...antigravityCredentials, ...upstreamCredentials]}
                 channels={channels}
                 claudeCredentials={claudeCredentials}
                 credentials={credentials}
@@ -1460,9 +1551,9 @@ function OverviewSection({
           icon={KeyRoundIcon}
         />
         <ResourceSummaryCard
-          title="Codex 凭据"
+          title="上游凭据"
           value={credentialCount}
-          description="已授权的 Codex 账号"
+          description="Codex / Claude OAuth 与上游 API Key"
           icon={UserRoundIcon}
         />
         <ResourceSummaryCard
@@ -1478,7 +1569,7 @@ function OverviewSection({
           <WorkflowIcon />
           <AlertTitle>还没有请求数据</AlertTitle>
           <AlertDescription>
-            创建 Relay API 密钥、配置 Codex 凭据和通道后，调用
+            创建下游 Relay Key、配置上游凭据和通道后，调用
             `/v1/models`、`/v1/responses` 或 `/v1/chat/completions`
             即可在这里看到统计和日志。
           </AlertDescription>
@@ -1511,7 +1602,7 @@ function OverviewSection({
         />
         <UsageStatsTableCard
           title="凭据用量"
-          description="按 Codex 凭据聚合的公开使用统计。"
+          description="按上游凭据聚合的公开使用统计。"
           rows={overviewStats.byCredential}
           emptyTitle="暂无凭据使用数据"
         />
@@ -1795,10 +1886,10 @@ function ApiKeysSection({
     <>
       <Card>
         <CardHeader>
-          <CardTitle>API 密钥</CardTitle>
+          <CardTitle>下游 Relay Key</CardTitle>
           <CardDescription>
-            创建、启停、限制模型/通道、设置每日 token
-            上限。完整密钥明文只会在创建后显示一次。
+            用于客户端访问 Relay，不是供应商上游 API Key。可创建、启停、限制模型/通道、设置每日 token
+            上限。完整密钥明文只会在创建后显示一次；空通道白名单仅允许 OAuth 通道，API 通道需显式绑定。
           </CardDescription>
           <CardAction>
             <Button type="button" onClick={() => setCreateOpen(true)}>
@@ -2155,14 +2246,14 @@ function ApiKeyFields({
           <FieldLabel>通道白名单</FieldLabel>
           <ChannelVisualSelector
             channels={channels}
-            emptyLabel="不限通道"
+            emptyLabel="仅 OAuth 通道（空白名单）"
             selectedIds={parseList(form.channelAllowlist)}
             onSelectedIdsChange={(ids) =>
               update("channelAllowlist", ids.join("\n"))
             }
           />
           <FieldDescription>
-            不选任何通道表示这个密钥可以使用所有可用通道。
+            空白名单仅允许 Codex / Claude / Antigravity OAuth 通道。使用可能按量计费的 OpenAI-compatible / Anthropic API 通道，必须在此显式选择；选择后仅允许选中的通道。
           </FieldDescription>
         </Field>
       </FieldGroup>
@@ -2195,7 +2286,7 @@ function CredentialVisualSelector({
         <UserRoundIcon />
         <AlertTitle>暂无可选凭据</AlertTitle>
         <AlertDescription>
-          请先连接或上传对应 provider 的凭据。
+          请先在凭据页添加对应 provider 的 OAuth 凭据或上游 API Key。
         </AlertDescription>
       </Alert>
     );
@@ -2205,13 +2296,14 @@ function CredentialVisualSelector({
     <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
       {credentials.map((credential) => {
         const selected = selectedIdSet.has(credential.id);
-        const name = credential.email || credential.accountId || credential.id;
+        const name = routableCredentialName(credential);
         return (
           <Button
             key={credential.id}
             type="button"
             variant={selected ? "secondary" : "outline"}
             className="h-auto justify-start whitespace-normal p-3 text-left"
+            aria-pressed={selected}
             onClick={() => toggleCredential(credential.id)}
           >
             <div className="grid min-w-0 flex-1 gap-2">
@@ -2227,11 +2319,13 @@ function CredentialVisualSelector({
                 <Badge variant="outline" className="shrink-0">
                   {credential.provider === "codex"
                     ? codexPlanLabel(credential.planType)
-                    : "Claude"}
+                    : channelProviderLabel(credential.provider)}
                 </Badge>
               </div>
               <div className="grid gap-1 text-xs text-muted-foreground">
-                <div className="truncate font-mono">{credential.id}</div>
+                <div className="truncate font-mono">
+                  {"keyPrefix" in credential ? `${credential.keyPrefix}…` : credential.id}
+                </div>
                 <div>
                   优先级 {formatNumber(credential.priority)} · 权重{" "}
                   {formatNumber(credential.weight)} · 健康度{" "}
@@ -2296,7 +2390,7 @@ function ChannelVisualSelector({
           <div>
             <div className="font-medium">{emptyLabel}</div>
             <div className="text-xs text-muted-foreground">
-              Relay 会在所有可用通道中自动路由。
+              仅在可用 OAuth 通道中路由，不会使用上游 API Key 通道。
             </div>
           </div>
         </div>
@@ -2311,6 +2405,7 @@ function ChannelVisualSelector({
               type="button"
               variant={selected ? "secondary" : "outline"}
               className="h-auto justify-start whitespace-normal p-3 text-left"
+              aria-pressed={selected}
               onClick={() => toggleChannel(channel.id)}
             >
               <div className="grid min-w-0 flex-1 gap-2">
@@ -2330,6 +2425,9 @@ function ChannelVisualSelector({
                 </div>
                 <div className="grid gap-1 text-xs text-muted-foreground">
                   <div className="truncate font-mono">{channel.id}</div>
+                  {isApiChannelProvider(channel.provider) && (
+                    <div>上游 API Key · 可能按量计费 · 需显式绑定</div>
+                  )}
                   <div>
                     优先级 {formatNumber(channel.priority)} · 权重{" "}
                     {formatNumber(channel.weight)} · 凭据{" "}
@@ -5159,6 +5257,516 @@ function CredentialProxyControls({
   );
 }
 
+function AntigravityCredentialsPanel({
+  credentials,
+  onDeleted,
+  onUpdated,
+  onReload,
+}: {
+  credentials: AntigravityCredentialRecord[];
+  onDeleted: (id: string) => void;
+  onUpdated: (credential: AntigravityCredentialRecord) => void;
+  onReload: () => Promise<unknown>;
+}) {
+  const [oauthOpen, setOauthOpen] = React.useState(false);
+  const [pendingId, setPendingId] = React.useState<string | null>(null);
+  const [quotas, setQuotas] = React.useState<Record<string, AntigravityQuotaReport>>({});
+  const [quotaErrors, setQuotaErrors] = React.useState<Record<string, string>>({});
+  const [quotaLoadingIds, setQuotaLoadingIds] = React.useState<Set<string>>(() => new Set());
+  const quotaLoadRequestedRef = React.useRef(new Set<string>());
+  // Captured once per mount; cooldown lists are rebuilt whenever credentials reload.
+  const [now] = React.useState(Date.now);
+
+  const loadQuota = React.useCallback(async (id: string) => {
+    setQuotaLoadingIds((current) => new Set(current).add(id));
+    try {
+      const quota = await getAntigravityCredentialQuota(id);
+      setQuotas((current) => ({ ...current, [id]: quota }));
+      setQuotaErrors((current) => {
+        const next = { ...current };
+        delete next[id];
+        return next;
+      });
+      return true;
+    } catch (error) {
+      setQuotaErrors((current) => ({ ...current, [id]: adminErrorMessage(error) }));
+      return false;
+    } finally {
+      setQuotaLoadingIds((current) => {
+        const next = new Set(current);
+        next.delete(id);
+        return next;
+      });
+    }
+  }, []);
+
+  React.useEffect(() => {
+    for (const credential of credentials) {
+      if (!credential.enabled || quotaLoadRequestedRef.current.has(credential.id)) continue;
+      quotaLoadRequestedRef.current.add(credential.id);
+      void loadQuota(credential.id);
+    }
+  }, [credentials, loadQuota]);
+
+  async function refreshAllQuotas() {
+    const results = await Promise.all(
+      credentials.filter((credential) => credential.enabled).map((credential) => loadQuota(credential.id)),
+    );
+    const failed = results.filter((success) => !success).length;
+    if (failed > 0) toast.error(`Antigravity 用量刷新完成，${formatNumber(failed)} 个账号失败`);
+    else toast.success("全部 Antigravity 用量已刷新");
+  }
+
+  const sortedCredentials = React.useMemo(
+    () =>
+      [...credentials].sort(
+        (left, right) =>
+          Number(right.enabled) - Number(left.enabled) ||
+          right.priority - left.priority ||
+          usageHealthScore(right.usageHealth) - usageHealthScore(left.usageHealth),
+      ),
+    [credentials],
+  );
+
+  async function run(credential: AntigravityCredentialRecord, action: () => Promise<void>) {
+    setPendingId(credential.id);
+    try {
+      await action();
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+      throw error;
+    } finally {
+      setPendingId(null);
+    }
+  }
+
+  const refreshToken = (credential: AntigravityCredentialRecord) => run(credential, async () => {
+    onUpdated(await refreshAntigravityCredential(credential.id));
+    toast.success("Antigravity token 与模型目录已刷新");
+  });
+  const resetHealth = (credential: AntigravityCredentialRecord) => run(credential, async () => {
+    onUpdated(await resetAntigravityCredentialHealth(credential.id));
+    toast.success("Antigravity 凭据健康度已重置，冷却已取消");
+  });
+  const remove = (credential: AntigravityCredentialRecord) => run(credential, async () => {
+    await deleteAntigravityCredential(credential.id);
+    onDeleted(credential.id);
+    toast.success("Antigravity 凭据已删除");
+  });
+
+  return (
+    <>
+      <Card>
+        <CardHeader>
+          <CardTitle>Antigravity 凭据</CardTitle>
+          <CardDescription>
+            连接 Google 账号使用 Antigravity 上游，可承载 Gemini、Claude 与 GPT-OSS 模型，支持
+            Chat、Responses、Messages（Claude Code）与 Token 计数。
+          </CardDescription>
+          <CardAction className="flex flex-wrap justify-end gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              disabled={credentials.length === 0 || quotaLoadingIds.size > 0}
+              onClick={refreshAllQuotas}
+            >
+              {quotaLoadingIds.size > 0 ? (
+                <Spinner data-icon="inline-start" />
+              ) : (
+                <RefreshCwIcon data-icon="inline-start" />
+              )}
+              刷新用量
+            </Button>
+            <Button type="button" onClick={() => setOauthOpen(true)}>
+              <PlusIcon data-icon="inline-start" />
+              连接 Google 账号
+            </Button>
+          </CardAction>
+        </CardHeader>
+        <CardContent>
+          {credentials.length === 0 ? (
+            <Empty className="min-h-64">
+              <EmptyHeader>
+                <EmptyMedia variant="icon">
+                  <UserRoundIcon />
+                </EmptyMedia>
+                <EmptyTitle>还没有 Antigravity 凭据</EmptyTitle>
+                <EmptyDescription>
+                  连接 Google 账号后，在通道页新建 Antigravity 通道并绑定到 Relay Key。
+                </EmptyDescription>
+              </EmptyHeader>
+              <Button type="button" onClick={() => setOauthOpen(true)}>
+                <PlusIcon data-icon="inline-start" />
+                连接 Google 账号
+              </Button>
+            </Empty>
+          ) : (
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
+              {sortedCredentials.map((credential) => {
+                const name = credential.email || credential.accountId || "未知 Google 账号";
+                const cooling = Object.entries(credential.modelCooldowns)
+                  .filter(([, cooldown]) => Date.parse(cooldown.until) > now)
+                  .sort(([left], [right]) => left.localeCompare(right));
+                return (
+                  <Card
+                    key={credential.id}
+                    className="relative bg-linear-to-br from-card via-card to-muted/45 shadow-sm"
+                  >
+                    <CardContent className="grid gap-3">
+                      <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
+                        <div className="flex min-w-0 items-center gap-2 overflow-hidden">
+                          <Badge variant="secondary" className="h-6 shrink-0 px-2 text-sm font-semibold">
+                            Antigravity
+                          </Badge>
+                          <div className="min-w-0 flex-1 truncate text-base font-medium" title={name}>
+                            {name}
+                          </div>
+                        </div>
+                        <AntigravityCredentialSettingsDialog
+                          credential={credential}
+                          disabled={pendingId === credential.id}
+                          onDeleted={() => remove(credential)}
+                          onRefreshToken={() => refreshToken(credential)}
+                          onSaved={onUpdated}
+                        />
+                      </div>
+
+                      {!credential.enabled && (
+                        <div className="flex flex-wrap gap-1.5">
+                          <Badge variant="outline">已停用</Badge>
+                        </div>
+                      )}
+
+                      <div className="grid gap-2 text-sm">
+                        <div className="flex items-center gap-2">
+                          <span className="shrink-0 text-muted-foreground">凭据健康度：</span>
+                          {credential.usageHealth ? (
+                            <>
+                              <UsageHealthBadge status={credential.usageHealth.status} />
+                              <span className="tabular-nums text-muted-foreground">
+                                {formatNumber(credential.usageHealth.score)}%
+                              </span>
+                            </>
+                          ) : (
+                            <Badge variant="outline">未知</Badge>
+                          )}
+                        </div>
+                        {credential.usageHealth && (
+                          <div className="text-xs text-muted-foreground">
+                            最近 {formatNumber(credential.usageHealth.windowSize)} 次 · 成功{" "}
+                            {formatNumber(credential.usageHealth.successCount)} · 错误{" "}
+                            {formatNumber(credential.usageHealth.errorCount)}
+                          </div>
+                        )}
+                        {credential.cooldownUntil && Date.parse(credential.cooldownUntil) > now && (
+                          <div className="text-xs text-amber-600 dark:text-amber-300">
+                            凭据冷却至 {formatNullableDate(credential.cooldownUntil)}
+                          </div>
+                        )}
+                        {cooling.map(([model, cooldown]) => (
+                          <div key={model} className="text-xs text-amber-600 dark:text-amber-300">
+                            {model} 冷却至 {formatNullableDate(cooldown.until)}
+                          </div>
+                        ))}
+                        {credential.lastError && (
+                          <div className="text-xs text-destructive">{credential.lastError}</div>
+                        )}
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={pendingId === credential.id}
+                          onClick={() => resetHealth(credential).catch(() => undefined)}
+                        >
+                          {pendingId === credential.id ? (
+                            <Spinner data-icon="inline-start" />
+                          ) : (
+                            <RefreshCwIcon data-icon="inline-start" />
+                          )}
+                          重置健康度
+                        </Button>
+                      </div>
+
+                      <div className="flex items-center gap-2 text-sm">
+                        <span className="shrink-0 text-muted-foreground">过期时间：</span>
+                        <span className="min-w-0 truncate">{formatNullableDate(credential.expiresAt)}</span>
+                      </div>
+
+                      <div className="grid gap-2 text-sm">
+                        <span className="text-muted-foreground">额度 / 用量：</span>
+                        <div className="rounded-lg border border-border/60 bg-muted/35 p-3">
+                          <AntigravityQuotaCell
+                            disabled={!credential.enabled}
+                            errorMessage={quotaErrors[credential.id]}
+                            loading={quotaLoadingIds.has(credential.id)}
+                            quota={quotas[credential.id]}
+                          />
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                );
+              })}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <OAuthDialog
+        open={oauthOpen}
+        onOpenChange={setOauthOpen}
+        onCompleted={onReload}
+        provider="antigravity"
+      />
+    </>
+  );
+}
+
+function AntigravityCredentialSettingsDialog({
+  credential,
+  disabled,
+  onDeleted,
+  onRefreshToken,
+  onSaved,
+}: {
+  credential: AntigravityCredentialRecord;
+  disabled: boolean;
+  onDeleted: () => Promise<void>;
+  onRefreshToken: () => Promise<void>;
+  onSaved: (credential: AntigravityCredentialRecord) => void;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const [refreshingToken, setRefreshingToken] = React.useState(false);
+  const [deleteOpen, setDeleteOpen] = React.useState(false);
+  const [deleting, setDeleting] = React.useState(false);
+  const accountName = credential.email || credential.accountId || credential.id;
+
+  async function refreshTokenFromSettings() {
+    setRefreshingToken(true);
+    try {
+      await onRefreshToken();
+    } catch {
+      // The panel action already shows the error toast.
+    } finally {
+      setRefreshingToken(false);
+    }
+  }
+
+  async function confirmDelete() {
+    setDeleting(true);
+    try {
+      await onDeleted();
+      setDeleteOpen(false);
+      setOpen(false);
+    } catch {
+      // The panel action already shows the error toast.
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <Button
+        type="button"
+        size="icon-sm"
+        variant="outline"
+        disabled={disabled}
+        onClick={() => setOpen(true)}
+        title="Antigravity 凭据设置"
+      >
+        <SettingsIcon />
+      </Button>
+      <DialogContent className="max-h-[88vh] gap-3 overflow-y-auto sm:max-w-3xl">
+        <DialogHeader className="pr-8">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0">
+              <DialogTitle>Antigravity 凭据设置</DialogTitle>
+              <DialogDescription className="mt-1 truncate">{accountName}</DialogDescription>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Badge variant="secondary">Antigravity</Badge>
+              <Badge variant={credential.enabled ? "secondary" : "outline"}>
+                {credential.enabled ? "已启用" : "已禁用"}
+              </Badge>
+            </div>
+          </div>
+        </DialogHeader>
+
+        <div className="grid gap-3 lg:grid-cols-[240px_minmax(0,1fr)]">
+          <aside className="grid h-fit gap-3">
+            <div className="grid gap-2 rounded-lg border border-border/60 bg-muted/25 p-2.5 text-sm">
+              <div className="min-w-0">
+                <div className="truncate font-medium" title={accountName}>{accountName}</div>
+                <div className="mt-1 truncate font-mono text-xs text-muted-foreground">{credential.id}</div>
+              </div>
+              <div className="grid gap-1.5 text-xs text-muted-foreground">
+                <CredentialCompactRow label="邮箱" value={credential.email} />
+                <CredentialCompactRow label="账号" value={credential.accountId} />
+                <CredentialCompactRow label="过期" value={formatNullableDate(credential.expiresAt)} />
+                <CredentialCompactRow label="使用" value={formatNullableDate(credential.lastUsedAt)} />
+              </div>
+            </div>
+
+            <div className="grid gap-2 rounded-lg border border-border/60 bg-muted/25 p-2.5">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="justify-start"
+                disabled={disabled || refreshingToken || !credential.enabled}
+                onClick={refreshTokenFromSettings}
+              >
+                {refreshingToken ? <Spinner data-icon="inline-start" /> : <RefreshCwIcon data-icon="inline-start" />}
+                刷新 token 与模型
+              </Button>
+              <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="destructive"
+                  className="justify-start"
+                  disabled={disabled}
+                  onClick={() => setDeleteOpen(true)}
+                >
+                  <Trash2Icon data-icon="inline-start" />
+                  删除凭据
+                </Button>
+                <AlertDialogContent size="sm">
+                  <AlertDialogHeader>
+                    <AlertDialogMedia>
+                      <Trash2Icon />
+                    </AlertDialogMedia>
+                    <AlertDialogTitle>删除 Antigravity 凭据？</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      将删除 {accountName}，并从所有通道解绑。此操作不可恢复。
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel disabled={deleting}>取消</AlertDialogCancel>
+                    <AlertDialogAction variant="destructive" disabled={deleting} onClick={confirmDelete}>
+                      {deleting && <Spinner data-icon="inline-start" />}
+                      删除
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+            </div>
+          </aside>
+
+          <section className="grid min-w-0 gap-3">
+            <AntigravityCredentialRoutingControls
+              key={`${credential.id}:${credential.priority}:${credential.weight}:${credential.enabled}`}
+              credential={credential}
+              disabled={disabled}
+              onSaved={onSaved}
+            />
+            <div className="grid gap-2 rounded-lg border border-border/60 bg-muted/25 p-2.5 text-sm">
+              <div className="font-medium">
+                模型目录
+                <span className="ml-2 text-xs font-normal text-muted-foreground">
+                  {credential.models === null
+                    ? "未知，按通道模型白名单路由"
+                    : `${formatNumber(credential.models.length)} 个，来自 Google fetchAvailableModels`}
+                </span>
+              </div>
+              {credential.models && credential.models.length > 0 && (
+                <div className="flex flex-wrap gap-1">
+                  {credential.models.map((model) => (
+                    <Badge key={model} variant="outline">{model}</Badge>
+                  ))}
+                </div>
+              )}
+            </div>
+          </section>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function AntigravityCredentialRoutingControls({
+  credential,
+  disabled,
+  onSaved,
+}: {
+  credential: AntigravityCredentialRecord;
+  disabled: boolean;
+  onSaved: (credential: AntigravityCredentialRecord) => void;
+}) {
+  const [priority, setPriority] = React.useState(credential.priority.toString());
+  const [weight, setWeight] = React.useState(credential.weight.toString());
+  const [saving, setSaving] = React.useState(false);
+
+  async function saveRouting(patch: { enabled?: boolean; priority?: number; weight?: number }) {
+    setSaving(true);
+    try {
+      onSaved(await updateAntigravityCredential(credential.id, patch));
+      toast.success("Antigravity 凭据路由配置已保存");
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="grid gap-2 rounded-lg border border-border/60 bg-muted/25 p-2.5 text-sm">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="font-medium">凭据路由</div>
+          <div className="text-xs text-muted-foreground">
+            通道内按凭据优先级、权重和健康度选择；某模型限流时只冷却该模型并切换到下一个凭据。
+          </div>
+        </div>
+        <Switch
+          checked={credential.enabled}
+          disabled={disabled || saving}
+          size="sm"
+          onCheckedChange={(checked) => saveRouting({ enabled: Boolean(checked) })}
+        />
+      </div>
+      <div className="grid gap-2 sm:grid-cols-[1fr_1fr_auto]">
+        <Input
+          aria-label="Antigravity 凭据优先级"
+          inputMode="numeric"
+          value={priority}
+          placeholder="优先级"
+          onChange={(event) => setPriority(event.target.value)}
+        />
+        <Input
+          aria-label="Antigravity 凭据权重"
+          inputMode="numeric"
+          value={weight}
+          placeholder="权重"
+          onChange={(event) => setWeight(event.target.value)}
+        />
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={disabled || saving}
+          onClick={() =>
+            saveRouting({
+              priority: integerValue(priority, credential.priority),
+              weight: Math.max(1, integerValue(weight, credential.weight)),
+            })
+          }
+        >
+          {saving && <Spinner data-icon="inline-start" />}
+          保存
+        </Button>
+      </div>
+      <div className="text-xs text-muted-foreground">
+        当前：优先级 {formatNumber(credential.priority)} · 权重 {formatNumber(credential.weight)}
+      </div>
+    </div>
+  );
+}
+
 function OAuthDialog({
   onCompleted,
   onOpenChange,
@@ -5168,25 +5776,25 @@ function OAuthDialog({
   onCompleted: () => Promise<unknown>;
   onOpenChange: (open: boolean) => void;
   open: boolean;
-  provider: "codex" | "claude";
+  provider: "codex" | "claude" | "antigravity";
 }) {
   const [pending, setPending] = React.useState(false);
   const [session, setSession] = React.useState<OAuthStartResponse | null>(null);
   const [callbackUrl, setCallbackUrl] = React.useState("");
 
-  const providerLabel = provider === "claude" ? "Claude" : "Codex";
+  const providerLabel = channelProviderLabel(provider);
   const callbackPlaceholder =
-    provider === "claude"
+    provider === "antigravity"
+      ? "http://localhost:51121/oauth-callback?code=...&state=..."
+      : provider === "claude"
       ? "http://localhost:54545/callback?code=...&state=..."
       : "http://localhost:3000/api/admin/codex/credentials/oauth/callback?code=...&state=...";
 
   async function startOAuth() {
     setPending(true);
     try {
-      const started =
-        provider === "claude"
-          ? await startClaudeOAuth()
-          : await startCodexOAuth();
+      const start = { claude: startClaudeOAuth, codex: startCodexOAuth, antigravity: startAntigravityOAuth }[provider];
+      const started = await start();
       setSession(started);
       toast.success("OAuth 链接已生成");
     } catch (error) {
@@ -5205,11 +5813,8 @@ function OAuthDialog({
     }
     setPending(true);
     try {
-      if (provider === "claude") {
-        await finishClaudeOAuth(trimmed);
-      } else {
-        await finishCodexOAuth(trimmed);
-      }
+      const finish = { claude: finishClaudeOAuth, codex: finishCodexOAuth, antigravity: finishAntigravityOAuth }[provider];
+      await finish(trimmed);
       await onCompleted();
       setCallbackUrl("");
       setSession(null);
@@ -5542,7 +6147,83 @@ function ClaudeQuotaUsageCell({
   );
 }
 
-function ClaudeQuotaStatusBadge({ quota }: { quota: ClaudeQuotaReport }) {
+function AntigravityQuotaCell({
+  disabled,
+  errorMessage,
+  loading,
+  quota,
+}: {
+  disabled: boolean;
+  errorMessage?: string;
+  loading: boolean;
+  quota: AntigravityQuotaReport | undefined;
+}) {
+  if (!quota) {
+    if (errorMessage) return <span className="text-xs text-destructive">{errorMessage}</span>;
+    return (
+      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+        {loading ? (
+          <>
+            <Spinner data-icon="inline-start" />
+            读取中
+          </>
+        ) : (
+          <Badge variant="outline">{disabled ? "已停用" : "未读取"}</Badge>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid gap-2">
+      <div className="flex items-center justify-between gap-2">
+        <ClaudeQuotaStatusBadge quota={quota} />
+        <span className="text-xs text-muted-foreground">真实额度</span>
+      </div>
+      {quota.groups.length === 0 ? (
+        <div className="text-xs text-muted-foreground">{quota.message || "Google 未返回额度分组"}</div>
+      ) : (
+        quota.groups.map((group) => (
+          <div
+            key={group.label}
+            className="grid gap-1.5 rounded-md border border-border/50 bg-background/55 p-2"
+            title={group.description || undefined}
+          >
+            <span className="truncate text-xs font-medium text-foreground">{group.label}</span>
+            {group.buckets.map((bucket) => {
+              const remaining = bucket.remaining_percent;
+              return (
+                <div key={bucket.id} className="grid gap-1">
+                  <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                    <span>{bucket.label}</span>
+                    <span className="tabular-nums">
+                      重置 <QuotaResetTime fallback="-" value={bucket.reset_at} />
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Progress
+                      className="min-w-0 flex-1 **:data-[slot=progress-track]:h-2"
+                      value={remaining === null ? 0 : clamp(remaining, 0, 100)}
+                    />
+                    <span
+                      className={`w-10 shrink-0 text-right text-xs tabular-nums ${
+                        remaining === 0 ? "text-destructive" : "text-muted-foreground"
+                      }`}
+                    >
+                      {remaining === null ? "未知" : `${Math.round(remaining)}%`}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
+function ClaudeQuotaStatusBadge({ quota }: { quota: Pick<ClaudeQuotaReport, "status"> }) {
   if (quota.status === "error" || quota.status === "exhausted") {
     return (
       <Badge variant="destructive">
@@ -5958,6 +6639,7 @@ function CredentialDeleteSettingsAction({
 }
 
 function ChannelsSection({
+  additionalCredentials,
   channels,
   claudeCredentials,
   credentials,
@@ -5965,6 +6647,7 @@ function ChannelsSection({
   onDeleted,
   onUpdated,
 }: {
+  additionalCredentials: (UpstreamCredentialRecord | AntigravityCredentialRecord)[];
   channels: ChannelRecord[];
   claudeCredentials: ClaudeCredentialRecord[];
   credentials: CodexCredentialRecord[];
@@ -5976,15 +6659,14 @@ function ChannelsSection({
   const [editingChannel, setEditingChannel] =
     React.useState<ChannelRecord | null>(null);
   const [pendingId, setPendingId] = React.useState<string | null>(null);
-  const codexCredentialsById = new Map(
-    credentials.map((credential) => [credential.id, credential]),
-  );
-  const claudeCredentialsById = new Map(
-    claudeCredentials.map((credential) => [credential.id, credential]),
+  const credentialsById = new Map<string, RoutableCredentialRecord>(
+    [...credentials, ...claudeCredentials, ...additionalCredentials].map(
+      (credential) => [credential.id, credential],
+    ),
   );
   const uniqueChannels = uniqueChannelsById(channels);
   const hasRoutableCredentials =
-    credentials.length > 0 || claudeCredentials.length > 0;
+    credentials.length > 0 || claudeCredentials.length > 0 || additionalCredentials.length > 0;
 
   async function toggleEnabled(channel: ChannelRecord, enabled: boolean) {
     setPendingId(channel.id);
@@ -6040,6 +6722,7 @@ function ChannelsSection({
             会先过滤已禁用、冷却中、凭据缺失和模型不匹配的通道；通道健康度取最近
             100 次请求成功率，凭据健康度取最近 50
             次请求成功率。路由先按健康度分层，再按优先级和权重加权选择。
+            OpenAI-compatible / Anthropic API 通道默认关闭，需设置非空模型白名单，并由下游 Relay Key 显式绑定才可使用；空通道白名单仅允许 OAuth。
           </AlertDescription>
         </Alert>
 
@@ -6069,7 +6752,7 @@ function ChannelsSection({
                   </EmptyMedia>
                   <EmptyTitle>还没有通道</EmptyTitle>
                   <EmptyDescription>
-                    添加 Codex 或 Claude 凭据后，可以手动创建对应 provider
+                    添加 OAuth 或上游 API Key 凭据后，可以手动创建对应 provider
                     的通道做优先级和权重路由。
                   </EmptyDescription>
                 </EmptyHeader>
@@ -6098,13 +6781,11 @@ function ChannelsSection({
                 </TableHeader>
                 <TableBody>
                   {uniqueChannels.map((channel, index) => {
-                    const credentialsById =
-                      channel.provider === "claude"
-                        ? claudeCredentialsById
-                        : codexCredentialsById;
                     const channelCredentials = channel.credentialIds
                       .map((credentialId) => credentialsById.get(credentialId))
-                      .filter(Boolean) as RoutableCredentialRecord[];
+                      .filter((credential): credential is RoutableCredentialRecord =>
+                        Boolean(credential && credential.provider === channel.provider),
+                      );
                     return (
                       <TableRow key={`${channel.id}:${index}`}>
                         <TableCell>
@@ -6147,9 +6828,12 @@ function ChannelsSection({
                                     key={`${credential.id}:${index}`}
                                     className="truncate"
                                   >
-                                    {credential.email ||
-                                      credential.accountId ||
-                                      credential.id}
+                                    {routableCredentialName(credential)}
+                                    {"keyPrefix" in credential && (
+                                      <span className="ml-2 font-mono text-xs text-muted-foreground">
+                                        {credential.keyPrefix}…
+                                      </span>
+                                    )}
                                   </div>
                                 ))}
                               {channelCredentials.length > 2 && (
@@ -6166,7 +6850,18 @@ function ChannelsSection({
                         <TableCell>{formatNumber(channel.priority)}</TableCell>
                         <TableCell>{formatNumber(channel.weight)}</TableCell>
                         <TableCell>
-                          {renderStringList(channel.modelAllowlist, "全部模型")}
+                          {renderStringList(
+                            channel.modelAllowlist,
+                            isApiChannelProvider(channel.provider)
+                              ? "未配置模型（不可用）"
+                              : channel.provider === "antigravity"
+                                ? "账号模型目录"
+                                : "全部模型",
+                          )}
+                          <div className="mt-1 text-xs text-muted-foreground">
+                            {(channel.capabilities ?? CHANNEL_CAPABILITIES[channel.provider])
+                              .map((operation) => CAPABILITY_LABELS[operation]).join(" · ") || "未开放任何操作"}
+                          </div>
                         </TableCell>
                         <TableCell>
                           <div className="min-w-28 space-y-1">
@@ -6232,6 +6927,7 @@ function ChannelsSection({
       </div>
 
       <ChannelFormDialog
+        additionalCredentials={additionalCredentials}
         claudeCredentials={claudeCredentials}
         credentials={credentials}
         mode="create"
@@ -6240,6 +6936,7 @@ function ChannelsSection({
         onSaved={(created) => onCreated(created)}
       />
       <ChannelFormDialog
+        additionalCredentials={additionalCredentials}
         channel={editingChannel}
         claudeCredentials={claudeCredentials}
         credentials={credentials}
@@ -6260,6 +6957,7 @@ function ChannelsSection({
 }
 
 function ChannelFormDialog({
+  additionalCredentials,
   channel,
   claudeCredentials,
   credentials,
@@ -6269,6 +6967,7 @@ function ChannelFormDialog({
   open,
 }: {
   channel?: ChannelRecord | null;
+  additionalCredentials: (UpstreamCredentialRecord | AntigravityCredentialRecord)[];
   claudeCredentials: ClaudeCredentialRecord[];
   credentials: CodexCredentialRecord[];
   mode: "create" | "edit";
@@ -6276,25 +6975,28 @@ function ChannelFormDialog({
   onSaved: (channel: ChannelRecord) => void;
   open: boolean;
 }) {
-  const defaultProvider: ChannelRecord["provider"] =
-    credentials.length > 0 ? "codex" : "claude";
+  const allCredentials: RoutableCredentialRecord[] = [
+    ...credentials, ...claudeCredentials, ...additionalCredentials,
+  ];
+  const defaultProvider = allCredentials[0]?.provider ?? "codex";
   const initialForm =
     mode === "edit" && channel
       ? channelToForm(channel)
       : {
           ...EMPTY_CHANNEL_FORM,
           provider: defaultProvider,
-          credentialIds:
-            defaultProvider === "claude"
-              ? claudeCredentials[0]?.id || ""
-              : credentials[0]?.id || "",
+          enabled: !isApiChannelProvider(defaultProvider),
+          baseUrl: defaultChannelBaseUrl(defaultProvider),
+          capabilities: [...CHANNEL_CAPABILITIES[defaultProvider]],
+          credentialIds: allCredentials[0]?.id || "",
         };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-5xl">
+      <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-5xl">
         {open && (
           <ChannelFormDialogBody
+            additionalCredentials={additionalCredentials}
             key={`${mode}:${channel?.id || credentials[0]?.id || claudeCredentials[0]?.id || "new"}`}
             channel={channel}
             claudeCredentials={claudeCredentials}
@@ -6314,6 +7016,7 @@ function ChannelFormDialog({
 }
 
 function ChannelFormDialogBody({
+  additionalCredentials,
   channel,
   claudeCredentials,
   credentials,
@@ -6323,6 +7026,7 @@ function ChannelFormDialogBody({
   onSaved,
 }: {
   channel?: ChannelRecord | null;
+  additionalCredentials: (UpstreamCredentialRecord | AntigravityCredentialRecord)[];
   claudeCredentials: ClaudeCredentialRecord[];
   credentials: CodexCredentialRecord[];
   initialForm: ChannelFormState;
@@ -6337,6 +7041,13 @@ function ChannelFormDialogBody({
     event.preventDefault();
     if (parseList(form.credentialIds).length === 0) {
       toast.error(`请至少选择一个 ${channelProviderLabel(form.provider)} 凭据`);
+      return;
+    }
+    if (
+      isApiChannelProvider(form.provider) &&
+      parseList(form.modelAllowlist).length === 0
+    ) {
+      toast.error("请填写上游已授权的模型 ID");
       return;
     }
     setPending(true);
@@ -6364,6 +7075,7 @@ function ChannelFormDialogBody({
         </DialogDescription>
       </DialogHeader>
       <ChannelFields
+        additionalCredentials={additionalCredentials}
         claudeCredentials={claudeCredentials}
         credentials={credentials}
         form={form}
@@ -6383,9 +7095,8 @@ function ChannelFormDialogBody({
           type="submit"
           disabled={
             pending ||
-            (form.provider === "claude"
-              ? claudeCredentials.length === 0
-              : credentials.length === 0)
+            ![...credentials, ...claudeCredentials, ...additionalCredentials]
+              .some((credential) => credential.provider === form.provider)
           }
         >
           {pending && <Spinner data-icon="inline-start" />}
@@ -6397,20 +7108,29 @@ function ChannelFormDialogBody({
 }
 
 function ChannelFields({
+  additionalCredentials,
   claudeCredentials,
   credentials,
   form,
   onChange,
   providerLocked,
 }: {
+  additionalCredentials: (UpstreamCredentialRecord | AntigravityCredentialRecord)[];
   claudeCredentials: ClaudeCredentialRecord[];
   credentials: CodexCredentialRecord[];
   form: ChannelFormState;
   onChange: React.Dispatch<React.SetStateAction<ChannelFormState>>;
   providerLocked: boolean;
 }) {
-  const selectedProviderCredentials =
-    form.provider === "claude" ? claudeCredentials : credentials;
+  const allCredentials: RoutableCredentialRecord[] = [
+    ...credentials, ...claudeCredentials, ...additionalCredentials,
+  ];
+  const selectedProviderCredentials = allCredentials.filter(
+    (credential) => credential.provider === form.provider,
+  );
+  const apiProvider = isApiChannelProvider(form.provider);
+  const antigravityProvider = form.provider === "antigravity";
+  const requiresModels = apiProvider;
 
   const update = <K extends keyof ChannelFormState>(
     key: K,
@@ -6420,12 +7140,18 @@ function ChannelFields({
   };
 
   function updateProvider(provider: ChannelRecord["provider"]) {
-    const nextCredentials =
-      provider === "claude" ? claudeCredentials : credentials;
+    if (provider === form.provider) return;
+    const nextCredentials = allCredentials.filter(
+      (credential) => credential.provider === provider,
+    );
     onChange((current) => ({
       ...current,
       provider,
       credentialIds: nextCredentials[0]?.id || "",
+      baseUrl: defaultChannelBaseUrl(provider),
+      capabilities: [...CHANNEL_CAPABILITIES[provider]],
+      enabled: !isApiChannelProvider(provider),
+      modelAllowlist: "",
     }));
   }
 
@@ -6446,24 +7172,28 @@ function ChannelFields({
           </Alert>
         )}
 
-        <Field>
-          <FieldLabel htmlFor="channel-provider">Provider</FieldLabel>
-          <select
-            id="channel-provider"
-            className="h-9 rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
+        <Field data-disabled={providerLocked}>
+          <FieldLabel id="channel-provider-label">Provider</FieldLabel>
+          <ToggleGroup
+            aria-labelledby="channel-provider-label"
+            variant="outline"
+            spacing={2}
+            className="flex-wrap"
             disabled={providerLocked}
-            value={form.provider}
-            onChange={(event) =>
-              updateProvider(
-                event.target.value === "claude" ? "claude" : "codex",
-              )
-            }
+            value={[form.provider]}
+            onValueChange={(values) => {
+              const provider = CHANNEL_PROVIDERS.find((item) => item === values[0]);
+              if (provider) updateProvider(provider);
+            }}
           >
-            <option value="codex">Codex</option>
-            <option value="claude">Claude</option>
-          </select>
+            {CHANNEL_PROVIDERS.map((provider) => (
+              <ToggleGroupItem key={provider} value={provider}>
+                {channelProviderLabel(provider)}
+              </ToggleGroupItem>
+            ))}
+          </ToggleGroup>
           <FieldDescription>
-            创建后不可修改。API Key 绑定到这个通道后才能使用对应 provider。
+            创建后不可修改。Codex / Claude / Antigravity 为 OAuth；OpenAI-compatible / Anthropic 为上游 API Key，可能按量计费，必须由下游 Relay Key 显式绑定。
           </FieldDescription>
         </Field>
 
@@ -6472,7 +7202,7 @@ function ChannelFields({
           <Input
             id="channel-name"
             value={form.name}
-            placeholder={`${channelProviderLabel(form.provider)} · account@example.com`}
+            placeholder={`${channelProviderLabel(form.provider)} · ${apiProvider ? "API 通道" : "account@example.com"}`}
             onChange={(event) => update("name", event.target.value)}
           />
         </Field>
@@ -6495,7 +7225,9 @@ function ChannelFields({
           <FieldContent>
             <FieldLabel htmlFor="channel-enabled">启用通道</FieldLabel>
             <FieldDescription>
-              关闭后这个通道不会参与自动路由。
+              {apiProvider
+                ? "新 API 通道默认关闭；启用后仍需下游 Relay Key 显式绑定，才会参与路由。"
+                : "关闭后这个通道不会参与自动路由。"}
             </FieldDescription>
           </FieldContent>
           <Switch
@@ -6509,13 +7241,17 @@ function ChannelFields({
           <FieldLabel htmlFor="channel-base-url">上游基础 URL</FieldLabel>
           <Input
             id="channel-base-url"
+            disabled={antigravityProvider}
             value={form.baseUrl}
             placeholder={`留空使用服务端默认 ${channelProviderLabel(form.provider)} 基础 URL`}
             onChange={(event) => update("baseUrl", event.target.value)}
           />
+          <FieldDescription>
+            {antigravityProvider ? "使用 Google Antigravity 上游地址。" : apiProvider ? "API 基础 URL 应包含 /v1；留空使用服务端默认值。API Key 会发送至该地址，请只填写可信上游。" : "留空使用服务端默认 OAuth 地址。"}
+          </FieldDescription>
         </Field>
 
-        <div className="grid gap-4 sm:grid-cols-2">
+        <FieldGroup className="sm:grid sm:grid-cols-2">
           <Field>
             <FieldLabel htmlFor="channel-priority">优先级</FieldLabel>
             <Input
@@ -6536,17 +7272,49 @@ function ChannelFields({
             />
             <FieldDescription>同优先级下按权重选择。</FieldDescription>
           </Field>
-        </div>
+        </FieldGroup>
 
         <Field>
-          <FieldLabel htmlFor="channel-models">模型白名单</FieldLabel>
+          <FieldLabel id="channel-capabilities-label">通道能力</FieldLabel>
+          <ToggleGroup
+            multiple
+            variant="outline"
+            spacing={2}
+            className="flex-wrap"
+            aria-labelledby="channel-capabilities-label"
+            value={form.capabilities}
+            onValueChange={(values) => update("capabilities", CHANNEL_CAPABILITIES[form.provider].filter((operation) => values.includes(operation)))}
+          >
+            {CHANNEL_CAPABILITIES[form.provider].map((operation) => (
+              <ToggleGroupItem key={operation} value={operation}>
+                {CAPABILITY_LABELS[operation]}
+              </ToggleGroupItem>
+            ))}
+          </ToggleGroup>
+          <FieldDescription>
+            可全部取消；空能力列表不开放任何上游操作，不会恢复默认能力。Anthropic 的 Messages 同时允许 Chat / Responses 协议转换；Codex 的 Responses 同时允许 Claude Messages（Claude Code）与本地 Token 计数；能力选项不代表供应商已授予模型或图像权限。
+          </FieldDescription>
+        </Field>
+
+        <Field>
+          <FieldLabel htmlFor="channel-models">模型白名单{requiresModels ? "（必填）" : ""}</FieldLabel>
           <Textarea
             id="channel-models"
             className="min-h-24"
+            required={requiresModels}
             value={form.modelAllowlist}
-            placeholder="留空表示不限模型，例如 gpt-5.5(xhigh) 或 claude-opus-4-8(1m)(max)"
+            placeholder={
+              requiresModels
+                ? "必填：手工输入供应商已授权的模型 ID，每行或逗号分隔"
+                : antigravityProvider
+                  ? "留空表示使用绑定账号的模型目录，例如 gemini-3-pro-high 或 claude-sonnet-4-6"
+                  : "留空表示不限模型，例如 gpt-5.5(xhigh) 或 claude-opus-4-8(1m)(max)"
+            }
             onChange={(event) => update("modelAllowlist", event.target.value)}
           />
+          <FieldDescription>
+            手工填写模型 ID，实际可用性以供应商和该 Key 的权限为准。Antigravity 留空时按绑定账号的模型目录路由，Claude / GPT-OSS 仅在目录明确包含时才会走 Antigravity。Codex 模型名（含图像模型）不保证在 OpenAI-compatible 官方 API 可用。
+          </FieldDescription>
         </Field>
       </FieldGroup>
     </FieldSet>
@@ -7728,7 +8496,29 @@ function renderChannelProviderBadge(provider: ChannelRecord["provider"]) {
 }
 
 function channelProviderLabel(provider: ChannelRecord["provider"]) {
-  return provider === "claude" ? "Claude" : "Codex";
+  const labels: Record<ChannelRecord["provider"], string> = {
+    codex: "Codex",
+    claude: "Claude",
+    antigravity: "Antigravity",
+    openai: "OpenAI-compatible API",
+    anthropic: "Anthropic API",
+  };
+  return labels[provider];
+}
+
+function isApiChannelProvider(provider: ChannelRecord["provider"]) {
+  return provider === "openai" || provider === "anthropic";
+}
+
+function defaultChannelBaseUrl(provider: ChannelRecord["provider"]) {
+  if (provider === "openai") return "https://api.openai.com/v1";
+  if (provider === "anthropic") return "https://api.anthropic.com/v1";
+  return "";
+}
+
+function routableCredentialName(credential: RoutableCredentialRecord) {
+  if ("keyPrefix" in credential) return credential.name || credential.id;
+  return credential.email || credential.accountId || credential.id;
 }
 
 function renderChannelStatusBadge(status: ChannelStatus) {
@@ -7817,6 +8607,9 @@ function assertApiKey(apiKey: PublicApiKey | null | undefined) {
 
 function channelToForm(channel: ChannelRecord): ChannelFormState {
   return {
+    capabilities: [
+      ...(channel.capabilities ?? CHANNEL_CAPABILITIES[channel.provider]),
+    ],
     provider: channel.provider,
     name: channel.name,
     credentialIds: channel.credentialIds.join("\n"),
@@ -7831,6 +8624,7 @@ function channelToForm(channel: ChannelRecord): ChannelFormState {
 function channelFormToPayload(form: ChannelFormState): ChannelPayload {
   const credentialIds = parseList(form.credentialIds);
   return {
+    capabilities: form.capabilities,
     provider: form.provider,
     name: form.name.trim(),
     credentialId: credentialIds[0],

@@ -1,6 +1,10 @@
 import "server-only";
 
-import { copyAccountQuotaHeaders } from "@/src/server/http/accountQuota";
+import { countAntigravityTokens, sendAntigravity, type AntigravityOutcome } from "@/src/server/antigravity/client";
+import { claudeMessagesToResponses, responsesStreamToClaude, responsesToClaudeMessage } from "@/src/server/antigravity/messages";
+import { copyAccountQuotaHeaders, withAccountQuotaHeaders } from "@/src/server/http/accountQuota";
+import { forwardApiKeyRequest, type ApiKeyRelayResult } from "@/src/server/upstream/forward";
+import { forwardedPayloadSnapshot, redactText, redactValue } from "@/src/server/upstream/client";
 
 import { createClaudeNativeSseStream } from "@/src/server/claude/nativeStream";
 import { claudePolicy } from "@/src/server/claude/wire";
@@ -29,7 +33,9 @@ import {
   normalizeRawCodexResponsesPayload,
   normalizeResponsesPayload,
   parseCodexSseResponse,
+  restoreOriginalToolName,
 } from "@/src/server/codex/client";
+import { claudeCodePromptCacheKey, claudeMessagesToCodex, countCodexInputTokens } from "@/src/server/codex/messages";
 import { createOpenAIChatSseStream } from "@/src/server/codex/chatStream";
 import {
   chatCompletionsToClaude,
@@ -59,17 +65,24 @@ import {
 } from "@/src/server/repositories/logs";
 import { authenticateRelayRequest } from "@/src/server/services/apiKeys";
 import {
+  credentialLogLabel,
   recordChannelFailure,
   recordChannelSuccess,
   selectChannel,
+  selectChannelForRequest,
+  listChannelRecords,
 } from "@/src/server/services/channels";
 import { listPublicCodexCredentials } from "@/src/server/services/codexCredentials";
+import { listAntigravityCredentials } from "@/src/server/repositories/antigravityCredentials";
 
 import { maybeAutoPruneRequestLogs } from "@/src/server/services/logRetention";
 import { getFullRequestLoggingSetting } from "@/src/server/services/settings";
 import type {
   ChannelRecord,
   RelayApiKeyContext,
+  SelectedChannel,
+  UpstreamCredentialWithSecret,
+  UpstreamOperation,
   UsageSnapshot,
 } from "@/src/shared/types/entities";
 
@@ -101,16 +114,35 @@ export async function handleModels(request: Request) {
       new URL(request.url).searchParams.get("plan") ||
       credentials[0]?.planType ||
       "";
-    const payload = await timing.timeAsync(
-      "create_models",
-      "生成模型列表",
-      () =>
-        createModelsResponse({
-          planType,
-          openAICompatible: true,
-          modelAllowlist: apiKey.modelAllowlist,
-        }),
+    const channels = listChannelRecords();
+    const hasOAuthAccess = apiKey.channelAllowlist.length === 0 || channels.some((channel) =>
+      (channel.provider === "codex" || channel.provider === "claude") &&
+      apiKey.channelAllowlist.includes(channel.id),
     );
+    const payload: { object: string; data: Array<{ id: string; object: string; created?: unknown; owned_by?: unknown }> } = hasOAuthAccess
+      ? await timing.timeAsync("create_models", "生成模型列表", () =>
+          createModelsResponse({ planType, openAICompatible: true, modelAllowlist: apiKey.modelAllowlist }),
+        )
+      : { object: "list", data: [] };
+    const seen = new Set(payload.data.map((entry) => entry.id));
+    const enabledAntigravity = new Map(listAntigravityCredentials()
+      .filter(credential => credential.enabled).map(credential => [credential.id, credential]));
+    for (const channel of channels) {
+      const isAntigravity = channel.provider === "antigravity";
+      if ((!isAntigravity && channel.provider !== "openai" && channel.provider !== "anthropic") ||
+        (!(isAntigravity && apiKey.channelAllowlist.length === 0) && !apiKey.channelAllowlist.includes(channel.id)) || !channel.enabled ||
+        channel.status === "disabled" || channel.capabilities.length === 0) continue;
+      if (isAntigravity && !channel.credentialIds.some(id => enabledAntigravity.has(id))) continue;
+      // An Antigravity channel without an allowlist offers the catalogs of its bound accounts.
+      const channelModels = isAntigravity && channel.modelAllowlist.length === 0
+        ? [...new Set(channel.credentialIds.flatMap(id => enabledAntigravity.get(id)?.models ?? []))].sort()
+        : channel.modelAllowlist;
+      for (const model of channelModels) {
+        if (seen.has(model) || (apiKey.modelAllowlist.length > 0 && !apiKey.modelAllowlist.includes(model))) continue;
+        seen.add(model);
+        payload.data.push({ id: model, object: "model", owned_by: channel.provider });
+      }
+    }
     const logId = appendRequestLogWithAutoPrune({
       startedAt,
       method: request.method,
@@ -161,26 +193,33 @@ export async function handleOpenAIResponses(request: Request) {
     input = await timing.timeAsync("read_request_body", "读取请求 Body", () =>
       readJsonObject(request),
     );
-    if (isClaudeModel(input.model)) {
+    const model = stringValue(input.model) || serverConfig.codexDefaultModel;
+    const selected = timing.time("select_channel", "选择通道", () =>
+      selectChannelForRequest({ operation: "responses", model, apiKey: apiKey! }),
+    );
+    channel = selected.channel;
+    if (selected.credential.provider === "antigravity") {
+      const stream = input.stream === true;
+      const outcome = await dispatchAntigravity({
+        request, startedAt, start, timing, apiKey, selected, operation: "responses", model, payload: input,
+        stream, includeThoughtsByDefault: true, requestType: "responses.antigravity",
+      });
+      if (outcome.type === "error") return antigravityErrorResponse(outcome);
+      return outcome.type === "stream" ? sseResponse(outcome.body) : Response.json(outcome.value);
+    }
+    if (isApiCredential(selected.credential)) {
+      return await forwardSelectedApiRequest({ request, startedAt, start, timing, apiKey,
+        selected, operation: "responses", payload: input, requestType: "responses" });
+    }
+    if (selected.credential.provider === "claude") {
       return await handleClaudeResponsesWithContext({
-        request,
-        startedAt,
-        start,
-        timing,
-        apiKey,
-        input,
+        request, startedAt, start, timing, apiKey, input, selection: selected,
       });
     }
     const stream = Boolean(input.stream);
     const payload = timing.time("normalize_payload", "规范化请求 Payload", () =>
       normalizeResponsesPayload(input!, { stream: true }),
     );
-    const model = stringValue(payload.model) || serverConfig.codexDefaultModel;
-    const selected = timing.time("select_channel", "选择通道", () =>
-      selectChannel({ model, apiKey: apiKey! }),
-    );
-    channel = selected.channel;
-
     if (stream) {
       return await forwardCodexStream({
         request,
@@ -300,35 +339,21 @@ export async function handleRawCodexCompact(request: Request) {
 export async function handleImagesGenerations(request: Request) {
   return handleImagesProxy(request, {
     requestType: "images.generations",
-    buildRequest: async (timing) => {
-      const input = await timing.timeAsync(
-        "read_request_body",
-        "读取图片请求 Body",
-        () => readJsonObject(request),
-      );
-      return timing.time("normalize_payload", "构造图片生成 Payload", () =>
-        buildImagesGenerationsRequest(input),
-      );
-    },
+    operation: "images_generations",
+    readRequest: (timing) => timing.timeAsync("read_request_body", "读取图片请求 Body", () => readJsonObject(request)),
   });
 }
 
 export async function handleImagesEdits(request: Request) {
   return handleImagesProxy(request, {
     requestType: "images.edits",
-    buildRequest: async (timing) => {
+    operation: "images_edits",
+    readRequest: async (timing) => {
       const contentType = request.headers.get("content-type") || "";
       if (contentType.toLowerCase().startsWith("application/json")) {
-        const input = await timing.timeAsync(
-          "read_request_body",
-          "读取图片编辑 JSON Body",
-          () => readJsonObject(request),
-        );
-        return timing.time("normalize_payload", "构造图片编辑 Payload", () =>
-          buildImagesEditsJsonRequest(input),
-        );
+        return timing.timeAsync("read_request_body", "读取图片编辑 JSON Body", () => readJsonObject(request));
       }
-      const formData = await timing.timeAsync(
+      return timing.timeAsync(
         "read_request_body",
         "读取图片编辑 Multipart Body",
         async () => {
@@ -343,11 +368,6 @@ export async function handleImagesEdits(request: Request) {
           }
         },
       );
-      return await timing.timeAsync(
-        "normalize_payload",
-        "构造图片编辑 Payload",
-        () => buildImagesEditsMultipartRequest(formData),
-      );
     },
   });
 }
@@ -356,7 +376,8 @@ async function handleImagesProxy(
   request: Request,
   input: {
     requestType: string;
-    buildRequest: (timing: StageTimer) => Promise<CodexImagesRequest>;
+    operation: "images_generations" | "images_edits";
+    readRequest: (timing: StageTimer) => Promise<Record<string, unknown> | FormData>;
   },
 ) {
   const startedAt = new Date().toISOString();
@@ -365,16 +386,30 @@ async function handleImagesProxy(
   let apiKey: RelayApiKeyContext | null = null;
   let channel: ChannelRecord | null = null;
   let imageRequest: CodexImagesRequest | null = null;
+  let original: Record<string, unknown> | FormData | undefined;
   try {
     apiKey = timing.time("authenticate", "认证 API Key", () =>
       authenticateRelayRequest(request),
     );
-    imageRequest = await input.buildRequest(timing);
+    original = await input.readRequest(timing);
+    const model = stringValue(original instanceof FormData ? original.get("model") : original.model) || "gpt-image-2";
     const selected = timing.time("select_channel", "选择通道", () =>
-      selectChannel({ model: imageRequest!.model, apiKey: apiKey! }),
+      selectChannelForRequest({ operation: input.operation, model, apiKey: apiKey! }),
     );
     channel = selected.channel;
-
+    if (isApiCredential(selected.credential)) {
+      return await forwardSelectedApiRequest({ request, startedAt, start, timing, apiKey,
+        selected, operation: input.operation, payload: original, requestType: input.requestType });
+    }
+    if (selected.credential.provider !== "codex") {
+      throw new HttpError(400, "unsupported_image_provider", "Selected channel does not support image requests");
+    }
+    const source = original;
+    imageRequest = await timing.timeAsync("normalize_payload", "构造 Codex 图片 Payload", async () =>
+      source instanceof FormData ? buildImagesEditsMultipartRequest(source)
+        : input.operation === "images_edits" ? buildImagesEditsJsonRequest(source)
+          : buildImagesGenerationsRequest(source),
+    );
     if (isFreeCodexPlan(selected.credential.planType)) {
       throw new HttpError(
         403,
@@ -510,7 +545,7 @@ async function handleImagesProxy(
       error,
       apiKey,
       channel,
-      imageRequest?.requestBody,
+      imageRequest?.requestBody ?? (original ? forwardedPayloadSnapshot(original) : undefined),
       timing,
     );
     return errorToResponse(error);
@@ -668,14 +703,33 @@ export async function handleChatCompletions(request: Request) {
     input = await timing.timeAsync("read_request_body", "读取请求 Body", () =>
       readJsonObject(request),
     );
-    if (isClaudeModel(input.model)) {
+    const model = stringValue(input.model) || serverConfig.codexDefaultModel;
+    const selected = timing.time("select_channel", "选择通道", () =>
+      selectChannelForRequest({ operation: "chat", model, apiKey: apiKey! }),
+    );
+    channel = selected.channel;
+    if (isApiCredential(selected.credential)) {
+      return await forwardSelectedApiRequest({ request, startedAt, start, timing, apiKey,
+        selected, operation: "chat", payload: input, requestType: "chat.completions" });
+    }
+    if (selected.credential.provider === "antigravity") {
+      const stream = input.stream === true;
+      const { payload: converted, toolNameMaps } = chatCompletionsToCodex(input, { stream });
+      // Chat requests carry max_tokens; the Codex converter drops sampling fields Antigravity understands.
+      const responsesPayload: Record<string, unknown> = { ...converted, temperature: input.temperature,
+        top_p: input.top_p, max_output_tokens: input.max_completion_tokens ?? input.max_tokens };
+      if (input.reasoning_effort === undefined && (!input.reasoning || typeof input.reasoning !== "object")) delete responsesPayload.reasoning;
+      const outcome = await dispatchAntigravity({
+        request, startedAt, start, timing, apiKey, selected, operation: "chat", model, payload: responsesPayload,
+        stream, requestType: "chat.completions.antigravity", requestBody: input,
+      });
+      if (outcome.type === "error") return antigravityErrorResponse(outcome);
+      if (outcome.type === "json") return Response.json(codexResponseToChatCompletion(outcome.value, model, toolNameMaps));
+      return sseResponse(createOpenAIChatSseStream(outcome.body, { fallbackModel: model, toolNameMaps }));
+    }
+    if (selected.credential.provider === "claude") {
       return await handleClaudeChatCompletionsWithContext({
-        request,
-        startedAt,
-        start,
-        timing,
-        apiKey,
-        input,
+        request, startedAt, start, timing, apiKey, input, selection: selected,
       });
     }
     const stream = Boolean(input.stream);
@@ -684,12 +738,6 @@ export async function handleChatCompletions(request: Request) {
       "Chat 转换为 Codex Payload",
       () => chatCompletionsToCodex(input!, { stream: true }),
     );
-    const model = stringValue(payload.model) || serverConfig.codexDefaultModel;
-    const selected = timing.time("select_channel", "选择通道", () =>
-      selectChannel({ model, apiKey: apiKey! }),
-    );
-    channel = selected.channel;
-
     if (stream) {
       const { response, credential, upstreamPayload, upstreamRequestHeaders } =
         await codexFetch("/responses", payload, {
@@ -898,6 +946,137 @@ export async function handleChatCompletions(request: Request) {
   }
 }
 
+// Shared Antigravity dispatch: one request builder, CPA 429 failover across credentials, and one log entry.
+async function dispatchAntigravity(input: {
+  request: Request;
+  startedAt: string;
+  start: number;
+  timing: StageTimer;
+  apiKey: RelayApiKeyContext;
+  selected: SelectedChannel;
+  operation: UpstreamOperation;
+  model: string;
+  payload: Record<string, unknown>;
+  stream: boolean;
+  includeThoughtsByDefault?: boolean;
+  requestType: string;
+  requestBody?: unknown;
+}) {
+  return sendAntigravity({
+    request: input.request,
+    model: input.model,
+    payload: input.payload,
+    stream: input.stream,
+    includeThoughtsByDefault: input.includeThoughtsByDefault,
+    selected: input.selected,
+    reselect(exclude) {
+      try {
+        return selectChannelForRequest({ operation: input.operation, model: input.model, apiKey: input.apiKey,
+          provider: "antigravity", excludeCredentialIds: exclude });
+      } catch {
+        return null;
+      }
+    },
+    onFailover(selected, error) {
+      recordChannelFailure(selected.channel, { statusCode: error.status, message: error.message });
+    },
+    onResult({ status, usage, error, selected }) {
+      if (!error) recordChannelSuccess(selected.channel);
+      else if (status !== 400 && status !== 499) recordChannelFailure(selected.channel, { statusCode: status, message: error.message });
+      appendSuccessLog({
+        request: input.request, startedAt: input.startedAt, start: input.start, timing: input.timing,
+        apiKey: input.apiKey, channel: selected.channel, credentialId: selected.credential.id,
+        credentialEmail: "email" in selected.credential ? selected.credential.email : undefined, requestType: input.requestType, stream: input.stream,
+        model: input.model, statusCode: status, usage, errorCode: error?.code, errorMessage: error?.message,
+        requestBody: input.requestBody ?? input.payload,
+      });
+    },
+  });
+}
+
+function antigravityErrorResponse(outcome: Extract<AntigravityOutcome, { type: "error" }>) {
+  const headers = new Headers();
+  if (outcome.retryAfter) headers.set("retry-after", outcome.retryAfter);
+  return Response.json({ error: { code: outcome.error.code, message: outcome.error.message } },
+    { status: outcome.error.status, headers });
+}
+
+function sseResponse(body: ReadableStream<Uint8Array>) {
+  return new Response(body, { headers: withStreamingHeaders(new Headers({ "Content-Type": "text/event-stream; charset=utf-8" })) });
+}
+function isApiCredential(credential: SelectedChannel["credential"]): credential is UpstreamCredentialWithSecret {
+  return credential.provider === "openai" || credential.provider === "anthropic";
+}
+
+async function forwardSelectedApiRequest(input: {
+  request: Request;
+  startedAt: string;
+  start: number;
+  timing: StageTimer;
+  apiKey: RelayApiKeyContext;
+  selected: SelectedChannel;
+  operation: UpstreamOperation;
+  payload: Record<string, unknown> | FormData;
+  requestType: string;
+}) {
+  const { channel, credential } = input.selected;
+  if (!isApiCredential(credential)) {
+    throw new HttpError(500, "invalid_api_channel", "Selected credential is not an API Key credential");
+  }
+  const stream = input.operation !== "count_tokens" && (input.payload instanceof FormData
+    ? input.payload.get("stream") === "true" : input.payload.stream === true);
+  let reported = false;
+  const report = (result: ApiKeyRelayResult) => {
+    if (reported) return;
+    reported = true;
+    if (result.errorCode || result.statusCode >= 400) {
+      recordChannelFailure(channel, { statusCode: result.statusCode, message: result.errorMessage });
+    } else {
+      recordChannelSuccess(channel);
+    }
+    appendSuccessLog({
+      request: input.request,
+      startedAt: input.startedAt,
+      start: input.start,
+      apiKey: input.apiKey,
+      channel,
+      credentialId: credential.id,
+      credentialEmail: credential.name,
+      requestType: input.requestType + "." + credential.provider,
+      stream,
+      model: stringValue(input.payload instanceof FormData ? input.payload.get("model") : input.payload.model),
+      requestBody: redactValue(forwardedPayloadSnapshot(input.payload), credential.apiKey),
+      ...result,
+      timing: input.timing,
+    });
+  };
+  let response: Response;
+  try {
+    response = await forwardApiKeyRequest({
+      request: input.request, channel, credential,
+      operation: input.operation, payload: input.payload, timing: input.timing,
+      captureBody: getFullRequestLoggingSetting(), onResult: report,
+    });
+  } catch (error) {
+    const safe = new HttpError(error instanceof HttpError ? error.status : 502,
+      error instanceof HttpError ? error.code : "upstream_request_failed",
+      redactText(error instanceof Error ? error.message : "API upstream request failed", credential.apiKey));
+    report({ statusCode: safe.status, usage: emptyUsage(), errorCode: safe.code,
+      errorMessage: safe.message, error: safe, upstreamHeaders: new Headers() });
+    response = credential.provider === "anthropic" && (input.operation === "messages" || input.operation === "count_tokens")
+      ? Response.json({ type: "error", error: {
+          type: safe.status < 500 ? "invalid_request_error" : "api_error", message: safe.message,
+        } }, { status: safe.status })
+      : errorToResponse(safe);
+  }
+  if (response.headers.get("content-type")?.includes("text/event-stream")) {
+    return withAccountQuotaHeaders(new Response(response.body, {
+      status: response.status, headers: withStreamingHeaders(new Headers(response.headers)),
+    }), credential.provider, credential.id);
+  }
+  return withAccountQuotaHeaders(response, credential.provider, credential.id);
+}
+
 async function handleClaudeChatCompletionsWithContext(input: {
   request: Request;
   startedAt: string;
@@ -905,6 +1084,7 @@ async function handleClaudeChatCompletionsWithContext(input: {
   timing: StageTimer;
   apiKey: RelayApiKeyContext;
   input: Record<string, unknown>;
+  selection?: SelectedChannel;
 }) {
   const stream = Boolean(input.input.stream);
   const conversion = input.timing.time(
@@ -914,7 +1094,7 @@ async function handleClaudeChatCompletionsWithContext(input: {
   );
   const model =
     stringValue(input.input.model) || serverConfig.claudeDefaultModel;
-  const selected = input.timing.time("select_channel", "选择 Claude 通道", () =>
+  const selected = input.selection ?? input.timing.time("select_channel", "选择 Claude 通道", () =>
     selectChannel({ provider: "claude", model, apiKey: input.apiKey }),
   );
   const channel = selected.channel;
@@ -1125,6 +1305,7 @@ async function handleClaudeResponsesWithContext(input: {
   timing: StageTimer;
   apiKey: RelayApiKeyContext;
   input: Record<string, unknown>;
+  selection?: SelectedChannel;
 }) {
   const stream = Boolean(input.input.stream);
   const conversion = input.timing.time(
@@ -1134,7 +1315,7 @@ async function handleClaudeResponsesWithContext(input: {
   );
   const model =
     stringValue(input.input.model) || serverConfig.claudeDefaultModel;
-  const selected = input.timing.time("select_channel", "选择 Claude 通道", () =>
+  const selected = input.selection ?? input.timing.time("select_channel", "选择 Claude 通道", () =>
     selectChannel({ provider: "claude", model, apiKey: input.apiKey }),
   );
   const channel = selected.channel;
@@ -1785,7 +1966,8 @@ function appendSuccessLog(input: {
     channelId: input.channel?.id,
     channelName: input.channel?.name,
     credentialId: input.credentialId ?? input.channel?.credentialId,
-    credentialEmail: input.credentialEmail || "",
+    credentialEmail: input.credentialEmail || (input.channel
+      ? credentialLogLabel(input.channel.provider, input.credentialId ?? input.channel.credentialId) : ""),
     usage: input.usage,
     errorCode: input.errorCode,
     errorMessage: input.errorMessage,
@@ -1837,6 +2019,8 @@ function appendErrorLog(
     channelId: channel?.id,
     channelName: channel?.name,
     credentialId: channel?.credentialId,
+    // Errors thrown after routing (token refresh, transport, conversion) still name the selected account.
+    credentialEmail: channel ? credentialLogLabel(channel.provider, channel.credentialId) : "",
     errorCode: error instanceof HttpError ? error.code : "internal_error",
     errorMessage: error instanceof Error ? error.message : String(error),
   };
@@ -2105,12 +2289,47 @@ async function handleClaudeNativeRequest(request: Request, countTokens: boolean)
     apiKey = authenticateRelayRequest(request);
     payload = await readJsonObject(request);
     const model = stringValue(payload.model);
-    if (!isClaudeModel(model)) throw new HttpError(400, "unsupported_claude_model", "A Claude model is required");
+    if (!model) throw new HttpError(400, "missing_model", "A model is required");
     if (!Array.isArray(payload.messages) || payload.messages.length === 0) {
       throw new HttpError(400, "invalid_messages", "messages must be a non-empty array");
     }
-    const selected = selectChannel({ provider: "claude", model, apiKey });
+    const operation = countTokens ? "count_tokens" : "messages";
+    const selected = selectChannelForRequest({ operation, model, apiKey });
     channel = selected.channel;
+    if (isApiCredential(selected.credential)) {
+      return await forwardSelectedApiRequest({ request, startedAt, start, timing, apiKey,
+        selected, operation, payload, requestType });
+    }
+    if (selected.credential.provider === "antigravity") {
+      const converted = claudeMessagesToResponses(payload);
+      if (countTokens) {
+        const inputTokens = await countAntigravityTokens({ request, model, payload: converted, credentialId: selected.credential.id });
+        recordChannelSuccess(channel);
+        appendSuccessLog({ request, startedAt, start, timing, apiKey, channel, credentialEmail: selected.credential.email,
+          requestType: requestType + ".antigravity", stream: false, model, statusCode: 200, usage: emptyUsage(), requestBody: payload });
+        return Response.json({ input_tokens: inputTokens });
+      }
+      const stream = payload.stream === true;
+      const outcome = await dispatchAntigravity({
+        request, startedAt, start, timing, apiKey, selected, operation, model, payload: converted,
+        stream, requestType: requestType + ".antigravity", requestBody: payload,
+      });
+      if (outcome.type === "error") {
+        return Response.json({ type: "error", error: {
+          type: outcome.error.status === 429 ? "rate_limit_error" : outcome.error.status < 500 ? "invalid_request_error" : "api_error",
+          message: outcome.error.message,
+        } }, { status: outcome.error.status, headers: outcome.retryAfter ? { "retry-after": outcome.retryAfter } : undefined });
+      }
+      if (outcome.type === "json") return Response.json(responsesToClaudeMessage(outcome.value, model));
+      return sseResponse(responsesStreamToClaude(outcome.body, model));
+    }
+    if (selected.credential.provider === "codex") {
+      return await handleCodexClaudeMessages({ request, startedAt, start, timing, apiKey, channel, payload,
+        model, countTokens, requestType: requestType + ".codex" });
+    }
+    if (!isClaudeModel(model) || selected.credential.provider !== "claude") {
+      throw new HttpError(400, "unsupported_claude_model", "A Claude model is required for an OAuth channel");
+    }
     const stream = !countTokens && payload.stream === true;
     const forwarded = structuredClone(payload);
     if (!countTokens && !forwarded.max_tokens) forwarded.max_tokens = claudePolicy(model)?.max_completion_tokens || 32000;
@@ -2171,6 +2390,75 @@ async function handleClaudeNativeRequest(request: Request, countTokens: boolean)
       message: error instanceof HttpError ? error.message : "Internal Server Error",
     } }, { status });
   }
+}
+
+// Claude Messages over a Codex OAuth channel, as CPA does for Claude Code: the request becomes a Codex Responses
+// call and the Responses SSE is re-framed as Claude SSE. count_tokens is computed locally like CPA's executor.
+async function handleCodexClaudeMessages(input: {
+  request: Request;
+  startedAt: string;
+  start: number;
+  timing: StageTimer;
+  apiKey: RelayApiKeyContext;
+  channel: ChannelRecord;
+  payload: Record<string, unknown>;
+  model: string;
+  countTokens: boolean;
+  requestType: string;
+}) {
+  const { request, startedAt, start, timing, apiKey, channel, payload, model, requestType } = input;
+  const { payload: converted, toolNameMaps } = timing.time("normalize_payload", "Messages 转换为 Codex Payload", () =>
+    claudeMessagesToCodex(payload));
+  if (input.countTokens) {
+    const inputTokens = countCodexInputTokens(converted);
+    recordChannelSuccess(channel);
+    appendSuccessLog({ request, startedAt, start, timing, apiKey, channel, credentialEmail: "", requestType,
+      stream: false, model, statusCode: 200, usage: emptyUsage(), requestBody: payload });
+    return Response.json({ input_tokens: inputTokens });
+  }
+  const restoreName = (name: string) => restoreOriginalToolName(name, toolNameMaps);
+  const stream = payload.stream === true;
+  const promptCacheKey = claudeCodePromptCacheKey(request.headers, payload, model) || codexPromptCacheKeyForApiKey(apiKey);
+  if (stream) {
+    const response = await forwardCodexStream({
+      request, startedAt, start, apiKey, channel, payload: converted, upstreamPath: "/responses", requestType,
+      fallbackContentType: "text/event-stream; charset=utf-8", requestBody: payload, promptCacheKey, timing,
+    });
+    if (!response.ok || !response.body) {
+      const status = response.ok ? 502 : response.status;
+      return Response.json({ type: "error", error: {
+        type: status === 429 ? "rate_limit_error" : status < 500 ? "invalid_request_error" : "api_error",
+        message: "Upstream request failed",
+      } }, { status, headers: copyAccountQuotaHeaders(response.headers) });
+    }
+    const headers = withStreamingHeaders(copyAccountQuotaHeaders(response.headers));
+    headers.set("Content-Type", "text/event-stream; charset=utf-8");
+    return new Response(responsesStreamToClaude(response.body, model, restoreName), { status: 200, headers });
+  }
+  const result = await codexJson("/responses", converted, {
+    stream: true, sourceHeaders: request.headers, channel, promptCacheKey, timing,
+  });
+  const raw = parseCodexSseResponse(result.text) || result.json;
+  const context = {
+    request, startedAt, start, apiKey, channel, requestType, model, stream: false,
+    credentialEmail: result.credential.email, requestBody: payload, forwardedBody: result.upstreamPayload,
+    forwardedHeaders: result.upstreamRequestHeaders, upstreamHeaders: result.response.headers,
+    upstreamBody: result.text, timing,
+  };
+  if (!result.response.ok) {
+    recordChannelFailure(channel, { statusCode: result.response.status, message: result.text.slice(0, 500) });
+    appendSuccessLog({ ...context, statusCode: result.response.status, usage: emptyUsage(),
+      errorCode: "upstream_error", errorMessage: result.text.slice(0, 500) });
+    const status = result.response.status;
+    return Response.json({ type: "error", error: {
+      type: status === 429 ? "rate_limit_error" : status < 500 ? "invalid_request_error" : "api_error",
+      message: "Upstream request failed",
+    } }, { status, headers: copyAccountQuotaHeaders(result.response.headers) });
+  }
+  recordChannelSuccess(channel);
+  appendSuccessLog({ ...context, statusCode: 200, usage: extractUsageFromCodexResponse(raw) });
+  return Response.json(responsesToClaudeMessage(raw && typeof raw === "object" ? raw as Record<string, unknown> : {},
+    model, restoreName), { headers: copyAccountQuotaHeaders(result.response.headers) });
 }
 
 function isFreeCodexPlan(planType: string) {
