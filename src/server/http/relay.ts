@@ -1800,6 +1800,8 @@ function createCodexUsageMeterStream(
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const framer = new CodexResponsesSseFramer();
+  const reader = upstreamBody.getReader();
+  let canceled = false;
   let usage = emptyUsage();
   let firstTokenReported = false;
   let upstreamCompleted = false;
@@ -1831,7 +1833,7 @@ function createCodexUsageMeterStream(
 
   function processText(
     text: string,
-    controller: TransformStreamDefaultController<Uint8Array>,
+    controller: ReadableStreamDefaultController<Uint8Array>,
   ) {
     for (const frame of framer.push(text)) {
       handleCodexStreamFrame(
@@ -1848,12 +1850,15 @@ function createCodexUsageMeterStream(
     }
   }
 
-  return upstreamBody.pipeThrough(
-    new TransformStream<Uint8Array, Uint8Array>({
-      transform(chunk, controller) {
-        processText(decoder.decode(chunk, { stream: true }), controller);
-      },
-      flush(controller) {
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { value, done } = await reader.read();
+        if (canceled) return;
+        if (!done) {
+          processText(decoder.decode(value, { stream: true }), controller);
+          return;
+        }
         const tail = decoder.decode();
         if (tail) {
           processText(tail, controller);
@@ -1873,16 +1878,30 @@ function createCodexUsageMeterStream(
         }
         if (upstreamCompleted) {
           reportCompletedOnce();
-          return;
+        } else {
+          throw new Error(
+            "Upstream stream ended before response.completed; refusing to mark a truncated Codex stream as successful",
+          );
         }
-        const error = new Error(
-          "Upstream stream ended before response.completed; refusing to mark a truncated Codex stream as successful",
-        );
+      } catch (error) {
+        if (canceled) return;
         reportErrorOnce(error);
         controller.enqueue(encoder.encode(codexStreamErrorFrame(error)));
-      },
-    }),
-  );
+        await reader.cancel().catch(() => undefined);
+      }
+      if (canceled) return;
+      reader.releaseLock();
+      controller.close();
+    },
+    async cancel(reason) {
+      canceled = true;
+      try {
+        await reader.cancel(reason);
+      } finally {
+        reader.releaseLock();
+      }
+    },
+  });
 }
 
 function handleCodexStreamFrame(

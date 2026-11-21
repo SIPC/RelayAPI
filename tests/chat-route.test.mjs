@@ -32,6 +32,8 @@ const calls = [];
 const accountId = "10000000-0000-4000-8000-000000000001";
 const system = "CUSTOM_SYSTEM_SENTINEL: Reply in Chinese.";
 let mode = "normal";
+let breakCodexStream;
+let codexStreamClosed;
 const upstream = http.createServer(async (req, res) => {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -81,6 +83,17 @@ const upstream = http.createServer(async (req, res) => {
       { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: "你好" },
       { type: "response.completed", response },
     ];
+    if (mode === "codex-socket-error") {
+      for (const event of events.slice(0, 2)) res.write("data: " + JSON.stringify(event) + "\n\n");
+      breakCodexStream = () => res.destroy();
+      codexStreamClosed = once(res, "close");
+      return;
+    }
+    if (mode === "codex-truncated") {
+      for (const event of events.slice(0, 2)) res.write("data: " + JSON.stringify(event) + "\n\n");
+      res.end();
+      return;
+    }
     for (const event of events) res.write("data: " + JSON.stringify(event) + "\n\n");
     res.end(); return;
   }
@@ -353,6 +366,56 @@ test("Native Claude truncated SSE is an error in output and logs", async () => {
   assert.equal(log(channel).status_code, 502);
   assert.equal(log(channel).error_code, "stream_error");
 });
+test("Codex Responses socket failure preserves partial output, emits an error and logs the cause once", async () => {
+  mode = "codex-socket-error";
+  const { channel, key, model } = setup("codex");
+  const response = await handleResponses(request(key, { model, input: "Hi", stream: true }, "/v1/responses"));
+  assert.equal(response.status, 200); // Headers were already sent before the upstream failed.
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = decoder.decode((await reader.read()).value, { stream: true });
+  breakCodexStream();
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value, { stream: true });
+  }
+  text += decoder.decode();
+  reader.releaseLock();
+  assert.ok(text.includes("你好"));
+  assert.match(text, /event: error\ndata: .*upstream_stream_incomplete/);
+  assert.doesNotMatch(text, /response\.completed|\[DONE\]|UND_ERR_SOCKET/);
+  const row = log(channel);
+  assert.equal(row.status_code, 502);
+  assert.equal(row.error_code, "stream_error");
+  assert.match(row.error_message, /terminated/);
+  assert.equal(getLogDb().prepare("SELECT count(*) n FROM request_logs WHERE channel_id=?").get(channel.id).n, 1);
+  const detail = getLogDb().prepare("SELECT error_cause_json FROM request_log_details WHERE request_log_id=?").get(row.id);
+  assert.match(detail.error_cause_json, /UND_ERR_SOCKET/);
+});
+
+test("Codex Responses still reports an EOF without completion as a failure", async () => {
+  mode = "codex-truncated";
+  const { channel, key, model } = setup("codex");
+  const response = await handleResponses(request(key, { model, input: "Hi", stream: true }, "/v1/responses"));
+  const text = await response.text();
+  assert.match(text, /Upstream stream ended before completion/);
+  assert.doesNotMatch(text, /response\.completed/);
+  assert.equal(log(channel).error_code, "stream_error");
+});
+
+test("canceling Codex Responses closes upstream without recording an upstream failure", { timeout: 5000 }, async () => {
+  mode = "codex-socket-error";
+  const { channel, key, model } = setup("codex");
+  const response = await handleResponses(request(key, { model, input: "Hi", stream: true }, "/v1/responses"));
+  const reader = response.body.getReader();
+  await reader.read();
+  await reader.cancel("client disconnected");
+  reader.releaseLock();
+  await codexStreamClosed;
+  assert.equal(log(channel), undefined);
+});
+
 test("Native Claude upstream errors retain the Claude error format", async () => {
   mode = "reject";
   const { channel, key, model } = setup("claude");
