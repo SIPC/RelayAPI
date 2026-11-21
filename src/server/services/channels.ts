@@ -99,6 +99,29 @@ export function listChannelRecords() {
   );
 }
 
+// Quota disclosure requires explicit bindings, even though an empty channel
+// allowlist permits OAuth generation. Do not select a route or mark it used.
+export function listCodexQuotaCredentials(apiKey: RelayApiKeyContext) {
+  const channels = listChannels().filter((channel) =>
+    channel.provider === "codex" && channel.enabled && channel.status !== "disabled" &&
+    channel.capabilities.length > 0 && apiKey.channelAllowlist.includes(channel.id) &&
+    (apiKey.modelAllowlist.length === 0 || channel.modelAllowlist.length === 0 ||
+      apiKey.modelAllowlist.some((model) => modelMatchesAllowlist(
+        modelAllowlistCandidates("codex", model), channel.modelAllowlist,
+      ))),
+  );
+  const now = Date.now();
+  return listCodexCredentials().filter((credential) =>
+    credential.enabled && channels.some((channel) => channel.credentialIds.includes(credential.id)),
+  ).map((credential) => ({
+    credential,
+    routingState: (credential.cooldownUntil && Date.parse(credential.cooldownUntil) > now) ||
+      channels.filter((channel) => channel.credentialIds.includes(credential.id))
+        .every((channel) => channel.cooldownUntil && Date.parse(channel.cooldownUntil) > now)
+      ? "cooldown" as const : "eligible" as const,
+  })).sort((a, b) => a.credential.id.localeCompare(b.credential.id));
+}
+
 export function createChannel(input: CreateChannelInput) {
   const provider = normalizeChannelProvider(input.provider);
   const credentials = assertChannelCredentials(provider, input);

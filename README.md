@@ -203,6 +203,32 @@ CODEX_USER_AGENT="codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (cod
 清除管理台全局设置后，会回退到环境变量或内置默认值；清除凭据覆盖后，会使用当前全局 User-Agent。
 
 
+## CC Switch 的 Codex 上游额度查询
+
+`GET /v1/usage` 使用 `Authorization: Bearer <Relay Key>`，返回该 Key **明确绑定的通道所绑定的、已启用的 Codex OAuth 凭据**的 WHAM 额度。每份凭据分别提供 5 小时和每周窗口，不相加、不平均，不代表下一次请求一定选中的账号，也不是 Relay Key 的每日 Token 余额。
+
+### 配置步骤
+
+1. 在 Relay 管理台的 Codex 通道中绑定要展示的 OAuth 凭据。只看一个账号时，使用专用的单凭据通道；池模式可绑定多个凭据。
+2. 在 Relay API Key 的通道白名单里**明确勾选上述通道**。绑定即允许持有该 Key 的人查看这些凭据的账号整体额度；不另设开关。空通道白名单虽然可用于 OAuth 生成，但此查询返回空列表，不公开整个账号池。禁用通道/凭据、移除绑定立即撤回可见范围，Key 和通道的模型白名单无交集时也不展示；临时冷却的凭据仍列出并标记 `cooldown`。
+3. 在 CC Switch 中选择 **Codex → Relay 第三方供应商卡片 ⋯ → 配置用量查询 → 启用 → 自定义**，不要选择 Sub2API 或官方订阅模板。
+4. 完整复制 [自定义用量脚本](docs/cc-switch-usage.js) 到脚本框。API Key 和 Base URL 继承供应商配置；使用的是 **Relay Key，不是 Web 管理密钥或 OAuth token**。脚本内保留 `{{apiKey}}`、`{{baseUrl}}` 占位符，不填写真实密钥。Base URL 可以以 `/v1` 结尾，也可为根地址，支持网关路径前缀。
+5. 刷新间隔建议 **5 分钟**。点击“测试脚本”，成功后保存。两份凭据应得到四条记录，每条显示独立的剩余百分比、重置时间及快照时间；CC Switch 可能将这些条目称为“多个套餐”。
+
+### 返回与保鲜约定
+
+- JSON 的 `schema` 为 `relay.codex-quota.v1`，`selection` 为 `bound_channels`，`credentials[]` 每项包含 Key 范围内稳定的脱敏 `ref`、自动生成的 `label`、`routingState`、`cache` 和 `windows[]`。不会使用邮箱或私密备注作为名称，也不返回 OAuth token、邮箱、account_id、内部凭据 ID、raw、proxy 或上游错误正文。
+- 窗口 `id` 为 `5h` / `7d`，提供 `usedPercent`、`remainingPercent`、ISO `resetAt` 和 `state`；只展示上游确认时长的主窗口，非标准时长不冒充 5h/周。未知值为 `null`，不是 0。旧版缓存没有时长信息时会尝试受控刷新，刷新前不展示未经确认的百分比。
+- 凭据级复用现有 `codex_quota_cache`，2 分钟内为 `fresh`。到期/冷缓存请求会有限等待刷新（单次 WHAM 最长 8 秒），不使用请求结束后可能丢失的后台任务。同凭据 single-flight，所有 Key 和管理员刷新共享 SQLite 租约；共享同一主数据库的多个 worker 合计最多并发 4 次，超出时先返回快照或 `missing`，后续轮询继续补齐。独立数据库的部署不共享限频。
+- 刷新失败保留最后成功快照，按 30 秒、60 秒、120 秒等指数退避，最长 15 分钟，并遵守更长的 `Retry-After`。退避状态和租约持久化，进程重启不清空退避；崩溃租约到期后可恢复。管理员手动刷新也不绕过成功后的 2 分钟间隔或失败退避。
+- `cache.state` 为 `fresh` / `stale` / `expired` / `missing`，`cache.retrievedAt` 为实际 WHAM 快照时间，`ageSeconds` 为年龄。超过 10 分钟隐藏全部旧百分比；某窗口重置时间已过时单独标记 `reset_pending` 并隐藏该窗口百分比，不推定已恢复满额。另一个未重置的窗口仍可展示。
+- `force`、`refresh`、`raw`、`credentialId` 等查询参数均不改变行为或权限。每次响应均 `Cache-Control: no-store`。缺失/无效 Key 返回 401，禁用/到期 Key 返回 403；有效 Key 无可见凭据返回 200 和空列表。Key 每日 Token 已耗尽或上游窗口已耗尽仍返回 200；生成接口原有额度限制不变。
+- 脚本逐个返回数值有效的窗口，部分未知时在说明中标明遗漏数量，全部未知时提示稍后重试/检查绑定。CC Switch 可能保留上次成功结果，请以每行的**快照时间**判断新鲜度；重置时间是说明文字，不承诺自动倒计时。
+
+WHAM 是上游账号整体额度，包含其他 Key、设备和官方客户端的消耗，不是这把 Relay Key 独占的额度或精确剩余 Token 数。此接口只服务 CC Switch 自定义用量查询，**不实现 Codex CLI 原生 `/status`**。CC Switch 自定义脚本由桌面端后端请求，不需要额外开放浏览器 CORS。
+
+本地回归：`node --test tests/usage-route.test.mjs`（临时 SQLite、合成凭据、模拟 WHAM，同时执行完整脚本）。脚本契约基于 CC Switch 4.0.37 的实现；实际安装版本的桌面展示和真实账号额度应在获准部署后联调。
+
 ## Star History
 
 <a href="https://www.star-history.com/?repos=SIPC%2FRelayAPI&type=date&legend=top-left">

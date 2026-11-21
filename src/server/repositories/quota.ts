@@ -58,6 +58,28 @@ export function upsertCodexQuotaCache(input: UpsertCodexQuotaCacheInput) {
   return getCodexQuotaCacheByCredentialId(input.credentialId);
 }
 
+// A single atomic statement coordinates workers sharing the main SQLite DB.
+// Expiring leases recover from a stopped process; failed refreshes retain cache.
+export function acquireCodexQuotaRefresh(credentialId: string, owner: string, leaseMs: number) {
+  const now = Date.now();
+  return getMainDb().prepare(`
+    INSERT INTO codex_quota_refresh (credential_id, owner, lease_until)
+    SELECT ?, ?, ? WHERE (SELECT COUNT(*) FROM codex_quota_refresh WHERE lease_until > ?) < 4
+    ON CONFLICT(credential_id) DO UPDATE SET owner = excluded.owner, lease_until = excluded.lease_until
+    WHERE codex_quota_refresh.lease_until <= ? AND codex_quota_refresh.next_attempt_at <= ?
+    RETURNING failures
+  `).get(credentialId, owner, now + leaseMs, now, now, now) as { failures: number } | undefined;
+}
+
+export function finishCodexQuotaRefresh(
+  credentialId: string, owner: string, failures: number, delayMs: number,
+) {
+  getMainDb().prepare(`
+    UPDATE codex_quota_refresh SET lease_until = 0, failures = ?, next_attempt_at = ?
+    WHERE credential_id = ? AND owner = ?
+  `).run(failures, Date.now() + delayMs, credentialId, owner);
+}
+
 function toCodexQuotaCacheRecord(
   row: CodexQuotaCacheRow,
 ): CodexQuotaCacheRecord {

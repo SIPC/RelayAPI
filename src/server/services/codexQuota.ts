@@ -1,10 +1,13 @@
 import "server-only";
 
+import { randomUUID } from "node:crypto";
 import { serverConfig } from "@/src/server/config/env";
 import { HttpError, logServerError } from "@/src/server/http/errors";
 import { proxiedFetch } from "@/src/server/net/proxy";
 import { getCodexCredentialById } from "@/src/server/repositories/codexCredentials";
 import {
+  acquireCodexQuotaRefresh,
+  finishCodexQuotaRefresh,
   getCodexQuotaCacheByCredentialId,
   upsertCodexQuotaCache,
 } from "@/src/server/repositories/quota";
@@ -22,6 +25,9 @@ export const WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 
 const WINDOW_5H_SECONDS = 5 * 60 * 60;
 const WINDOW_7D_SECONDS = 7 * 24 * 60 * 60;
+export const CODEX_QUOTA_FRESH_MS = 2 * 60 * 1000;
+const QUOTA_TIMEOUT_MS = Math.min(serverConfig.requestTimeoutMs, 8_000);
+const refreshes = new Map<string, Promise<PublicCodexQuotaReport>>();
 
 type CodexQuotaStatus =
   | "unknown"
@@ -38,6 +44,7 @@ type RawObject = Record<string, unknown>;
 interface QuotaWindow {
   id: string;
   label: string;
+  window_seconds: number | null;
   used_percent: number | null;
   remaining_percent: number | null;
   reset_label: string;
@@ -82,10 +89,12 @@ export async function getCodexQuota({
   credentialId,
   forceRefresh = false,
   includeRaw = false,
+  refreshIfStale = false,
 }: {
   credentialId: string;
   forceRefresh?: boolean;
   includeRaw?: boolean;
+  refreshIfStale?: boolean;
 }): Promise<PublicCodexQuotaReport | MissingCodexQuotaReport> {
   if (!credentialId) {
     throw new HttpError(
@@ -95,22 +104,41 @@ export async function getCodexQuota({
     );
   }
 
-  if (!forceRefresh) {
-    const cached = getCodexQuotaCacheByCredentialId(credentialId);
-    if (cached) {
-      return markQuotaCacheState(cached.cache, "cached");
-    }
-    const credential = getCodexCredentialById(credentialId);
-    if (!credential) {
-      throw new HttpError(
-        404,
-        "codex_credential_not_found",
-        "Codex credential not found",
-      );
-    }
-    return missingQuotaResponse(credential);
+  const credential = getCodexCredentialById(credentialId);
+  if (!credential) {
+    throw new HttpError(404, "codex_credential_not_found", "Codex credential not found");
   }
+  const cached = getCodexQuotaCacheByCredentialId(credentialId);
+  const snapshot = cached ? markQuotaCacheState(cached.cache, "cached") : missingQuotaResponse(credential);
+  const age = cached ? Date.now() - Date.parse(cached.retrievedAt) : Infinity;
+  const needsRefresh = !cached || !Number.isFinite(age) || age < 0 || age >= CODEX_QUOTA_FRESH_MS ||
+    snapshot.windows.some((window) =>
+      !window.window_seconds || (window.reset_at && Date.parse(window.reset_at) <= Date.now()),
+    );
+  if (!forceRefresh && !(refreshIfStale && needsRefresh)) return snapshot;
 
+  // Only the initiating admin caller may receive raw; joiners get a clean report.
+  const running = refreshes.get(credentialId);
+  if (running) return running.then((report) => markQuotaCacheState(reportToRecord(report), "fresh"));
+  const owner = randomUUID();
+  const lease = acquireCodexQuotaRefresh(credentialId, owner, QUOTA_TIMEOUT_MS + 30_000);
+  if (!lease) return snapshot;
+  const refresh = refreshCodexQuota(credentialId, includeRaw).then((report) => {
+    finishCodexQuotaRefresh(credentialId, owner, 0, CODEX_QUOTA_FRESH_MS);
+    return report;
+  }).catch((error: unknown) => {
+    const failures = Math.min(lease.failures + 1, 10);
+    const retryAfter = error instanceof HttpError
+      ? Number((error.details as { retryAfterMs?: number } | undefined)?.retryAfterMs) || 0 : 0;
+    finishCodexQuotaRefresh(credentialId, owner, failures,
+      Math.max(Math.min(30_000 * 2 ** (failures - 1), 15 * 60_000), retryAfter));
+    throw error;
+  }).finally(() => refreshes.delete(credentialId));
+  refreshes.set(credentialId, refresh);
+  return refresh;
+}
+
+async function refreshCodexQuota(credentialId: string, includeRaw: boolean): Promise<PublicCodexQuotaReport> {
   let credential: CodexCredentialWithTokens | null = null;
   try {
     credential = await ensureFreshCredential(credentialId);
@@ -138,7 +166,8 @@ export async function getCodexQuota({
           accountId: credential.accountId,
           userAgent: getEffectiveCodexUserAgent(credential),
         }),
-        signal: AbortSignal.timeout(serverConfig.requestTimeoutMs),
+        signal: AbortSignal.timeout(QUOTA_TIMEOUT_MS),
+        redirect: "error",
       },
       credential.proxy?.enabled
         ? credential.proxy
@@ -158,10 +187,15 @@ export async function getCodexQuota({
           upstreamStatus: response.status,
           upstreamStatusText: response.statusText,
           upstreamBody: body,
+          retryAfterMs: retryAfterMs(response.headers.get("retry-after")),
         },
       );
     }
 
+    const root = objectFrom(body);
+    if (!root || !objectFrom(firstValue(root.rate_limit, root.rateLimit))) {
+      throw new HttpError(502, "invalid_codex_quota_response", "Invalid quota response");
+    }
     const report = normalizeQuotaResponse(body, credential);
     // Quota cache belongs to the main DB because automatic channel routing may
     // use current quota state in a later routing slice.
@@ -185,11 +219,17 @@ export async function getCodexQuota({
           ? codexQuotaCredentialLogMetadata(credential)
           : { credentialId }),
         includeRaw,
-        forceRefresh,
+        forceRefresh: true,
       },
     });
     throw error;
   }
+}
+
+function retryAfterMs(value: string | null) {
+  if (!value) return 0;
+  const seconds = Number(value);
+  return Math.max(0, Number.isFinite(seconds) ? seconds * 1000 : Date.parse(value) - Date.now()) || 0;
 }
 
 function markQuotaCacheState(
@@ -282,14 +322,9 @@ function parseCodexWindows(payload: RawObject) {
     firstValue(payload.rate_limit, payload.rateLimit),
   );
   const [fiveHour, weekly] = findQuotaWindows(rateLimit);
-  const limitReached = firstValue(
-    rateLimit?.limit_reached,
-    rateLimit?.limitReached,
-  );
-  const allowed = firstValue(rateLimit?.allowed);
   return [
-    buildWindow("code-5h", "5h", fiveHour, limitReached, allowed),
-    buildWindow("code-7d", "7d", weekly, limitReached, allowed),
+    buildWindow("code-5h", "5h", fiveHour),
+    buildWindow("code-7d", "7d", weekly),
   ].filter((window): window is QuotaWindow => window !== null);
 }
 
@@ -320,11 +355,6 @@ function parseAdditionalWindows(payload: RawObject) {
           entry.meteredFeature,
         ),
       ) || `additional-${index + 1}`;
-    const limitReached = firstValue(
-      rateLimit.limit_reached,
-      rateLimit.limitReached,
-    );
-    const allowed = firstValue(rateLimit.allowed);
     return [
       buildWindow(
         `${name}-primary`,
@@ -332,8 +362,6 @@ function parseAdditionalWindows(payload: RawObject) {
         objectFrom(
           firstValue(rateLimit.primary_window, rateLimit.primaryWindow),
         ),
-        limitReached,
-        allowed,
       ),
       buildWindow(
         `${name}-secondary`,
@@ -341,8 +369,6 @@ function parseAdditionalWindows(payload: RawObject) {
         objectFrom(
           firstValue(rateLimit.secondary_window, rateLimit.secondaryWindow),
         ),
-        limitReached,
-        allowed,
       ),
     ].filter((window): window is QuotaWindow => window !== null);
   });
@@ -378,48 +404,35 @@ function findQuotaWindows(
     }
   }
 
-  return [fiveHour || primary, weekly || secondary];
+  const withoutDuration = (window: RawObject | null) => window &&
+    !numberPtr(firstValue(window.limit_window_seconds, window.limitWindowSeconds)) ? window : null;
+  return [fiveHour || withoutDuration(primary), weekly || withoutDuration(secondary)];
 }
 
 function buildWindow(
   id: string,
   label: string,
   window: RawObject | null,
-  limitReached: unknown,
-  allowed: unknown,
 ): QuotaWindow | null {
   if (!window) {
     return null;
   }
   const resetAt = resolveResetDate(window);
-  const usedPercent = deduceUsedPercent(window, limitReached, allowed, resetAt);
+  // An overall limit_reached/allowed flag cannot identify which window is full.
+  const used = numberPtr(firstValue(window.used_percent, window.usedPercent));
+  const usedPercent = used === null ? null : clamp(used, 0, 100);
   const remainingPercent =
     usedPercent === null ? null : clamp(100 - usedPercent, 0, 100);
   return {
     id,
     label,
+    window_seconds: numberPtr(firstValue(window.limit_window_seconds, window.limitWindowSeconds)),
     used_percent: usedPercent,
     remaining_percent: remainingPercent,
     reset_label: formatResetLabel(resetAt),
     reset_at: resetAt?.toISOString() ?? null,
     exhausted: usedPercent !== null && usedPercent >= 100,
   };
-}
-
-function deduceUsedPercent(
-  window: RawObject,
-  limitReached: unknown,
-  allowed: unknown,
-  resetAt: Date | null,
-) {
-  const used = numberPtr(firstValue(window.used_percent, window.usedPercent));
-  if (used !== null) {
-    return clamp(used, 0, 100);
-  }
-  if ((booleanFromAny(limitReached) || allowed === false) && resetAt) {
-    return 100;
-  }
-  return null;
 }
 
 function deriveCodexStatus(windows: QuotaWindow[]): CodexQuotaStatus {
@@ -536,13 +549,6 @@ function isNumberish(value: unknown) {
     return false;
   }
   return Number.isFinite(Number.parseFloat(value.trim().replace(/%$/, "")));
-}
-
-function booleanFromAny(value: unknown) {
-  if (typeof value === "boolean") {
-    return value;
-  }
-  return typeof value === "string" && value.trim().toLowerCase() === "true";
 }
 
 function clamp(value: number, low: number, high: number) {

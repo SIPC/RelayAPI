@@ -100,7 +100,10 @@ export function removeApiKey(id: string) {
   }
 }
 
-export function authenticateRelayRequest(request: Request): RelayApiKeyContext {
+export function authenticateRelayRequest(
+  request: Request,
+  { usageQuery = false }: { usageQuery?: boolean } = {},
+): RelayApiKeyContext {
   const key = extractApiKey(request);
   if (!key) {
     throw new HttpError(401, "missing_api_key", "Missing bearer API key");
@@ -116,6 +119,7 @@ export function authenticateRelayRequest(request: Request): RelayApiKeyContext {
     throw new HttpError(403, "api_key_expired", "API key is expired");
   }
   if (
+    !usageQuery &&
     record.tokenLimitDaily !== null &&
     getApiKeyDailyUsage(record.id) >= record.tokenLimitDaily
   ) {
@@ -125,7 +129,7 @@ export function authenticateRelayRequest(request: Request): RelayApiKeyContext {
       "API key daily token limit has been reached",
     );
   }
-  markApiKeyUsed(record.id);
+  if (!usageQuery) markApiKeyUsed(record.id);
   return {
     id: record.id,
     name: record.name,

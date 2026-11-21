@@ -529,6 +529,15 @@ function migrateMainDb(db: DatabaseSync) {
   applyMigration(db, "013_antigravity_credential_metadata", `
     ALTER TABLE antigravity_credentials ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}';
   `);
+  applyMigration(db, "014_codex_quota_refresh", `
+    CREATE TABLE codex_quota_refresh (
+      credential_id TEXT PRIMARY KEY REFERENCES codex_credentials(id) ON DELETE CASCADE,
+      owner TEXT NOT NULL,
+      lease_until INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at INTEGER NOT NULL DEFAULT 0,
+      failures INTEGER NOT NULL DEFAULT 0
+    ) STRICT;
+  `);
 }
 
 function migrateLogDb(db: DatabaseSync) {
