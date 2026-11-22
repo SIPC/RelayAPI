@@ -12,7 +12,8 @@ import type {
   SelectedChannel,
   UpstreamOperation,
 } from "@/src/shared/types/entities";
-import { claudeModelAllowlistCandidates } from "@/src/server/claude/modelSuffix";
+import { claudeModelAllowlistCandidates, stripClaudeModelSuffixes } from "@/src/server/claude/modelSuffix";
+import { claudeCacheTtlMs, claudeSessionId } from "@/src/server/claude/wire";
 import { isClaudeModel } from "@/src/server/claude/chat";
 import { isCodexImageModel } from "@/src/server/codex/imageModels";
 import {
@@ -63,8 +64,20 @@ import {
   credentialUsageHealth,
 } from "@/src/server/repositories/logs";
 import { serverConfig } from "@/src/server/config/env";
-import { randomId } from "@/src/server/services/crypto";
+import { randomId, sha256 } from "@/src/server/services/crypto";
+import {
+  completeSessionBinding, failSessionBinding, reserveSessionBinding, type SessionBinding,
+} from "@/src/server/repositories/sessionBindings";
 import { HttpError } from "@/src/server/http/errors";
+
+// Only request-local completion state lives in memory; account bindings live in SQLite.
+const claudeSessions = new WeakMap<ChannelRecord, {
+  binding: SessionBinding; sessionId: string; ttlMs: number; startedAt: number; upstreamStarted: boolean;
+}>();
+
+export function claudeChannelSession(channel: ChannelRecord) {
+  return claudeSessions.get(channel);
+}
 
 const CODEX_THINKING_SUFFIX_LEVELS = new Set([
   "none",
@@ -305,10 +318,34 @@ export function selectChannelForRequest(input: {
   operation: UpstreamOperation;
   model: string;
   apiKey: RelayApiKeyContext;
+  request?: { payload: Record<string, unknown>; headers: Headers };
   // Antigravity failover reselects only Antigravity channels and skips credentials already tried.
   provider?: ChannelProvider;
   excludeCredentialIds?: string[];
 }): SelectedChannel {
+  if (!input.request || input.operation === "count_tokens" || !isClaudeModel(input.model) ||
+    (input.provider && input.provider !== "claude")) return selectRequestChannel(input);
+  const sessionId = claudeSessionId(input.request.payload, input.request.headers);
+  // Include configured endpoints, but not health, priority or cooldown: recovery
+  // must not silently move an established session back to its old account.
+  const domain = listChannels().filter((channel) => channel.provider === "claude" &&
+    (!input.apiKey.channelAllowlist.length || input.apiKey.channelAllowlist.includes(channel.id)))
+    .map((channel) => [channel.id, channel.baseUrl]).sort((a, b) => a[0].localeCompare(b[0]));
+  const key = sha256(JSON.stringify([input.apiKey.id, "claude", domain,
+    stripClaudeModelSuffixes(input.model), sessionId]));
+  const ttlMs = claudeCacheTtlMs(input.request.payload);
+  const { selected, binding } = reserveSessionBinding(key, ttlMs,
+    (previous) => selectRequestChannel(input, previous));
+  if (binding) claudeSessions.set(selected.channel, {
+    binding, sessionId, ttlMs, startedAt: Date.now(), upstreamStarted: false,
+  });
+  return selected;
+}
+
+function selectRequestChannel(
+  input: Parameters<typeof selectChannelForRequest>[0],
+  binding?: SessionBinding | null,
+): SelectedChannel {
   const model = cleanString(input.model);
   // Antigravity serves Gemini, Claude and GPT-OSS IDs listed on its channels; Gemini IDs exist nowhere else.
   const antigravityModel = antigravityModelName(model);
@@ -347,7 +384,7 @@ export function selectChannelForRequest(input: {
       channels.filter((channel) => channel.provider === provider).flatMap((channel) => channel.credentialIds)));
   }
   const excluded = new Set(input.excludeCredentialIds ?? []);
-  const candidates = channels.flatMap((channel) => {
+  let candidates = channels.flatMap((channel) => {
     const credentials = availableCredentialsForChannel(channel, maps.get(channel.provider)!, now)
       .filter((credential) => !excluded.has(credential.id) && antigravityServesModel(credential, model, now,
         channel.modelAllowlist.length === 0 && !isAntigravityGeminiModel(antigravityModel)));
@@ -356,11 +393,21 @@ export function selectChannelForRequest(input: {
   if (!candidates.length) {
     throw new HttpError(503, "no_available_channel", "No usable channel is available for this request");
   }
-  const selected = selectRoutingItem(candidates,
+  const boundChannel = !binding?.failed && binding
+    ? candidates.find((candidate) => candidate.channel.id === binding.channelId &&
+      candidate.credentials.some((credential) => credential.id === binding.credentialId)) : undefined;
+  if (binding?.failed) {
+    const alternatives = candidates.flatMap((candidate) => {
+      const credentials = candidate.credentials.filter((credential) => credential.id !== binding.credentialId);
+      return credentials.length ? [{ ...candidate, credentials }] : [];
+    });
+    if (alternatives.length) candidates = alternatives;
+  }
+  const selected = boundChannel || selectRoutingItem(candidates,
     (candidate) => candidate.channel.priority,
     (candidate) => candidate.channel.weight,
     (candidate) => usageHealthScore(candidate.channel.usageHealth));
-  const selectedCredential = selectRoutingItem(selected.credentials,
+  const selectedCredential = (boundChannel && selected.credentials.find((credential) => credential.id === binding!.credentialId)) || selectRoutingItem(selected.credentials,
     (credential) => credential.priority, (credential) => credential.weight,
     (credential) => usageHealthScore(credential.usageHealth));
   const credential = getCredentialWithTokens(selected.channel.provider, selectedCredential.id);
@@ -393,6 +440,10 @@ function supportsOperation(channel: ChannelRecord, operation: UpstreamOperation)
 }
 
 export function recordChannelSuccess(channel: ChannelRecord) {
+  const session = claudeSessions.get(channel);
+  // A late success must not undo a newer failure's cooldown or a rebind.
+  if (session?.upstreamStarted &&
+    !completeSessionBinding(session.binding, session.startedAt + session.ttlMs)) return;
   clearCredentialCooldown(channel.provider, channel.credentialId);
   const nextScore = clamp(channel.healthScore + 2, 0, 100);
   const next = updateChannel(channel.id, {
@@ -415,6 +466,11 @@ export function recordChannelFailure(
   input: { statusCode?: number | null; message?: string | null },
 ) {
   const statusCode = input.statusCode ?? null;
+  const session = claudeSessions.get(channel);
+  if (session?.upstreamStarted && (statusCode === null || statusCode === 408 ||
+    statusCode === 401 || statusCode === 403 || statusCode === 429 || statusCode >= 500)) {
+    failSessionBinding(session.binding);
+  }
   // Antigravity rate limits cool only the requested model on the credential (see antigravity/client.ts).
   if (channel.provider === "antigravity" && statusCode === 429) {
     updateChannel(channel.id, { lastError: input.message || null });
@@ -560,6 +616,8 @@ function availableCredentialsForChannel(
       Boolean(
         credential?.enabled && credential.provider === channel.provider &&
         (!("keySet" in credential) || credential.keySet) &&
+        (credential.provider !== "claude" || !credential.expiresAt ||
+          !(Date.parse(credential.expiresAt) <= now)) &&
         (!credential.cooldownUntil ||
           Date.parse(credential.cooldownUntil) <= now),
       ),

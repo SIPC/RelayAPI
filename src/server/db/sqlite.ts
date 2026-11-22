@@ -538,6 +538,18 @@ function migrateMainDb(db: DatabaseSync) {
       failures INTEGER NOT NULL DEFAULT 0
     ) STRICT;
   `);
+  applyMigration(db, "015_claude_session_bindings", `
+    CREATE TABLE session_bindings (
+      binding_key TEXT PRIMARY KEY,
+      channel_id TEXT NOT NULL,
+      credential_id TEXT NOT NULL,
+      generation TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      cache_until INTEGER NOT NULL DEFAULT 0,
+      failed INTEGER NOT NULL DEFAULT 0 CHECK (failed IN (0, 1))
+    ) STRICT;
+    CREATE INDEX idx_session_bindings_expiry ON session_bindings(expires_at);
+  `);
 }
 
 function migrateLogDb(db: DatabaseSync) {

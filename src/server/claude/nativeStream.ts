@@ -13,6 +13,7 @@ export function createClaudeNativeSseStream(
   let usageFrames = "";
   let completed = false;
   let failed = false;
+  let canceled = false;
   function inspect(frame: string) {
     const data = frame.split(/\r?\n/).filter((line) => line.startsWith("data:"))
       .map((line) => line.slice(5).trimStart()).join("\n");
@@ -29,6 +30,7 @@ export function createClaudeNativeSseStream(
     async pull(controller) {
       try {
         const { value, done } = await reader.read();
+        if (canceled) return;
         buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
         let match: RegExpExecArray | null;
         while ((match = /\r?\n\r?\n/.exec(buffer))) {
@@ -49,6 +51,7 @@ export function createClaudeNativeSseStream(
           reader.releaseLock(); controller.close();
         }
       } catch (error) {
+        if (canceled) return;
         if (!failed) {
           failed = true;
           input.onError(error);
@@ -60,6 +63,9 @@ export function createClaudeNativeSseStream(
         reader.releaseLock(); controller.close();
       }
     },
-    async cancel(reason) { await reader.cancel(reason); reader.releaseLock(); },
+    async cancel(reason) {
+      canceled = true;
+      try { await reader.cancel(reason); } finally { reader.releaseLock(); }
+    },
   });
 }

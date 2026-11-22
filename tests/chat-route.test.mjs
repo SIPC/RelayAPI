@@ -7,6 +7,7 @@ import { once } from "node:events";
 import { randomUUID } from "node:crypto";
 import { registerHooks } from "node:module";
 import { after, test } from "node:test";
+import { Worker } from "node:worker_threads";
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-chat-route-"));
 process.env.DATA_DIR = dataDir;
@@ -24,9 +25,9 @@ registerHooks({ resolve(specifier, context, nextResolve) {
 const { handleChatCompletions, handleOpenAIResponses: handleResponses, handleClaudeMessages, handleClaudeCountTokens } =
   await import("../src/server/http/relay.ts");
 const { upsertCodexCredential } = await import("../src/server/repositories/codexCredentials.ts");
-const { upsertClaudeCredential, getClaudeCredentialWithTokens } = await import("../src/server/repositories/claudeCredentials.ts");
-const { createChannel } = await import("../src/server/services/channels.ts");
-const { createApiKey } = await import("../src/server/services/apiKeys.ts");
+const { upsertClaudeCredential, getClaudeCredentialWithTokens, updateClaudeCredential } = await import("../src/server/repositories/claudeCredentials.ts");
+const { createChannel, patchChannel, selectChannelForRequest } = await import("../src/server/services/channels.ts");
+const { createApiKey, patchApiKey, authenticateRelayRequest } = await import("../src/server/services/apiKeys.ts");
 const { getMainDb, getLogDb } = await import("../src/server/db/sqlite.ts");
 const calls = [];
 const accountId = "10000000-0000-4000-8000-000000000001";
@@ -34,6 +35,7 @@ const system = "CUSTOM_SYSTEM_SENTINEL: Reply in Chinese.";
 let mode = "normal";
 let breakCodexStream;
 let codexStreamClosed;
+let releaseClaudeStream;
 const upstream = http.createServer(async (req, res) => {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -55,6 +57,10 @@ const upstream = http.createServer(async (req, res) => {
   if (mode === "reject") {
     res.writeHead(400, { "content-type": "application/json" });
     res.end('{"type":"error","error":{"type":"invalid_request_error","message":"synthetic rejection"}}'); return;
+  }
+  if (mode === "unavailable") {
+    res.writeHead(503, { "content-type": "application/json" });
+    res.end('{"type":"error","error":{"type":"api_error","message":"synthetic outage"}}'); return;
   }
   const headers = { "content-type": "application/json", "set-cookie": "private", "anthropic-organization-id": "private-org", ...quotaHeaders };
   if (req.url.includes("count_tokens")) { res.writeHead(200, headers); res.end('{"input_tokens":12}'); return; }
@@ -108,10 +114,15 @@ const upstream = http.createServer(async (req, res) => {
     { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "你好" } },
     { type: "content_block_stop", index: 0 },
     { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } },
-    ...(mode === "truncated" ? [] : [{ type: "message_stop" }]),
+    ...(["truncated", "held-claude"].includes(mode) ? [] : [{ type: "message_stop" }]),
   ];
   const bytes = Buffer.from(events.map((event) => "event: " + event.type + "\ndata: " + JSON.stringify(event) + "\n\n").join(""));
   for (let i = 0; i < bytes.length; i += 17) res.write(bytes.subarray(i, i + 17));
+  if (mode === "held-claude") {
+    releaseClaudeStream = (success) => success === "socket" ? res.destroy()
+      : res.end(success ? 'event: message_stop\ndata: {"type":"message_stop"}\n\n' : "");
+    return;
+  }
   res.end();
 });
 upstream.listen(0, "127.0.0.1");
@@ -618,3 +629,303 @@ for (const stream of [false, true]) test("Native Claude stream=" + stream + ": q
   assertQuota(response, "claude");
   assert.equal((await response.json()).error.type, "rate_limit_error");
 });
+
+// Warm both synthetic accounts so their measured health is identical. Changes
+// in priority below would move requests without affinity, even after success.
+async function claudePair() {
+  mode = "normal";
+  const fixture = setup("claude");
+  const second = "synthetic-" + randomUUID();
+  upsertClaudeCredential({ id: second, email: "second@example.invalid", accountId: randomUUID(),
+    priority: 100, tokens: { access_token: "sk-ant-oat01-second", expired: "2099-01-01T00:00:00Z" } });
+  patchChannel(fixture.channel.id, { credentialIds: [fixture.id, second], modelAllowlist: [] });
+  patchApiKey(fixture.key.id, { modelAllowlist: [] });
+  updateClaudeCredential(fixture.id, { enabled: false });
+  const pair = { ...fixture, second, session: randomUUID() };
+  await affinityRequest(pair, { session_id: randomUUID() });
+  updateClaudeCredential(fixture.id, { enabled: true, priority: 200 });
+  updateClaudeCredential(second, { enabled: false });
+  await affinityRequest(pair, { session_id: randomUUID() });
+  updateClaudeCredential(second, { enabled: true });
+  return pair;
+}
+async function affinityRequest(pair, extra = {}, handler = handleClaudeMessages, headers = {}, status = 200) {
+  const response = await handler(request(pair.key, {
+    model: pair.model, session_id: pair.session,
+    messages: [{ role: "user", content: "Affinity root" }], ...extra,
+  }, "/v1/messages", headers));
+  assert.equal(response.status, status);
+  const body = await response.text();
+  return { body, account: log(pair.channel)?.credential_id, call: calls.at(-1) };
+}
+function affinitySelection(pair, extra = {}, headers = {}, operation = "messages") {
+  const payload = { model: pair.model, session_id: pair.session,
+    messages: [{ role: "user", content: "Affinity root" }], ...extra };
+  const req = request(pair.key, payload, "/v1/messages", headers);
+  return selectChannelForRequest({ operation, model: payload.model, apiKey: authenticateRelayRequest(req),
+    request: { payload, headers: req.headers } });
+}
+
+test("Claude affinity: explicit sessions survive protocol conversion, account priority and weight changes", async () => {
+  const pair = await claudePair();
+  const userId = JSON.stringify({ session_id: pair.session, device_id: "ab".repeat(32), account_uuid: accountId });
+  const identity = { session_id: undefined, metadata: { user_id: userId } };
+  assert.equal((await affinityRequest(pair, identity)).account, pair.id);
+  updateClaudeCredential(pair.second, { priority: 999, weight: 999 });
+  for (const handler of [handleClaudeMessages, handleChatCompletions, handleResponses]) {
+    for (const stream of [false, true]) {
+      const extra = { ...identity, stream, input: [{ role: "user", content: "Affinity root" }] };
+      const result = await affinityRequest(pair, extra, handler);
+      assert.equal(result.account, pair.id);
+      assert.equal(JSON.parse(result.call.payload.metadata.user_id).session_id, pair.session);
+      assert.equal(result.call.headers["x-claude-code-session-id"], pair.session);
+    }
+  }
+  assert.equal((await affinityRequest(pair, { session_id: undefined, metadata: {
+    user_id: "user_" + "ab".repeat(32) + "_account_" + accountId + "_session_" + pair.session,
+  } })).account, pair.id);
+  assert.equal((await affinityRequest(pair, { session_id: "lower-priority-session" }, handleClaudeMessages,
+    { "x-claude-code-session-id": pair.session })).account, pair.id);
+  assert.equal(affinitySelection(pair, { session_id: "new-session" }).credential.id, pair.second);
+});
+
+test("Claude affinity: hashed roots survive appended turns and canonical object order without merging distinct roots", async () => {
+  const pair = await claudePair();
+  const first = { session_id: undefined, system: "Stable system",
+    tools: [{ name: "lookup", input_schema: { type: "object", properties: { q: { type: "string" } } } }] };
+  const initial = await affinityRequest(pair, first);
+  updateClaudeCredential(pair.second, { priority: 999 });
+  const continued = await affinityRequest(pair, { ...first,
+    tools: [{ input_schema: { properties: { q: { type: "string" } }, type: "object" }, name: "lookup" }],
+    messages: [{ role: "user", content: "Affinity root" }, { role: "assistant", content: "Reply" },
+      { role: "user", content: "Continue" }] });
+  assert.equal(continued.account, pair.id);
+  assert.equal(continued.call.payload.metadata.user_id, initial.call.payload.metadata.user_id);
+  assert.equal(affinitySelection(pair, { ...first, system: "Different system" }).credential.id, pair.second);
+  assert.equal(affinitySelection(pair, { ...first, messages: [{ role: "user", content: "Different root" }] }).credential.id, pair.second);
+  assert.equal(affinitySelection(pair, { ...first, tools: [] }).credential.id, pair.second);
+});
+
+test("Claude affinity: Key, model and configured channel domain isolate otherwise identical sessions", async () => {
+  const pair = await claudePair();
+  await affinityRequest(pair);
+  updateClaudeCredential(pair.second, { priority: 999 });
+  const otherKey = createApiKey({ channelAllowlist: [pair.channel.id] });
+  assert.equal(affinitySelection({ ...pair, key: otherKey }).credential.id, pair.second);
+  assert.equal(affinitySelection(pair, { model: "claude-opus-4-7" }).credential.id, pair.second);
+  assert.equal(affinitySelection(pair, { model: "anthropic/claude-sonnet-4.6(high)" }).credential.id, pair.id);
+  patchChannel(pair.channel.id, { baseUrl: baseUrl + "/new-domain" });
+  assert.equal(affinitySelection(pair).credential.id, pair.second);
+});
+
+test("Claude affinity: independent Node workers atomically reserve one account for concurrent first requests", async () => {
+  const pair = await claudePair();
+  updateClaudeCredential(pair.id, { priority: 100 });
+  const payload = { model: pair.model, session_id: pair.session, messages: [{ role: "user", content: "Concurrent root" }] };
+  const req = request(pair.key, payload);
+  const gate = new SharedArrayBuffer(4);
+  const workers = Array.from({ length: 8 }, (_, index) => new Worker(`
+    const { parentPort, workerData } = require("node:worker_threads");
+    const { registerHooks } = require("node:module");
+    registerHooks({ resolve(specifier, context, nextResolve) {
+      if (specifier === "server-only") return { url: "data:text/javascript,export {};", shortCircuit: true };
+      if (specifier.startsWith("@/")) return nextResolve(new URL(specifier.slice(2) + ".ts", workerData.root).href, context);
+      return nextResolve(specifier, context);
+    } });
+    (async () => {
+      const { selectChannelForRequest } = await import(new URL("src/server/services/channels.ts", workerData.root));
+      const { getMainDb, getLogDb } = await import(new URL("src/server/db/sqlite.ts", workerData.root));
+      getMainDb();
+      parentPort.postMessage("ready");
+      Atomics.wait(new Int32Array(workerData.gate), 0, 0);
+      Math.random = () => workerData.index % 2 ? 0.99 : 0;
+      const selected = selectChannelForRequest({ ...workerData.input,
+        request: { payload: workerData.payload, headers: new Headers() } });
+      parentPort.postMessage(selected.credential.id);
+      getMainDb().close(); getLogDb().close();
+    })().catch(error => { throw error; });
+  `, { eval: true, workerData: { root: projectRoot.href, gate, index, payload,
+    input: { operation: "messages", model: pair.model, apiKey: authenticateRelayRequest(req) } } }));
+  const results = workers.map(worker => new Promise((resolve, reject) => {
+    worker.on("message", value => { if (value !== "ready") resolve(value); });
+    worker.once("error", reject);
+  }));
+  const exited = workers.map(worker => once(worker, "exit"));
+  await Promise.all(workers.map(worker => once(worker, "message")));
+  Atomics.store(new Int32Array(gate), 0, 1);
+  Atomics.notify(new Int32Array(gate), 0);
+  const accounts = await Promise.all(results);
+  assert.equal(new Set(accounts).size, 1, accounts.join(", "));
+  assert.ok([pair.id, pair.second].includes(accounts[0]));
+  assert.equal(affinitySelection(pair, payload).credential.id, accounts[0]);
+  await Promise.all(exited);
+});
+
+for (const ttl of ["5m", "1h", "unknown"]) test("Claude affinity: sliding " + ttl + " TTL expires at its boundary, not on token counting", async (t) => {
+  const pair = await claudePair();
+  const start = Date.now();
+  let now = start;
+  t.mock.method(Date, "now", () => now);
+  const duration = ttl === "5m" ? 300000 : 3600000;
+  const cache = ttl === "unknown" ? {} : { prompt_cache_options: { mode: "explicit" },
+    system: [{ type: "text", text: "Cache prefix", cache_control: { type: "ephemeral", ttl } }] };
+  await affinityRequest(pair, cache);
+  updateClaudeCredential(pair.second, { priority: 999 });
+  now = start + duration - 1000;
+  assert.equal((await affinityRequest(pair, cache)).account, pair.id);
+  now = start + duration + 1000;
+  assert.equal(affinitySelection(pair, cache).credential.id, pair.id);
+  now = start + 2 * duration - 2000;
+  await affinityRequest(pair, cache, handleClaudeCountTokens);
+  now = start + 2 * duration - 1001;
+  assert.equal(affinitySelection(pair, cache).credential.id, pair.id);
+  now += 1;
+  assert.equal(affinitySelection(pair, cache).credential.id, pair.second);
+});
+
+test("Claude affinity: a five-minute helper cannot shorten a confirmed one-hour binding", async (t) => {
+  const pair = await claudePair();
+  let now = Date.now();
+  const start = now;
+  t.mock.method(Date, "now", () => now);
+  const cache = { prompt_cache_options: { mode: "explicit" },
+    system: [{ type: "text", text: "Prefix", cache_control: { type: "ephemeral", ttl: "1h" } }] };
+  await affinityRequest(pair, cache);
+  updateClaudeCredential(pair.second, { priority: 999 });
+  now += 60000;
+  cache.system[0].cache_control.ttl = "5m";
+  await affinityRequest(pair, cache);
+  now = start + 3600000 - 1;
+  assert.equal(affinitySelection(pair, cache).credential.id, pair.id);
+  now += 1;
+  assert.equal(affinitySelection(pair, cache).credential.id, pair.second);
+});
+
+for (const failure of ["unavailable", "rate-limited", "truncated"]) test("Claude affinity: " + failure + " migrates only the next request and never replays SSE", async () => {
+  const pair = await claudePair();
+  await affinityRequest(pair);
+  const before = calls.length;
+  mode = failure;
+  const failed = await affinityRequest(pair, { stream: failure === "truncated" }, handleClaudeMessages, {},
+    failure === "unavailable" ? 503 : failure === "rate-limited" ? 429 : 200);
+  assert.equal(failed.account, pair.id);
+  if (failure === "truncated") assert.match(failed.body, /event: error/);
+  assert.equal(calls.length, before + 1);
+  mode = "normal";
+  assert.equal((await affinityRequest(pair)).account, pair.second);
+  updateClaudeCredential(pair.id, { cooldownUntil: null, priority: 999 });
+  assert.equal((await affinityRequest(pair)).account, pair.second, "recovery must not bounce back");
+});
+
+test("Claude affinity: client validation and upstream 400 neither migrate nor extend the cache lifetime", async (t) => {
+  const pair = await claudePair();
+  const start = Date.now();
+  let now = start;
+  t.mock.method(Date, "now", () => now);
+  const cache = { prompt_cache_options: { mode: "explicit" },
+    system: [{ type: "text", text: "Prefix", cache_control: { type: "ephemeral", ttl: "5m" } }] };
+  await affinityRequest(pair, cache);
+  updateClaudeCredential(pair.second, { priority: 999 });
+  now += 240000;
+  const before = calls.length;
+  await affinityRequest(pair, { ...cache, system: [{ type: "image", source: {} }] }, handleClaudeMessages, {}, 400);
+  assert.equal(calls.length, before);
+  mode = "reject";
+  assert.equal((await affinityRequest(pair, cache, handleClaudeMessages, {}, 400)).account, pair.id);
+  assert.equal(affinitySelection(pair, cache).credential.id, pair.id);
+  now = start + 300000;
+  assert.equal(affinitySelection(pair, cache).credential.id, pair.second);
+});
+
+for (const outcome of ["success", "failure"]) test("Claude affinity: late old-generation " + outcome + " cannot overwrite a rebound session", async () => {
+  const pair = await claudePair();
+  await affinityRequest(pair);
+  mode = "held-claude";
+  const old = await handleClaudeMessages(request(pair.key, { model: pair.model, session_id: pair.session,
+    stream: true, messages: [{ role: "user", content: "Affinity root" }] }));
+  const oldBody = old.text();
+  const release = releaseClaudeStream;
+  mode = "rate-limited";
+  await affinityRequest(pair, {}, handleClaudeMessages, {}, 429);
+  mode = "normal";
+  assert.equal((await affinityRequest(pair)).account, pair.second);
+  release(outcome === "success");
+  const body = await oldBody;
+  if (outcome === "failure") assert.match(body, /event: error/);
+  else assert.ok(Date.parse(getClaudeCredentialWithTokens(pair.id).cooldownUntil) > Date.now(), "late success cannot clear a newer cooldown");
+  assert.equal((await affinityRequest(pair)).account, pair.second);
+});
+
+for (const [name, handler] of [["Messages", handleClaudeMessages], ["Chat", handleChatCompletions], ["Responses", handleResponses]])
+test("Claude affinity: canceling " + name + " SSE is not an upstream failure or a reason to migrate", async () => {
+  const pair = await claudePair();
+  await affinityRequest(pair);
+  updateClaudeCredential(pair.second, { priority: 999 });
+  mode = "held-claude";
+  const response = await handler(request(pair.key, { model: pair.model, session_id: pair.session,
+    stream: true, messages: [{ role: "user", content: "Affinity root" }], input: "Affinity root" }));
+  const reader = response.body.getReader();
+  await reader.read();
+  const pending = reader.read();
+  await new Promise(resolve => setImmediate(resolve));
+  await reader.cancel("synthetic client disconnect");
+  await pending;
+  releaseClaudeStream(false);
+  mode = "normal";
+  assert.equal((await affinityRequest(pair)).account, pair.id);
+});
+
+for (const [name, handler] of [["Chat", handleChatCompletions], ["Responses", handleResponses]]) {
+  test("Claude affinity: non-stream " + name + " rejects a truncated upstream SSE and migrates", async () => {
+    const pair = await claudePair();
+    await affinityRequest(pair);
+    mode = "truncated";
+    const before = calls.length;
+    await affinityRequest(pair, { stream: false, input: "Affinity root" }, handler, {}, 502);
+    assert.equal(calls.length, before + 1);
+    mode = "normal";
+    assert.equal((await affinityRequest(pair)).account, pair.second);
+  });
+  test("Claude affinity: a " + name + " upstream socket failure migrates the next request without replay", async () => {
+    const pair = await claudePair();
+    await affinityRequest(pair);
+    mode = "held-claude";
+    const before = calls.length;
+    const response = await handler(request(pair.key, { model: pair.model, session_id: pair.session,
+      stream: true, messages: [{ role: "user", content: "Affinity root" }], input: "Affinity root" }));
+    const body = response.text();
+    const rejected = assert.rejects(body);
+    await new Promise(resolve => setImmediate(resolve));
+    releaseClaudeStream("socket");
+    await rejected;
+    assert.equal(calls.length, before + 1);
+    mode = "normal";
+    assert.equal((await affinityRequest(pair)).account, pair.second);
+  });
+}
+
+for (const restriction of ["credential-disabled", "credential-cooldown", "credential-expired", "channel-disabled", "channel-cooldown", "key-disabled", "model", "channel-authorization"]) {
+  test("Claude affinity never bypasses " + restriction, async () => {
+    const pair = await claudePair();
+    await affinityRequest(pair);
+    if (restriction === "credential-disabled") updateClaudeCredential(pair.id, { enabled: false });
+    if (restriction === "credential-cooldown") updateClaudeCredential(pair.id, { cooldownUntil: new Date(Date.now() + 60000).toISOString() });
+    if (restriction === "credential-expired") {
+      const current = getClaudeCredentialWithTokens(pair.id);
+      upsertClaudeCredential({ ...current, tokens: { ...current.tokens, expired: "2000-01-01T00:00:00Z" } });
+    }
+    if (restriction.startsWith("credential-")) {
+      assert.equal((await affinityRequest(pair)).account, pair.second);
+      return;
+    }
+    if (restriction === "channel-disabled") patchChannel(pair.channel.id, { enabled: false });
+    if (restriction === "channel-cooldown") patchChannel(pair.channel.id, { cooldownUntil: new Date(Date.now() + 60000).toISOString() });
+    if (restriction === "key-disabled") patchApiKey(pair.key.id, { enabled: false });
+    if (restriction === "model") patchApiKey(pair.key.id, { modelAllowlist: ["claude-opus-4-7"] });
+    if (restriction === "channel-authorization") patchApiKey(pair.key.id, { channelAllowlist: ["not-authorized"] });
+    const before = calls.length;
+    const status = restriction === "key-disabled" || restriction === "model" ? 403 : 503;
+    await affinityRequest(pair, {}, handleClaudeMessages, {}, status);
+    assert.equal(calls.length, before);
+  });
+}

@@ -4,6 +4,7 @@ import { applyClaudeThinkingEffort } from "@/src/server/claude/wire";
 
 import crypto from "node:crypto";
 import { serverConfig } from "@/src/server/config/env";
+import { HttpError } from "@/src/server/http/errors";
 import { parseClaudeModelSuffixes } from "@/src/server/claude/modelSuffix";
 import {
   prepareClaudeOAuthToolNamesForUpstream,
@@ -215,6 +216,32 @@ export function responsesToClaude(
   return chatCompletionsToClaude(chatPayload, input);
 }
 
+// pipeThrough propagates socket errors without running a transform's flush.
+// Report those errors as well, but never treat downstream cancellation as one.
+function observeClaudeStreamErrors(body: ReadableStream<Uint8Array>, onError: (error: unknown) => void) {
+  const reader = body.getReader();
+  let canceled = false;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { value, done } = await reader.read();
+        if (canceled) return;
+        if (done) { reader.releaseLock(); controller.close(); }
+        else controller.enqueue(value);
+      } catch (error) {
+        if (canceled) return;
+        onError(error);
+        reader.releaseLock();
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      canceled = true;
+      try { await reader.cancel(reason); } finally { reader.releaseLock(); }
+    },
+  });
+}
+
 export function createOpenAIChatStreamFromClaude(
   upstreamBody: ReadableStream<Uint8Array>,
   input: {
@@ -281,7 +308,7 @@ export function createOpenAIChatStreamFromClaude(
     }
   }
 
-  return upstreamBody.pipeThrough(
+  return observeClaudeStreamErrors(upstreamBody, reportErrorOnce).pipeThrough(
     new TransformStream<Uint8Array, Uint8Array>({
       transform(chunk, controller) {
         processText(decoder.decode(chunk, { stream: true }), controller);
@@ -445,7 +472,7 @@ export function createOpenAIResponsesStreamFromClaude(
     }
   }
 
-  return upstreamBody.pipeThrough(
+  return observeClaudeStreamErrors(upstreamBody, reportErrorOnce).pipeThrough(
     new TransformStream<Uint8Array, Uint8Array>({
       transform(chunk, controller) {
         processText(decoder.decode(chunk, { stream: true }), controller);
@@ -555,6 +582,10 @@ function parseClaudeSseText(
   const framer = new ClaudeSseFramer();
   const state = initialStreamState(input.model);
   const events = [...framer.push(text), ...framer.flush()];
+  if (!events.some((event) => event.type === "message_stop") ||
+    events.some((event) => event.type === "error" || event.error)) {
+    throw new HttpError(502, "claude_stream_incomplete", "Upstream Claude stream failed or ended before message_stop");
+  }
   for (const event of events) {
     consumeClaudeEvent(event, state, input.reverseToolNameMap);
   }

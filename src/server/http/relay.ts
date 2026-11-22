@@ -196,7 +196,8 @@ export async function handleOpenAIResponses(request: Request) {
     );
     const model = stringValue(input.model) || serverConfig.codexDefaultModel;
     const selected = timing.time("select_channel", "选择通道", () =>
-      selectChannelForRequest({ operation: "responses", model, apiKey: apiKey! }),
+      selectChannelForRequest({ operation: "responses", model, apiKey: apiKey!,
+        request: { payload: input!, headers: request.headers } }),
     );
     channel = selected.channel;
     if (selected.credential.provider === "antigravity") {
@@ -706,7 +707,8 @@ export async function handleChatCompletions(request: Request) {
     );
     const model = stringValue(input.model) || serverConfig.codexDefaultModel;
     const selected = timing.time("select_channel", "选择通道", () =>
-      selectChannelForRequest({ operation: "chat", model, apiKey: apiKey! }),
+      selectChannelForRequest({ operation: "chat", model, apiKey: apiKey!,
+        request: { payload: input!, headers: request.headers } }),
     );
     channel = selected.channel;
     if (isApiCredential(selected.credential)) {
@@ -1096,7 +1098,8 @@ async function handleClaudeChatCompletionsWithContext(input: {
   const model =
     stringValue(input.input.model) || serverConfig.claudeDefaultModel;
   const selected = input.selection ?? input.timing.time("select_channel", "选择 Claude 通道", () =>
-    selectChannel({ provider: "claude", model, apiKey: input.apiKey }),
+    selectChannelForRequest({ provider: "claude", operation: "chat", model, apiKey: input.apiKey,
+      request: { payload: input.input, headers: input.request.headers } }),
   );
   const channel = selected.channel;
 
@@ -1106,6 +1109,7 @@ async function handleClaudeChatCompletionsWithContext(input: {
         stream: true,
         sourceHeaders: input.request.headers,
         credentialId: selected.credential.id,
+        channel,
         baseUrl: channel.baseUrl,
         timing: input.timing,
       });
@@ -1229,6 +1233,7 @@ async function handleClaudeChatCompletionsWithContext(input: {
     stream: true,
     sourceHeaders: input.request.headers,
     credentialId: selected.credential.id,
+    channel,
     baseUrl: channel.baseUrl,
     timing: input.timing,
   });
@@ -1317,7 +1322,8 @@ async function handleClaudeResponsesWithContext(input: {
   const model =
     stringValue(input.input.model) || serverConfig.claudeDefaultModel;
   const selected = input.selection ?? input.timing.time("select_channel", "选择 Claude 通道", () =>
-    selectChannel({ provider: "claude", model, apiKey: input.apiKey }),
+    selectChannelForRequest({ provider: "claude", operation: "responses", model, apiKey: input.apiKey,
+      request: { payload: input.input, headers: input.request.headers } }),
   );
   const channel = selected.channel;
 
@@ -1327,6 +1333,7 @@ async function handleClaudeResponsesWithContext(input: {
         stream: true,
         sourceHeaders: input.request.headers,
         credentialId: selected.credential.id,
+        channel,
         baseUrl: channel.baseUrl,
         timing: input.timing,
       });
@@ -1450,6 +1457,7 @@ async function handleClaudeResponsesWithContext(input: {
     stream: true,
     sourceHeaders: input.request.headers,
     credentialId: selected.credential.id,
+    channel,
     baseUrl: channel.baseUrl,
     timing: input.timing,
   });
@@ -2314,7 +2322,8 @@ async function handleClaudeNativeRequest(request: Request, countTokens: boolean)
       throw new HttpError(400, "invalid_messages", "messages must be a non-empty array");
     }
     const operation = countTokens ? "count_tokens" : "messages";
-    const selected = selectChannelForRequest({ operation, model, apiKey });
+    const selected = selectChannelForRequest({ operation, model, apiKey,
+      request: { payload, headers: request.headers } });
     channel = selected.channel;
     if (isApiCredential(selected.credential)) {
       return await forwardSelectedApiRequest({ request, startedAt, start, timing, apiKey,
@@ -2354,7 +2363,7 @@ async function handleClaudeNativeRequest(request: Request, countTokens: boolean)
     const forwarded = structuredClone(payload);
     if (!countTokens && !forwarded.max_tokens) forwarded.max_tokens = claudePolicy(model)?.max_completion_tokens || 32000;
     const result = await claudeFetch(forwarded, {
-      stream, sourceHeaders: request.headers, credentialId: channel.credentialId,
+      stream, sourceHeaders: request.headers, credentialId: channel.credentialId, channel,
       baseUrl: channel.baseUrl, upstreamPath: countTokens ? "/v1/messages/count_tokens" : "/v1/messages", timing,
     });
     const context = {

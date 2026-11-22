@@ -58,22 +58,49 @@ export function stableUuid(seed: string) {
   const hex = hash.subarray(0, 16).toString("hex");
   return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20, 32)].join("-");
 }
-export function claudeSessionId(payload: RecordValue, headers: Headers, native: boolean) {
+export function claudeSessionId(payload: RecordValue, headers: Headers) {
   const metadata = record(payload.metadata);
   const candidates = [
+    headers.get("x-claude-code-session-id"), userIdentity(payload)?.session_id,
+    headers.get("x-session-id"),
     metadata?.session_id, payload.session_id, payload.conversation_id,
     headers.get("session-id"), headers.get("session_id"),
-    ...(native ? [headers.get("x-claude-code-session-id"), userIdentity(payload)?.session_id] : []),
+    payload.prompt_cache_key, record(payload.conversation)?.id, payload.conversation,
   ];
   for (const candidate of candidates) {
     const value = text(candidate);
     if (value) return UUID.test(value) ? value : stableUuid("claude:session:" + value);
   }
-  const firstUser = (Array.isArray(payload.messages) ? payload.messages : [])
+  const messages = Array.isArray(payload.messages) ? payload.messages : Array.isArray(payload.input) ? payload.input : [];
+  const firstUser = messages
     .find((message) => record(message)?.role === "user");
-  const root = JSON.stringify([payload.system, record(firstUser)?.content]);
+  const system = payload.system ?? payload.instructions ?? messages.filter((message) =>
+    ["system", "developer"].includes(text(record(message)?.role)));
+  const root = JSON.stringify(stableValue([payload.tools, system,
+    record(firstUser)?.content ?? (typeof payload.input === "string" ? payload.input : null)]));
   const relayKey = (headers.get("authorization") || headers.get("x-api-key") || "").replace(/^Bearer\s+/i, "").trim();
-  return stableUuid("claude:root:" + relayKey + ":" + root);
+  const digest = crypto.createHash("sha256").update("claude:root:" + relayKey + ":" + root).digest("hex");
+  return stableUuid(digest);
+}
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableValue);
+  const item = record(value);
+  return item ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, stableValue(item[key])])) : value;
+}
+export function claudeCacheTtlMs(payload: RecordValue) {
+  let ttl = 0;
+  function visit(value: unknown) {
+    if (Array.isArray(value)) { value.forEach(visit); return; }
+    const item = record(value);
+    if (!item) return;
+    const control = record(item.cache_control);
+    if (control?.type === "ephemeral") ttl = Math.max(ttl, control.ttl === "1h" ? 3600000 : 300000);
+    for (const [key, child] of Object.entries(item)) {
+      if (["system", "tools", "messages", "content"].includes(key)) visit(child);
+    }
+  }
+  visit(payload);
+  return ttl || 3600000;
 }
 export function applyClaudeCredentialIdentity(
   payload: RecordValue,

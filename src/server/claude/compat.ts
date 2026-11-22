@@ -26,12 +26,13 @@ export function prepareClaudeOAuthUpstreamPayload(
     claudeUserAgent: string;
     accountId: string;
     deviceId: string;
+    sessionId?: string;
     countTokens?: boolean;
   },
 ): ClaudeOAuthPreparedPayload {
   let payload = cloneRecord(inputPayload);
   const native = isNativeClaudeCodeRequest(input.sourceHeaders, payload, input.countTokens);
-  const sessionId = claudeSessionId(payload, input.sourceHeaders, native);
+  const sessionId = input.sessionId || claudeSessionId(payload, input.sourceHeaders);
   const explicitCache = recordValue(payload.prompt_cache_options)?.mode === "explicit";
   applyClaudeModelOptions(payload);
   if (input.countTokens) payload = relocateClaudeCountSystem(payload, native);

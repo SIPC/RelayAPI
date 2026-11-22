@@ -3,7 +3,8 @@ import "server-only";
 import { withAccountQuotaHeaders } from "@/src/server/http/accountQuota";
 
 import crypto from "node:crypto";
-import { claudeBetas, isNativeClaudeCodeRequest } from "@/src/server/claude/wire";
+import { claudeBetas, claudeCacheTtlMs, isNativeClaudeCodeRequest } from "@/src/server/claude/wire";
+import { claudeChannelSession } from "@/src/server/services/channels";
 import { prepareClaudeOAuthUpstreamPayload } from "@/src/server/claude/compat";
 import { serverConfig } from "@/src/server/config/env";
 import { proxiedFetch } from "@/src/server/net/proxy";
@@ -14,7 +15,7 @@ import {
   resolveClaudeCredentialProxy,
 } from "@/src/server/services/claudeCredentials";
 import type { StageTimer } from "@/src/server/http/stageTimer";
-import type { ClaudeCredentialWithTokens } from "@/src/shared/types/entities";
+import type { ChannelRecord, ClaudeCredentialWithTokens } from "@/src/shared/types/entities";
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -42,6 +43,7 @@ export async function claudeFetch(
     stream: boolean;
     sourceHeaders: Headers;
     credentialId: string;
+    channel?: ChannelRecord;
     baseUrl?: string;
     upstreamPath?: "/v1/messages" | "/v1/messages/count_tokens";
     timing?: StageTimer;
@@ -66,6 +68,7 @@ export async function claudeFetch(
     sourceHeaders: input.sourceHeaders,
     claudeUserAgent,
     ...ensureClaudeRequestIdentity(credential),
+    sessionId: input.channel && claudeChannelSession(input.channel)?.sessionId,
     countTokens: input.upstreamPath === "/v1/messages/count_tokens",
   });
   const upstreamPayload = prepared.payload;
@@ -85,6 +88,12 @@ export async function claudeFetch(
     payload: upstreamPayload,
     countTokens: input.upstreamPath === "/v1/messages/count_tokens",
   });
+  const session = input.channel && claudeChannelSession(input.channel);
+  if (session) {
+    session.ttlMs = claudeCacheTtlMs(upstreamPayload);
+    session.startedAt = Date.now();
+    session.upstreamStarted = true;
+  }
   const response =
     (await input.timing?.timeAsync("upstream_fetch", "Claude 上游 Fetch", () =>
       proxiedFetch(
@@ -130,6 +139,7 @@ export async function claudeJson(
     stream: boolean;
     sourceHeaders: Headers;
     credentialId: string;
+    channel?: ChannelRecord;
     baseUrl?: string;
     upstreamPath?: "/v1/messages" | "/v1/messages/count_tokens";
     timing?: StageTimer;
