@@ -20,7 +20,6 @@ import {
   ANTIGRAVITY_BASE_URL,
   antigravityModelName,
   antigravityStandardModel,
-  isAntigravityGeminiModel,
   isAntigravityModelId,
   resolveAntigravityModel,
 } from "@/src/server/antigravity/protocol";
@@ -347,9 +346,9 @@ function selectRequestChannel(
   binding?: SessionBinding | null,
 ): SelectedChannel {
   const model = cleanString(input.model);
-  // Antigravity serves Gemini, Claude and GPT-OSS IDs listed on its channels; Gemini IDs exist nowhere else.
+  // Antigravity only serves Gemini, regardless of its catalog or persisted channel allowlist.
   const antigravityModel = antigravityModelName(model);
-  const oauthProvider = isAntigravityGeminiModel(antigravityModel) ? "antigravity" : isClaudeModel(model) ? "claude" : "codex";
+  const oauthProvider = isAntigravityModelId(antigravityModel) ? "antigravity" : isClaudeModel(model) ? "claude" : "codex";
   const oauthModelCandidates = modelAllowlistCandidates(oauthProvider, model);
   if (input.apiKey.modelAllowlist.length > 0 && model &&
     !modelMatchesAllowlist(oauthModelCandidates, input.apiKey.modelAllowlist)) {
@@ -367,7 +366,7 @@ function selectRequestChannel(
       if (input.apiKey.modelAllowlist.length > 0 && !input.apiKey.modelAllowlist.includes(model)) return false;
     } else if (channel.provider === "antigravity") {
       // An empty allowlist means every model in the bound accounts' catalogs, like empty OAuth allowlists.
-      // Allowlists match by standard name, so "claude-opus-5-5" and "claude-opus-5-5-high" are one model.
+      // Allowlists match by standard name, so "gemini-4-argon" and "gemini-4-argon-high" are one model.
       if (!isAntigravityModelId(antigravityModel) || (channel.modelAllowlist.length > 0 &&
         !channel.modelAllowlist.some(allowed => antigravityStandardModel(allowed) === antigravityStandardModel(model)))) return false;
     } else {
@@ -386,8 +385,7 @@ function selectRequestChannel(
   const excluded = new Set(input.excludeCredentialIds ?? []);
   let candidates = channels.flatMap((channel) => {
     const credentials = availableCredentialsForChannel(channel, maps.get(channel.provider)!, now)
-      .filter((credential) => !excluded.has(credential.id) && antigravityServesModel(credential, model, now,
-        channel.modelAllowlist.length === 0 && !isAntigravityGeminiModel(antigravityModel)));
+      .filter((credential) => !excluded.has(credential.id) && antigravityServesModel(credential, model, now));
     return credentials.length ? [{ channel, credentials }] : [];
   });
   if (!candidates.length) {
@@ -419,13 +417,10 @@ function selectRequestChannel(
 }
 
 // Antigravity cools a model per credential and skips credentials whose catalog lacks the model, as in CPA.
-// Claude and GPT-OSS IDs also exist on other providers, so an empty allowlist only takes them when the catalog
-// is known to include them.
-function antigravityServesModel(credential: RoutableCredentialRecord, model: string, now: number, requireCatalog: boolean) {
+function antigravityServesModel(credential: RoutableCredentialRecord, model: string, now: number) {
   if (credential.provider !== "antigravity") return true;
   const cooldown = credential.modelCooldowns[antigravityStandardModel(model)];
   if (cooldown && Date.parse(cooldown.until) > now) return false;
-  if (!credential.models) return !requireCatalog;
   return resolveAntigravityModel(credential.models, model) !== null;
 }
 
@@ -880,7 +875,7 @@ function normalizeCapabilities(provider: ChannelProvider, input: unknown): Upstr
 function normalizeModelAllowlist(provider: ChannelProvider, input: unknown) {
   const models = cleanStringArray(input);
   if (provider === "antigravity" && models.some(model => !isAntigravityModelId(model))) {
-    throw new HttpError(400, "invalid_antigravity_models", "Antigravity channels accept exact Gemini, Claude or GPT-OSS model IDs");
+    throw new HttpError(400, "invalid_antigravity_models", "Antigravity channels only accept Gemini model IDs");
   }
   if (isApiProvider(provider) && models.length === 0) {
     throw new HttpError(400, "missing_channel_models", "API upstream channels require a non-empty model allowlist");

@@ -37,8 +37,11 @@ const { POST: postCountTokens } = await import("../app/v1/messages/count_tokens/
 const { GET: getModels } = await import("../app/v1/models/route.ts");
 const { createApiKey } = await import("../src/server/services/apiKeys.ts");
 const { getMainDb, getLogDb } = await import("../src/server/db/sqlite.ts");
-const { getAntigravityCredentialWithTokens, replaceAntigravityModels, replaceAntigravityTokens } =
+const { getAntigravityCredentialWithTokens, replaceAntigravityModels, replaceAntigravityTokens, saveAntigravityCredential } =
   await import("../src/server/repositories/antigravityCredentials.ts");
+const { upsertClaudeCredential } = await import("../src/server/repositories/claudeCredentials.ts");
+const { updateChannel } = await import("../src/server/repositories/channels.ts");
+const { selectChannelForRequest } = await import("../src/server/services/channels.ts");
 const { ANTIGRAVITY_DEFAULT_CLIENT_ID, ANTIGRAVITY_DEFAULT_CLIENT_SECRET } =
   await import("../src/server/antigravity/oauthClient.ts");
 const { createWebSessionToken, WEB_SESSION_COOKIE } = await import("../src/server/services/webAccess.ts");
@@ -55,7 +58,7 @@ after(() => {
 });
 
 const model = "gemini-fixture";
-const claudeModel = "claude-sonnet-4-6";
+const otherModel = "gemini-3-pro-fixture";
 const usage = { promptTokenCount: 12, candidatesTokenCount: 3, thoughtsTokenCount: 2, totalTokenCount: 17, cachedContentTokenCount: 4 };
 const toolSignature = "dGVzdC1zaWduYXR1cmU=";
 const tools = [{ type: "function", name: "lookup", parameters: { type: "object", properties: { q: { type: "string", minLength: 2 } } } }];
@@ -155,7 +158,7 @@ test("Antigravity OAuth, CPA request shape, 429 failover and every relay protoco
     }
     if (url.pathname.endsWith(":fetchAvailableModels")) {
       assert.equal(payload.project, "project-" + account);
-      return Response.json({ models: { [model]: {}, [claudeModel]: {} } });
+      return Response.json({ models: { [model]: {}, [otherModel]: {}, "claude-opus-5-5-high": {}, "gpt-oss-120b-medium": {} } });
     }
     upstreamCalls.push({ account, pathname: url.pathname, payload });
     const next = inference.shift();
@@ -183,7 +186,7 @@ test("Antigravity OAuth, CPA request shape, 429 failover and every relay protoco
   assert.equal(onboardBodies.length, 2);
   assert.deepEqual(onboardBodies[0], { tier_id: "standard-tier", metadata: { ide_type: "ANTIGRAVITY", ide_version: "2.33.0", ide_name: "antigravity" } });
   assert.equal(getAntigravityCredentialWithTokens(credentialA.id).projectId, "project-a");
-  assert.deepEqual(credentialA.models, [claudeModel, model]);
+  assert.deepEqual(credentialA.models, [otherModel, model]);
   assert.equal(credentialA.tokens, undefined);
   const credentialB = await login("code-b");
   assert.equal(getAntigravityCredentialWithTokens(credentialB.id).projectId, "project-b");
@@ -203,17 +206,17 @@ test("Antigravity OAuth, CPA request shape, 429 failover and every relay protoco
   const channels = [];
   for (const [credential, priority] of [[credentialA, 10], [credentialB, 1]]) {
     const response = await createChannel(request("/channels", {
-      provider: "antigravity", modelAllowlist: [model, claudeModel], credentialId: credential.id, priority,
+      provider: "antigravity", modelAllowlist: [model, otherModel], credentialId: credential.id, priority,
     }, admin));
     assert.equal(response.status, 201, await response.clone().text());
     channels.push(await response.json());
   }
   assert.deepEqual(channels[0].capabilities, ["chat", "responses", "messages", "count_tokens"]);
-  const key = createApiKey({ channelAllowlist: channels.map(channel => channel.id), modelAllowlist: [model, claudeModel] });
+  const key = createApiKey({ channelAllowlist: channels.map(channel => channel.id), modelAllowlist: [model, otherModel] });
   const headers = { authorization: "Bearer " + key.key, "content-type": "application/json" };
   const ask = body => postResponses(request("/v1/responses", { model, ...body }, headers));
   const models = await getModels(request("/v1/models", undefined, headers));
-  assert.deepEqual((await models.json()).data.map(item => item.id), [model, claudeModel]);
+  assert.deepEqual((await models.json()).data.map(item => item.id), [model, otherModel]);
 
   inference.push(() => Response.json(responseFrame([{ thoughtSignature: toolSignature, functionCall: {
     name: "lookup", args: { q: "weather" },
@@ -278,7 +281,7 @@ test("Antigravity OAuth, CPA request shape, 429 failover and every relay protoco
   const ids = { a: credentialA.id, b: credentialB.id };
   const cooled = (await list(request("/credentials", undefined, admin)).json()).find(item => item.id === ids[limited]);
   assert.ok(Date.parse(cooled.modelCooldowns[model].until) > Date.now() + 20000);
-  assert.equal(cooled.modelCooldowns[claudeModel], undefined);
+  assert.equal(cooled.modelCooldowns[otherModel], undefined);
 
   inference.push(({ token }) => rateLimit("QUOTA_EXHAUSTED", "120s", token));
   const exhausted = await ask({ input: "Hello" });
@@ -288,10 +291,10 @@ test("Antigravity OAuth, CPA request shape, 429 failover and every relay protoco
   // The cooled credential is skipped for this model, so only the other credential is tried.
   assert.equal(upstreamCalls.at(-1).account, fallback);
 
-  // Claude uses the streaming endpoint even for non-stream Chat, with VALIDATED tools and capped output.
+  // Gemini 3 Pro uses the streaming endpoint even for non-stream Chat, and needs tool placeholders.
   inference.push(() => sse(responseFrame([{ text: "Hello" }], "STOP", usage)));
   const chat = await postChat(request("/v1/chat/completions", {
-    model: claudeModel, max_tokens: 100000,
+    model: otherModel, max_tokens: 100000,
     messages: [{ role: "system", content: "Be brief" }, { role: "user", content: "Hi" }],
     tools: [{ type: "function", function: { name: "lookup", parameters: { type: "object", properties: {} } } }],
   }, headers));
@@ -299,14 +302,14 @@ test("Antigravity OAuth, CPA request shape, 429 failover and every relay protoco
   assert.equal((await chat.json()).choices[0].message.content, "Hello");
   const chatCall = upstreamCalls.at(-1);
   assert.equal(chatCall.pathname, "/v1internal:streamGenerateContent");
-  assert.equal(chatCall.payload.request.toolConfig.functionCallingConfig.mode, "VALIDATED");
+  assert.equal(chatCall.payload.request.toolConfig.functionCallingConfig.mode, "AUTO");
   assert.deepEqual(chatCall.payload.request.tools[0].functionDeclarations[0].parameters.required, ["reason"]);
-  assert.equal(chatCall.payload.request.generationConfig.maxOutputTokens, 64000);
+  assert.equal(chatCall.payload.request.generationConfig?.maxOutputTokens, undefined);
   assert.equal(chatCall.payload.request.systemInstruction.parts[0].text, "Be brief");
 
   inference.push(() => sse(responseFrame([{ text: "Hi there" }], "STOP", usage)));
   const messages = await postMessages(request("/v1/messages", {
-    model: claudeModel, max_tokens: 1024, stream: true, messages: [{ role: "user", content: "Hi" }],
+    model: otherModel, max_tokens: 1024, stream: true, messages: [{ role: "user", content: "Hi" }],
   }, headers));
   assert.equal(messages.status, 200);
   const claudeEvents = (await messages.text()).split("\n").filter(line => line.startsWith("data: ")).map(line => JSON.parse(line.slice(6)));
@@ -322,7 +325,7 @@ test("Antigravity OAuth, CPA request shape, 429 failover and every relay protoco
     return Response.json({ totalTokens: 42 });
   });
   const counted = await postCountTokens(request("/v1/messages/count_tokens", {
-    model: claudeModel, messages: [{ role: "user", content: "Hi" }],
+    model: otherModel, messages: [{ role: "user", content: "Hi" }],
   }, headers));
   assert.equal(counted.status, 200, await counted.clone().text());
   assert.deepEqual(await counted.json(), { input_tokens: 42 });
@@ -330,7 +333,7 @@ test("Antigravity OAuth, CPA request shape, 429 failover and every relay protoco
   // TOS_VIOLATION disables the credential and the request continues on the next credential.
   inference.push(() => Response.json({ error: { code: 403, details: [{ reason: "TOS_VIOLATION" }] } }, { status: 403 }),
     () => sse(responseFrame([{ text: "rescued" }], "STOP", usage)));
-  const suspended = await ask({ model: claudeModel, input: "Hello" });
+  const suspended = await ask({ model: otherModel, input: "Hello" });
   assert.equal(suspended.status, 200, await suspended.clone().text());
   const [banned, rescued] = upstreamCalls.slice(-2).map(call => call.account);
   assert.notEqual(rescued, banned);
@@ -339,7 +342,7 @@ test("Antigravity OAuth, CPA request shape, 429 failover and every relay protoco
   const calls = upstreamCalls.length;
   // Both credentials are cooled for the Gemini model now; input validation still fails before any upstream call.
   assert.equal((await ask({ input: "Hi" })).status, 503);
-  assert.equal((await ask({ model: claudeModel, input: "Hi", previous_response_id: "resp_previous" })).status, 400);
+  assert.equal((await ask({ model: otherModel, input: "Hi", previous_response_id: "resp_previous" })).status, 400);
   assert.equal(upstreamCalls.length, calls);
 
   const logs = getLogDb().prepare("SELECT status_code, total_tokens FROM request_logs WHERE request_type = 'responses.antigravity' ORDER BY rowid").all();
@@ -384,7 +387,7 @@ test("Antigravity OAuth, CPA request shape, 429 failover and every relay protoco
   const catalogKey = createApiKey({ channelAllowlist: [catalogChannel.id] });
   const catalogHeaders = { authorization: "Bearer " + catalogKey.key, "content-type": "application/json" };
   const catalogModels = await getModels(request("/v1/models", undefined, catalogHeaders));
-  assert.deepEqual((await catalogModels.json()).data.map(item => item.id), [claudeModel, model]);
+  assert.deepEqual((await catalogModels.json()).data.map(item => item.id), [otherModel, model]);
   inference.push(() => Response.json(responseFrame([{ text: "catalog" }], "STOP", usage)));
   const viaCatalog = await postResponses(request("/v1/responses", { model, input: "Hi" }, catalogHeaders));
   assert.equal(viaCatalog.status, 200, await viaCatalog.clone().text());
@@ -394,20 +397,19 @@ test("Antigravity OAuth, CPA request shape, 429 failover and every relay protoco
   assert.equal(upstreamCalls.length, outsideCatalog);
 
   // Tiered upstream IDs are listed and routed by their standard name; the tier follows the requested effort.
-  replaceAntigravityModels(credentialA.id, ["claude-opus-5-5-high", "claude-opus-5-5-low", "gemini-4-carbon-disabled",
+  replaceAntigravityModels(credentialA.id, ["gemini-4-argon-high", "gemini-4-argon-low", "gemini-4-carbon-disabled",
     "tab_flash_lite_preview", model]);
   const tieredModels = await getModels(request("/v1/models", undefined, catalogHeaders));
-  assert.deepEqual((await tieredModels.json()).data.map(item => item.id), ["claude-opus-5-5", claudeModel, model]);
+  assert.deepEqual((await tieredModels.json()).data.map(item => item.id), [otherModel, "gemini-4-argon", model]);
   for (const [requested, effort, expected] of [
-    ["claude-opus-5-5", "low", "claude-opus-5-5-low"],
-    ["claude-opus-5-5", undefined, "claude-opus-5-5-high"],
+    ["gemini-4-argon", "low", "gemini-4-argon-low"],
+    ["gemini-4-argon", undefined, "gemini-4-argon-high"],
     // Vendor prefixes resolve like the bare name.
-    ["anthropic/claude-opus-5-5", "low", "claude-opus-5-5-low"],
+    ["google/gemini-4-argon", "low", "gemini-4-argon-low"],
     ["google/" + model, undefined, model],
   ]) {
-    // Claude always uses the streaming endpoint; Gemini answers non-stream requests with JSON.
     const frame = responseFrame([{ text: "tiered" }], "STOP", usage);
-    inference.push(() => expected.startsWith("claude") ? sse(frame) : Response.json(frame));
+    inference.push(() => Response.json(frame));
     const tiered = await postResponses(request("/v1/responses", {
       model: requested, input: "Hi", ...(effort && { reasoning: { effort } }),
     }, catalogHeaders));
@@ -424,4 +426,61 @@ test("Antigravity OAuth, CPA request shape, 429 failover and every relay protoco
   const remaining = await (await listChannels(request("/channels", undefined, admin))).json();
   assert.ok(remaining.every(channel => !channel.credentialIds.includes(credentialB.id)));
   assert.deepEqual(remaining.find(channel => channel.id === catalogChannel.id).credentialIds, [credentialA.id]);
+});
+
+test("Antigravity only offers and routes Gemini, including legacy allowlists and unknown catalogs", async () => {
+  const admin = { cookie: WEB_SESSION_COOKIE + "=" + createWebSessionToken(), "content-type": "application/json" };
+  const agy = saveAntigravityCredential({ accountId: "gemini-only", email: "gemini-only@example.invalid", projectId: "fixture-project",
+    tokens: { access_token: "synthetic-token", refresh_token: "synthetic-refresh", expired: "2099-01-01T00:00:00Z", last_refresh: new Date().toISOString() } });
+  const native = upsertClaudeCredential({ id: "native-claude", email: "native@example.invalid", accountId: "native-account",
+    tokens: { access_token: "synthetic-native-token", expired: "2099-01-01T00:00:00Z" } });
+  for (const blocked of ["claude-opus-5-5", "gpt-oss-120b-medium", "gpt-5.5"]) {
+    const invalid = await createChannel(request("/channels", {
+      provider: "antigravity", credentialId: agy.id, modelAllowlist: [model, blocked],
+    }, admin));
+    assert.equal(invalid.status, 400, "must reject AGY allowlist containing " + blocked);
+    assert.equal((await invalid.json()).error.code, "invalid_antigravity_models");
+  }
+  const agyChannel = await (await createChannel(request("/channels", {
+    provider: "antigravity", credentialId: agy.id, priority: 9999,
+  }, admin))).json();
+  const claudeChannel = await (await createChannel(request("/channels", {
+    provider: "claude", credentialId: native.id, priority: 1,
+  }, admin))).json();
+  const onlyAgy = createApiKey({ channelAllowlist: [agyChannel.id] });
+  const headers = { authorization: "Bearer " + onlyAgy.key, "content-type": "application/json" };
+  const both = createApiKey({ channelAllowlist: [agyChannel.id, claudeChannel.id] });
+  const apiKey = { id: both.id, name: "Gemini-only probe", prefix: both.prefix, scopes: ["relay"],
+    channelAllowlist: [agyChannel.id, claudeChannel.id], modelAllowlist: [], tokenLimitDaily: null };
+  const blockedModels = ["claude-opus-5-5", "anthropic/claude-opus-5-5", "gpt-oss-120b", "openai/gpt-oss-120b"];
+  let googleCalls = 0;
+  globalThis.fetch = async () => { googleCalls++; assert.fail("unsupported AGY model must not reach Google"); };
+  for (const catalog of [null, [model, "claude-opus-5-5-high", "gpt-oss-120b-medium"]]) {
+    if (catalog) replaceAntigravityModels(agy.id, catalog);
+    for (const allowlist of [[], [model, ...blockedModels]]) {
+      // Simulate persisted pre-upgrade configuration without going through the new validation.
+      updateChannel(agyChannel.id, { modelAllowlist: allowlist });
+      const listed = await getModels(request("/v1/models", undefined, headers));
+      assert.equal(listed.status, 200);
+      assert.deepEqual((await listed.json()).data.map(item => item.id), catalog || allowlist.length ? [model] : []);
+      for (const blocked of blockedModels) {
+        for (const [handler, pathname, body] of [
+          [postResponses, "/v1/responses", { input: "Hi" }],
+          [postChat, "/v1/chat/completions", { messages: [{ role: "user", content: "Hi" }] }],
+          [postMessages, "/v1/messages", { max_tokens: 10, messages: [{ role: "user", content: "Hi" }] }],
+          [postCountTokens, "/v1/messages/count_tokens", { messages: [{ role: "user", content: "Hi" }] }],
+        ]) {
+          const rejected = await handler(request(pathname, { model: blocked, ...body }, headers));
+          assert.equal(rejected.status, 503, pathname + " must not send " + blocked + " to AGY");
+        }
+      }
+      for (const requested of ["claude-opus-5-5", "anthropic/claude-opus-5-5"]) {
+        for (const operation of ["responses", "chat", "messages", "count_tokens"]) {
+          assert.equal(selectChannelForRequest({ model: requested, operation, apiKey }).channel.id, claudeChannel.id);
+        }
+      }
+      assert.equal(selectChannelForRequest({ model: "google/" + model, operation: "responses", apiKey }).channel.id, agyChannel.id);
+    }
+  }
+  assert.equal(googleCalls, 0);
 });

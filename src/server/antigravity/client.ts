@@ -8,7 +8,6 @@ import {
   antigravityStandardModel,
   antigravityRequiresStreaming,
   antigravityString as string,
-  isAntigravityClaudeModel,
   resolveAntigravityModel,
 } from "@/src/server/antigravity/protocol";
 import { AntigravityResponsesOutput, antigravityResponseError } from "@/src/server/antigravity/responsesOutput";
@@ -21,11 +20,7 @@ import {
   markAntigravityModelCooldown,
   suspendAntigravityCredential,
 } from "@/src/server/repositories/antigravityCredentials";
-import {
-  antigravityCreditsHint,
-  ensureFreshAntigravityCredential,
-  markAntigravityCreditsExhausted,
-} from "@/src/server/services/antigravityCredentials";
+import { ensureFreshAntigravityCredential } from "@/src/server/services/antigravityCredentials";
 import { redactValue } from "@/src/server/upstream/redact";
 import { emptyUsage } from "@/src/server/upstream/stream";
 import type { AntigravityCredentialWithTokens, SelectedChannel, UsageSnapshot } from "@/src/shared/types/entities";
@@ -49,7 +44,7 @@ export type AntigravityOutcome =
   | { type: "error"; error: HttpError; retryAfter?: string };
 
 type Decision = "instant" | "switch" | "exhausted" | "soft";
-type Failure = { error: HttpError; retryAfterMs?: number; creditsExhausted?: boolean; decision?: Decision };
+type Failure = { error: HttpError; retryAfterMs?: number; decision?: Decision };
 
 export async function sendAntigravity(input: {
   request: Request;
@@ -87,7 +82,7 @@ export async function sendAntigravity(input: {
     const tried: AntigravityCredentialWithTokens[] = [];
     let last: Failure | null = null;
 
-    const attempt = async (credits: boolean): Promise<{ upstream: Response; credential: AntigravityCredentialWithTokens } | Failure> => {
+    const attempt = async (): Promise<{ upstream: Response; credential: AntigravityCredentialWithTokens } | Failure> => {
       let credential: AntigravityCredentialWithTokens;
       try {
         credential = await ensureFreshAntigravityCredential(selected.credential.id);
@@ -101,7 +96,6 @@ export async function sendAntigravity(input: {
         ...build(upstreamModel),
         project: credential.projectId,
         requestId: antigravityRequestId(upstreamModel),
-        ...(credits && { enabledCreditTypes: ["GOOGLE_ONE_AI"] }),
       };
       const path = upstreamStream ? "/v1internal:streamGenerateContent?alt=sse" : "/v1internal:generateContent";
       let upstream: Response;
@@ -128,15 +122,15 @@ export async function sendAntigravity(input: {
       if (error.code === "antigravity_tos_violation") suspendAntigravityCredential(credential, error.message);
       const header = upstream.headers.get("retry-after");
       const retryAfterMs = retryDelayMs(value) ?? (header && /^\d+$/.test(header) ? Number(header) * 1000 : undefined);
-      return { error, retryAfterMs, creditsExhausted: credits && hasReason(value, "INSUFFICIENT_G1_CREDITS_BALANCE"), ...decisionOf(value, upstream.status) };
+      return { error, retryAfterMs, ...decisionOf(value, upstream.status) };
     };
 
     // Per CPA: classify each 429, cool the model on that credential, and move to the next credential.
     for (let round = 0; round < MAX_FAILOVER_ATTEMPTS; round++) {
-      let result = await attempt(false);
+      let result = await attempt();
       if ("decision" in result && result.decision === "instant" && result.retryAfterMs !== undefined) {
         await sleep(result.retryAfterMs, signal);
-        result = await attempt(false);
+        result = await attempt();
       }
       if ("upstream" in result) return await respond(result.upstream, result.credential);
       last = result;
@@ -152,20 +146,6 @@ export async function sendAntigravity(input: {
       if (!next) break;
       input.onFailover?.(selected, result.error);
       selected = next;
-    }
-
-    // Google One AI credits are a last resort for Claude after every credential is rate limited (CPA default off).
-    if (last && (last.error.status === 429 || last.error.status === 503) && creditsEnabled() &&
-      isAntigravityClaudeModel(input.model)) {
-      const candidates = [...tried.filter(item => antigravityCreditsHint(item.id) === true),
-        ...tried.filter(item => antigravityCreditsHint(item.id) === undefined)];
-      for (const credential of candidates) {
-        selected = { ...selected, credential, channel: { ...selected.channel, credentialId: credential.id } };
-        const result = await attempt(true);
-        if ("upstream" in result) return await respond(result.upstream, result.credential);
-        if (result.creditsExhausted) markAntigravityCreditsExhausted(credential.id);
-        last = result;
-      }
     }
 
     const error = last?.error ?? new HttpError(503, "no_available_channel", "No usable channel is available for this request");
@@ -312,10 +292,6 @@ function durationMs(value: string) {
   let total = 0;
   for (const [, amount, , unit] of value.matchAll(/(\d+(\.\d+)?)(h|ms|m|s)/g)) total += Number(amount) * scale[unit];
   return Math.round(total);
-}
-
-function creditsEnabled() {
-  return /^(1|true|yes)$/i.test(process.env.RELAY_ANTIGRAVITY_CREDITS?.trim() ?? "");
 }
 
 function sleep(ms: number, signal: AbortSignal) {

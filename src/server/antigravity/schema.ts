@@ -6,10 +6,8 @@ import "server-only";
 type Schema = Record<string, unknown>;
 type Options = {
   tool: boolean;
-  // Claude VALIDATED mode requires a non-empty required list, so empty objects get a placeholder.
+  // Models requiring validated tools need placeholders for empty objects.
   placeholder: boolean;
-  // Antigravity Claude rejects multi-branch unions in tool parameters.
-  flattenMultiBranch: boolean;
 };
 
 const PLACEHOLDER_DESCRIPTION = "Brief explanation of why you are calling this tool";
@@ -136,7 +134,7 @@ function cleanNode(input: Schema, options: Options, root: boolean): Schema {
     const nonNull = objects.filter(branch => !isNullBranch(branch));
     const nullable = nonNull.length !== objects.length || node.nullable === true;
     delete node[key];
-    if (nonNull.length >= 2 && !options.flattenMultiBranch) {
+    if (nonNull.length >= 2) {
       node.anyOf = nonNull;
       if (nullable) { node.nullable = true; hint(node, "(nullable)"); }
       continue;
@@ -214,14 +212,14 @@ function cleanNode(input: Schema, options: Options, root: boolean): Schema {
   return node;
 }
 
-export function cleanAntigravityToolSchema(schema: unknown, input: { claude: boolean; validated: boolean }) {
+export function cleanAntigravityToolSchema(schema: unknown, input: { validated: boolean }) {
   const root = isObject(schema) ? schema : { type: "object", properties: {} };
   const resolved = resolveRefs(root, root, new Set()) as Schema;
-  return cleanNode(resolved, { tool: true, placeholder: input.validated, flattenMultiBranch: input.claude }, true);
+  return cleanNode(resolved, { tool: true, placeholder: input.validated }, true);
 }
 
 export function cleanAntigravityResponseSchema(schema: unknown) {
   if (!isObject(schema)) return schema;
   const resolved = resolveRefs(schema, schema, new Set()) as Schema;
-  return cleanNode(resolved, { tool: false, placeholder: false, flattenMultiBranch: false }, true);
+  return cleanNode(resolved, { tool: false, placeholder: false }, true);
 }

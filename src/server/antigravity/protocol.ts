@@ -10,23 +10,13 @@ export const ANTIGRAVITY_ONBOARD_USER_AGENT = ANTIGRAVITY_USER_AGENT + " google-
 export const ANTIGRAVITY_GOOG_API_CLIENT = "gl-node/22.21.1";
 export const ANTIGRAVITY_TOKEN_USER_AGENT = "Go-http-client/2.0";
 
-const MODEL_PATTERN = /^(gemini|claude|gpt-oss)-[a-z0-9][a-z0-9.-]*$/;
+const MODEL_PATTERN = /^gemini-[a-z0-9][a-z0-9.-]*$/;
 
 export function isAntigravityModelId(model: string) {
   return MODEL_PATTERN.test(model);
 }
 
-// Gemini models are served only by Antigravity; Claude and GPT-OSS IDs may also exist on other providers.
-export function isAntigravityGeminiModel(model: string) {
-  return /^gemini-[a-z0-9][a-z0-9.-]*$/.test(model);
-}
-
-export function isAntigravityClaudeModel(model: string) {
-  return model.toLowerCase().includes("claude");
-}
-
 export type AntigravityModelInfo = {
-  maxTokens?: number;
   thinking?: { min: number; max: number; zero?: boolean; levels?: string[] };
 };
 
@@ -34,10 +24,6 @@ export type AntigravityModelInfo = {
 // behave like CPA user-defined models: thinking settings pass through without clamping.
 const GEMINI_LEVELS = ["low", "medium", "high"];
 const MODEL_INFO: Record<string, AntigravityModelInfo> = {
-  "claude-opus-4-6-thinking": { maxTokens: 64000, thinking: { min: 1024, max: 64000, zero: true } },
-  "claude-sonnet-4-6": { maxTokens: 64000, thinking: { min: 1024, max: 64000, zero: true } },
-  "claude-opus-5-5-high": { maxTokens: 128000, thinking: { min: 1024, max: 64000, zero: true, levels: GEMINI_LEVELS } },
-  "claude-sonnet-5-5-high": { maxTokens: 128000, thinking: { min: 1024, max: 64000, zero: true, levels: GEMINI_LEVELS } },
   "gemini-4-argon-high": { thinking: { min: 1, max: 65535, levels: GEMINI_LEVELS } },
   "gemini-4-carbon-high": { thinking: { min: 1, max: 65535, levels: GEMINI_LEVELS } },
   "gemini-4-hydrogen-xhigh": { thinking: { min: 1, max: 65535, levels: [...GEMINI_LEVELS, "xhigh"] } },
@@ -46,20 +32,18 @@ const MODEL_INFO: Record<string, AntigravityModelInfo> = {
   "gemini-3.8-flash-tiered": { thinking: { min: 1, max: 65535, levels: GEMINI_LEVELS } },
   "gemini-3-flash": { thinking: { min: 128, max: 32768, levels: ["minimal", ...GEMINI_LEVELS] } },
   "gemini-3.1-flash-image": { thinking: { min: 128, max: 32768, levels: ["minimal", "high"] } },
-  "gpt-oss-120b-medium": { maxTokens: 32768 },
   "gemini-3.1-flash-lite": { thinking: { min: 1, max: 65535, zero: true, levels: ["minimal", ...GEMINI_LEVELS] } },
   "gemini-3.5-flash-lite": { thinking: { min: 1, max: 65535, levels: ["minimal", ...GEMINI_LEVELS] } },
 };
 
-// Antigravity publishes one ID per thinking tier (claude-opus-5-5-high, gemini-4-argon-low, gpt-oss-120b-medium,
-// claude-opus-4-6-thinking). Relay exposes the standard name so these models share routing with other providers,
+// Antigravity publishes one Gemini ID per thinking tier. Relay exposes the standard name
 // and picks the tier per account when sending.
 const TIER_SUFFIX = /-(minimal|low|medium|high|xhigh|max|thinking)$/;
 const TIER_ORDER = ["", "-high", "-xhigh", "-medium", "-thinking", "-low", "-minimal", "-max"];
 
-// Clients may send vendor-prefixed names (openai/gpt-oss-120b, anthropic/claude-opus-5-5, google/gemini-4-argon).
+// Clients may send Google-prefixed names (google/gemini-4-argon).
 export function antigravityModelName(model: string) {
-  return model.trim().toLowerCase().replace(/^(openai|anthropic|google)\//, "");
+  return model.trim().toLowerCase().replace(/^google\//, "");
 }
 
 export function antigravityStandardModel(model: string) {
@@ -76,6 +60,7 @@ export function antigravityStandardModels(catalog: string[]) {
 // requested reasoning effort, then the default tier. An unknown catalog passes the name through.
 export function resolveAntigravityModel(catalog: string[] | null, model: string, effort = "") {
   const requested = antigravityModelName(model);
+  if (!isAntigravityModelId(requested)) return null;
   if (!catalog || catalog.includes(requested)) return requested;
   const base = antigravityStandardModel(requested);
   const suffixes = effort ? ["-" + effort.toLowerCase(), ...TIER_ORDER] : TIER_ORDER;
@@ -93,7 +78,7 @@ export function antigravityModelInfo(model: string): AntigravityModelInfo | unde
 // CPA always uses the streaming endpoint for these models and aggregates non-stream responses.
 export function antigravityRequiresStreaming(model: string) {
   const value = model.toLowerCase();
-  return value.includes("claude") || value.includes("gemini-3-pro") || value.includes("gemini-3.1-flash-image");
+  return value.includes("gemini-3-pro") || value.includes("gemini-3.1-flash-image");
 }
 
 export function antigravityObject(value: unknown): Record<string, unknown> {

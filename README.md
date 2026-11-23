@@ -90,14 +90,14 @@ X-Relay-Quota-7d-Remaining-Percent: 60
 
 ## Antigravity OAuth
 
-Antigravity 是独立渠道，与 CLIProxyAPI 对齐，提供 `POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages` 和 `POST /v1/messages/count_tokens`。支持 JSON、SSE、完整对话历史以及函数和自定义文本工具。后续工具轮次须回传原始 output items，包括带 `encrypted_content` 的 reasoning item（Messages 中为 thinking 块的 signature）。渠道填写 Gemini、Claude 或 GPT-OSS 模型的完整 ID，账户权限由 Google 决定。
+Antigravity 是仅承接 **Gemini 系列**的独立渠道，提供 `POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages` 和 `POST /v1/messages/count_tokens`。支持 JSON、SSE、完整对话历史以及函数和自定义文本工具。后续工具轮次须回传原始 output items，包括带 `encrypted_content` 的 reasoning item（Messages 中为 thinking 块的 signature）。渠道只接受 `gemini-*` 模型 ID；客户端也可使用 `google/gemini-*` 前缀。即使上游账号目录或旧渠道白名单含有 Claude、GPT-OSS 等模型，也不会展示为 AGY 可用模型或路由到 AGY。
 
 1. Relay 与 CLIProxyAPI 一样内置 Antigravity 桌面客户端的 OAuth client ID 和 secret，无需额外配置；`RELAY_ANTIGRAVITY_OAUTH_CLIENT_ID`、`RELAY_ANTIGRAVITY_OAUTH_CLIENT_SECRET`、`RELAY_ANTIGRAVITY_OAUTH_SCOPE` 仅用于覆盖默认值。授权不使用 PKCE，没有项目的账号会通过 `onboardUser` 自动开通。
 2. 回调地址默认为 `http://localhost:51121/oauth-callback`。已有注册回调时，设置 `RELAY_ANTIGRAVITY_OAUTH_REDIRECT_URI`。在管理台连接 Google 账号，授权后将浏览器回调 URL 粘贴回 Relay。
-3. 新建 Antigravity 渠道并绑定账号；模型白名单留空时按账号的模型目录路由（Claude / GPT-OSS 仅在目录明确包含时才走 Antigravity）。客户端拿 Relay Key 调用上述接口。凭据可手动续期，续期同时刷新账号的可用模型目录；进入到期前五分钟时，请求也会触发续期。
+3. 新建 Antigravity 渠道并绑定账号；模型白名单留空时按账号目录中的 Gemini 模型路由。客户端拿 Relay Key 调用上述接口。凭据可手动续期，续期同时刷新账号的可用模型目录；进入到期前五分钟时，请求也会触发续期。升级前保存的非 Gemini 白名单项在路由时被忽略，修改白名单时须删除这些项；仅绑定 AGY 的 Key 请求非 Gemini 模型会返回 503，不会发给 Google。
 4. 账号卡片的额度与 CPA 管理面板同源，读取 `retrieveUserQuotaSummary` 的模型分组周额度和 5 小时额度；daily 端点只返回部分分组时继续查询其他端点并合并。
 
-请求按 CPA 处理：携带 Antigravity 客户端 User-Agent、`requestId` 与稳定的 `sessionId`，清理工具和响应 schema，Claude 使用 `VALIDATED` 工具模式且始终走流式上游。429 会按 Google 的错误原因和重试时间处理：短时限流原地重试，其余为该账号的该模型设置冷却并切换到下一个账号。所有账号均限流时，设置 `RELAY_ANTIGRAVITY_CREDITS=1` 可让 Claude 请求改用 Google One AI 积分（默认关闭，与 CPA 一致）。
+Gemini 请求沿用 CPA 的转换方式：携带 Antigravity 客户端 User-Agent、`requestId` 与稳定的 `sessionId`，清理工具和响应 schema。429 会按 Google 的错误原因和重试时间处理：短时限流原地重试，其余为该账号的该模型设置冷却并切换到下一个账号。不再提供 AGY 的 Claude/GPT-OSS 转发或 Claude Google One AI 积分回退。
 
 本地回归使用模拟的 Google 授权、项目发现和推理响应，可运行 `node --test tests/antigravity-route.test.mjs`。真实账户需要 Google 接受所配置的 OAuth 客户端，并为账户返回有效的 Antigravity 项目。Google 的个人计划条款限制第三方应用使用 Antigravity OAuth。 [Antigravity 条款](https://antigravity.google/terms)
 

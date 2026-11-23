@@ -3,11 +3,12 @@ import "server-only";
 import { HttpError } from "@/src/server/http/errors";
 import {
   antigravityModelInfo,
+  antigravityModelName,
   antigravityObject as object,
   antigravityRequestId,
   antigravitySessionId,
   antigravityString as string,
-  isAntigravityClaudeModel,
+  isAntigravityModelId,
   type AntigravityModelInfo,
 } from "@/src/server/antigravity/protocol";
 import { cleanAntigravityResponseSchema, cleanAntigravityToolSchema } from "@/src/server/antigravity/schema";
@@ -16,7 +17,6 @@ export const ANTIGRAVITY_SIGNATURE_PREFIX = "relay-antigravity:";
 export const ANTIGRAVITY_CALL_ID_PREFIX = "call_relay_agy_";
 // CPA replays function calls without a stored signature with Gemini's documented bypass value.
 const SKIP_SIGNATURE = "skip_thought_signature_validator";
-const CLAUDE_55 = /^claude-(opus|sonnet)-5-5(?:-(low|medium|high|reasoning))?(?:-[0-9]{8})?(?:\[[^[\]]+\])?$/;
 const LEVEL_BUDGETS: Record<string, number> = {
   none: 0, auto: -1, minimal: 512, low: 1024, medium: 8192, high: 24576, xhigh: 32768, max: 128000,
 };
@@ -37,10 +37,11 @@ export function antigravityResponsesPayload(
   model: string,
   options: { includeThoughtsByDefault?: boolean; countTokens?: boolean } = {},
 ) {
+  model = antigravityModelName(model);
+  if (!isAntigravityModelId(model)) invalid("Antigravity only supports Gemini models");
   if (input.previous_response_id || input.conversation || input.background === true) {
     invalid("Antigravity Responses requires the full input history and foreground execution");
   }
-  const claude = isAntigravityClaudeModel(model);
   const system: Part[] = typeof input.instructions === "string" && input.instructions ? [{ text: input.instructions }] : [];
   let contents: Content[] = [];
   const callNames = new Map<string, { name: string; upstreamId?: string }>();
@@ -97,8 +98,8 @@ export function antigravityResponsesPayload(
       const upstreamId = id.startsWith(ANTIGRAVITY_CALL_ID_PREFIX) ? undefined : id;
       const args = type === "custom_tool_call" ? { input: string(item.input) } : jsonArguments(string(item.arguments));
       callNames.set(id, { name, upstreamId });
-      const callSignature = signature || (claude ? "" : SKIP_SIGNATURE);
-      append("model", [{ functionCall: { name, args, id: upstreamId }, ...(callSignature && { thoughtSignature: callSignature }) }]);
+      const callSignature = signature || SKIP_SIGNATURE;
+      append("model", [{ functionCall: { name, args, id: upstreamId }, thoughtSignature: callSignature }]);
       signature = "";
       continue;
     }
@@ -116,7 +117,7 @@ export function antigravityResponsesPayload(
   if (!contents.length) invalid("Antigravity requires a message in input");
 
   // CPA cleans tool schemas in the Antigravity subset; VALIDATED models also need placeholder properties.
-  const validated = claude || /gemini-3(\.1)?-pro/.test(model);
+  const validated = /gemini-3(\.1)?-pro/.test(model);
   const tools = Array.isArray(input.tools) ? input.tools : [];
   const functionDeclarations = tools.map(value => {
     const tool = object(value);
@@ -130,17 +131,17 @@ export function antigravityResponsesPayload(
     return {
       name,
       description: string(tool.description) || undefined,
-      parameters: cleanAntigravityToolSchema(schema, { claude, validated }),
+      parameters: cleanAntigravityToolSchema(schema, { validated }),
     };
   });
   const choice = object(input.tool_choice);
-  let mode = input.tool_choice === "none" ? "NONE"
+  const mode = input.tool_choice === "none" ? "NONE"
     : input.tool_choice === "required" || choice.type === "function" || choice.type === "custom" ? "ANY" : "AUTO";
-  let allowedFunctionNames = string(choice.name) ? [string(choice.name)] : undefined;
+  const allowedFunctionNames = string(choice.name) ? [string(choice.name)] : undefined;
 
   const generationConfig: Part = {};
   for (const [source, destination] of [
-    ["max_output_tokens", "maxOutputTokens"], ["temperature", "temperature"], ["top_p", "topP"], ["top_k", "topK"],
+    ["temperature", "temperature"], ["top_p", "topP"], ["top_k", "topK"],
   ]) {
     if (typeof input[source] === "number") generationConfig[destination] = input[source];
   }
@@ -154,27 +155,7 @@ export function antigravityResponsesPayload(
   }
   applyThinking(generationConfig, input, model, options.includeThoughtsByDefault === true);
 
-  // Claude 5.5 rejects forced tool use with native output schemas, so CPA moves the schema into the prompt.
-  let promptStructuredOutput = false;
-  if (CLAUDE_55.test(model.toLowerCase()) && format.type === "json_schema" && format.schema && typeof format.schema === "object") {
-    system.push({ text: structuredOutputInstruction(format) });
-    delete generationConfig.responseMimeType;
-    delete generationConfig.responseJsonSchema;
-    if (mode === "ANY") {
-      mode = "AUTO";
-      allowedFunctionNames = undefined;
-    }
-    promptStructuredOutput = true;
-  }
-  if (claude) {
-    const limit = antigravityModelInfo(model)?.maxTokens;
-    const max = generationConfig.maxOutputTokens;
-    if (limit && typeof max === "number" && max > limit) generationConfig.maxOutputTokens = limit;
-  } else {
-    delete generationConfig.maxOutputTokens;
-  }
-
-  if (!claude) contents = boundaryUserTurns(contents, !options.countTokens);
+  contents = boundaryUserTurns(contents, !options.countTokens);
   const request: Record<string, unknown> = {
     contents,
     systemInstruction: system.length ? { role: "user", parts: system } : undefined,
@@ -183,9 +164,7 @@ export function antigravityResponsesPayload(
   };
   if (options.countTokens) return { request };
 
-  const functionCallingConfig = claude && !promptStructuredOutput
-    ? { mode: "VALIDATED", allowedFunctionNames }
-    : functionDeclarations.length ? { mode, allowedFunctionNames } : undefined;
+  const functionCallingConfig = functionDeclarations.length ? { mode, allowedFunctionNames } : undefined;
   request.toolConfig = functionCallingConfig ? { functionCallingConfig } : undefined;
   const image = model.includes("image");
   if (!image) request.sessionId = antigravitySessionId(contents);
@@ -223,7 +202,6 @@ function applyThinking(config: Part, input: Record<string, unknown>, model: stri
   if (info && !info.thinking) return;
   const support = info?.thinking;
   const levels = support?.levels ?? [];
-  const claude = isAntigravityClaudeModel(model);
   if (support && !levels.length && thinking.mode === "level") {
     thinking = { mode: "budget", budget: LEVEL_BUDGETS[thinking.level!] };
   }
@@ -234,22 +212,15 @@ function applyThinking(config: Part, input: Record<string, unknown>, model: stri
     config.thinkingConfig = value;
   };
   if (thinking.mode === "none") {
-    // Level models drop thinkingConfig; Claude drops it below its minimum budget.
-    if (!levels.length && !claude) withInclude({ thinkingBudget: support && !support.zero ? support.min : 0 });
+    // Level models drop thinkingConfig; budget models clamp to their supported minimum.
+    if (!levels.length) withInclude({ thinkingBudget: support && !support.zero ? support.min : 0 });
     return;
   }
   if (thinking.mode === "level") {
     withInclude({ thinkingLevel: thinking.level });
     return;
   }
-  let value = thinking.mode === "auto" ? -1 : thinking.budget!;
-  if (claude && info) {
-    const requested = typeof config.maxOutputTokens === "number" && config.maxOutputTokens > 0 ? config.maxOutputTokens : 0;
-    const max = requested || info.maxTokens || 0;
-    if (max > 0 && value >= max) value = max - 1;
-    if (support && support.min > 0 && value >= 0 && value < support.min) return;
-    if (!requested && max > 0) config.maxOutputTokens = max;
-  }
+  const value = thinking.mode === "auto" ? -1 : thinking.budget!;
   withInclude({ thinkingBudget: value });
 }
 
@@ -290,15 +261,6 @@ function boundaryUserTurns(contents: Content[], trailing: boolean) {
   if (result[0]?.role === "model") result.unshift({ role: "user", parts: [{ text: "" }] });
   if (trailing && result.at(-1)?.role === "model") result.push({ role: "user", parts: [{ text: "" }] });
   return result;
-}
-
-function structuredOutputInstruction(format: Record<string, unknown>) {
-  const lines = ["You must format your entire response as valid JSON that conforms strictly to the following JSON schema:"];
-  if (string(format.name).trim()) lines.push("Schema Name: " + string(format.name).trim());
-  if (string(format.description).trim()) lines.push("Schema Description: " + string(format.description).trim());
-  lines.push("JSON Schema:", JSON.stringify(format.schema));
-  return lines.join("\n") +
-    "\nDo not include any explanations, markdown code blocks (such as ```json), or any text outside of the JSON object.";
 }
 
 function contentParts(content: unknown): Part[] {

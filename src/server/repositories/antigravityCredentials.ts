@@ -1,5 +1,6 @@
 import "server-only";
 
+import { isAntigravityModelId } from "@/src/server/antigravity/protocol";
 import { getMainDb } from "@/src/server/db/sqlite";
 import { decryptJson, encryptJson, sha256 } from "@/src/server/services/crypto";
 import type {
@@ -59,7 +60,7 @@ function publicRecord(row: Row): AntigravityCredentialRecord {
     proxyPoolId: null,
     useGlobalProxy: false,
     metadata: parseJson<Record<string, unknown>>(row.metadata_json, {}),
-    models: parseJson<string[] | null>(row.models_json, null),
+    models: parseJson<string[] | null>(row.models_json, null)?.filter(isAntigravityModelId) ?? null,
     modelCooldowns: parseJson<Record<string, AntigravityModelCooldown>>(row.model_cooldowns_json, {}),
   };
 }

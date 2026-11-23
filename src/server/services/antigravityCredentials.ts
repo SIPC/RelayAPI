@@ -38,7 +38,6 @@ import type {
 } from "@/src/shared/types/entities";
 
 const REFRESH_LEAD_MS = 5 * 60 * 1000;
-const CREDITS_HINT_TTL_MS = 10 * 60 * 1000;
 const ONBOARD_ATTEMPTS = 5;
 const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -54,10 +53,8 @@ const DEFAULT_SCOPE = [
 ].join(" ");
 
 type Step = "token" | "identity" | "project" | "onboard" | "models" | "quota";
-type CreditsHint = { available: boolean; updatedAt: number };
 
 const refreshes = new Map<string, Promise<AntigravityCredentialWithTokens>>();
-const creditsHints = new Map<string, CreditsHint>();
 
 function oauthClient() {
   return {
@@ -125,7 +122,6 @@ export async function finishAntigravityOAuthCallback(input: unknown) {
   const projectId = companionProject(loaded) || await onboardUser(token, defaultTierId(loaded));
   if (!projectId) throw new HttpError(403, "antigravity_project_missing", "No Antigravity project is associated with this account");
   const saved = saveAntigravityCredential({ accountId, email, projectId, tokens });
-  observeCredits(saved.id, loaded);
   await refreshModelCatalog(saved.id, token, projectId);
   return publicCredential(getAntigravityCredential(saved.id) ?? saved);
 }
@@ -178,37 +174,6 @@ function defaultTierId(loaded: Record<string, unknown>) {
   return string(tier?.id).trim() || string(object(loaded.currentTier).id).trim() || "free-tier";
 }
 
-// Credits hints mirror CPA: GOOGLE_ONE_AI balance from loadCodeAssist, kept in memory for 10 minutes.
-function observeCredits(id: string, loaded: Record<string, unknown>) {
-  const paidTier = object(loaded.paidTier);
-  const credits = Array.isArray(paidTier.availableCredits) ? paidTier.availableCredits.map(object) : [];
-  const credit = credits.find(item => string(item.creditType).toUpperCase() === "GOOGLE_ONE_AI");
-  const amount = Number(credit?.creditAmount);
-  const minimum = Number(credit?.minimumCreditAmountForUsage);
-  creditsHints.set(id, {
-    available: Number.isFinite(amount) && Number.isFinite(minimum) && amount >= minimum,
-    updatedAt: Date.now(),
-  });
-}
-
-export function antigravityCreditsHint(id: string): boolean | undefined {
-  const hint = creditsHints.get(id);
-  if (!hint || Date.now() - hint.updatedAt >= CREDITS_HINT_TTL_MS) return undefined;
-  return hint.available;
-}
-
-export function markAntigravityCreditsExhausted(id: string) {
-  creditsHints.set(id, { available: false, updatedAt: Date.now() });
-}
-
-export async function refreshAntigravityCreditsHint(credential: AntigravityCredentialWithTokens) {
-  try {
-    observeCredits(credential.id, await loadCodeAssist(credential.tokens.access_token));
-  } catch {
-    // A failed balance probe leaves the hint unknown; the credits attempt itself decides.
-  }
-}
-
 async function refreshModelCatalog(id: string, token: string, projectId: string) {
   try {
     const result = await googleJson(ANTIGRAVITY_BASE_URL + "/v1internal:fetchAvailableModels", {
@@ -247,7 +212,6 @@ async function refreshCredential(credential: AntigravityCredentialWithTokens) {
   }
   const updated = getAntigravityCredentialWithTokens(credential.id);
   if (!updated?.enabled) throw new HttpError(403, "antigravity_credential_unavailable", "Antigravity credential is unavailable");
-  void refreshAntigravityCreditsHint(updated);
   return updated;
 }
 
