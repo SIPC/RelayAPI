@@ -1,7 +1,6 @@
 import "server-only";
 
 import crypto from "node:crypto";
-import { prepareClaudeOAuthUpstreamPayload } from "@/src/server/claude/compat";
 import {
   claudeModelAllowlistCandidates,
   stripClaudeModelSuffixes,
@@ -19,11 +18,7 @@ import {
   upsertClaudeCredential,
 } from "@/src/server/repositories/claudeCredentials";
 import { detachCredentialFromChannels } from "@/src/server/repositories/channels";
-import {
-  credentialUsageHealth,
-  credentialUsageWindows,
-  latestCredentialUpstreamHeaders,
-} from "@/src/server/repositories/logs";
+import { credentialUsageHealth } from "@/src/server/repositories/logs";
 import {
   saveOAuthPendingState,
   takeOAuthPendingState,
@@ -65,18 +60,6 @@ const TOKEN_REFRESH_METADATA_KEYS = [
   "token_refresh_auto_disabled",
 ] as const;
 const USAGE_HEALTH_RESET_METADATA_KEY = "usage_health_reset_at";
-const CLAUDE_MESSAGES_PATH = "/v1/messages?beta=true";
-const CLAUDE_BETA = [
-  "claude-code-20250219",
-  "oauth-2025-04-20",
-  "interleaved-thinking-2025-05-14",
-  "context-management-2025-06-27",
-  "prompt-caching-scope-2026-01-05",
-  "structured-outputs-2025-12-15",
-  "fast-mode-2026-02-01",
-  "redact-thinking-2026-02-12",
-  "token-efficient-tools-2026-03-28",
-].join(",");
 
 interface PendingOAuthState {
   codeVerifier: string;
@@ -246,74 +229,7 @@ export function listPublicClaudeCredentials() {
   }));
 }
 
-export async function getClaudeQuota(
-  credentialId: string,
-  options: { sourceHeaders?: Headers } = {},
-): Promise<ClaudeQuotaReport> {
-  const id = cleanString(credentialId);
-  if (!id) {
-    throw new HttpError(
-      400,
-      "missing_claude_credential_id",
-      "Claude credential id is required",
-    );
-  }
-  const existing = getClaudeCredentialWithTokens(id);
-  if (!existing) {
-    throw new HttpError(
-      404,
-      "claude_credential_not_found",
-      "Claude credential not found",
-    );
-  }
-
-  let credential = existing;
-  try {
-    credential = await ensureFreshClaudeCredential(id);
-    if (!credential.tokens.access_token) {
-      throw new HttpError(
-        400,
-        "missing_claude_access_token",
-        "Saved Claude credential does not contain an access token",
-      );
-    }
-
-    const now = new Date();
-    const localWindows = credentialUsageWindows(id, now);
-    const probe =
-      cachedClaudeQuotaProbe(id) ||
-      (await requestClaudeQuotaProbe(
-        credential,
-        options.sourceHeaders || new Headers(),
-      ));
-    const windows = withClaudeRetryAfterWindow(
-      parseClaudeRateLimitWindows(probe.headers),
-      probe,
-      now,
-    );
-
-    return {
-      provider: "claude",
-      source: "anthropic_headers",
-      credential_id: credential.id,
-      account_id: credential.accountId,
-      email: credential.email,
-      status: deriveClaudeQuotaStatus(credential, windows, now, probe.status),
-      windows,
-      local_windows: localWindows,
-      retrieved_at: now.toISOString(),
-      cooldown_until: credential.cooldownUntil,
-      last_error: credential.lastError,
-      message: claudeQuotaMessage(probe, windows),
-    };
-  } catch (error) {
-    logServerError(error, {
-      operation: "claude.quota.refresh",
-      metadata: claudeCredentialLogMetadata(credential),
-    });
-    throw error;
-  }
-}
+export { getClaudeQuota } from "@/src/server/services/claudeQuota";
 
 export function patchClaudeCredentialRouting(
   id: string,
@@ -827,109 +743,6 @@ async function saveClaudeTokenResponse(
   return saved;
 }
 
-interface ClaudeQuotaProbeResult {
-  ok: boolean;
-  status: number;
-  statusText: string;
-  headers: Headers;
-  body: unknown;
-  source: "request_log" | "probe";
-}
-
-function cachedClaudeQuotaProbe(
-  credentialId: string,
-): ClaudeQuotaProbeResult | null {
-  const headers = latestCredentialUpstreamHeaders(credentialId);
-  if (!headers) {
-    return null;
-  }
-  return {
-    ok: true,
-    status: 200,
-    statusText: "OK",
-    headers: new Headers(headers),
-    body: null,
-    source: "request_log",
-  };
-}
-
-async function requestClaudeQuotaProbe(
-  credential: ClaudeCredentialWithTokens,
-  sourceHeaders: Headers,
-): Promise<ClaudeQuotaProbeResult> {
-  const claudeUserAgent = sourceClaudeCliUserAgent(
-    sourceHeaders,
-    getEffectiveClaudeUserAgent(credential),
-  );
-  const prepared = prepareClaudeOAuthUpstreamPayload(
-    {
-      model: stripClaudeModelSuffixes(serverConfig.claudeDefaultModel),
-      messages: [
-        {
-          role: "user",
-          content: [{ type: "text", text: "quota probe" }],
-        },
-      ],
-      max_tokens: 1,
-      stream: true,
-    },
-    {
-      accessToken: credential.tokens.access_token,
-      sourceHeaders,
-      claudeUserAgent,
-      ...ensureClaudeRequestIdentity(credential),
-    },
-  );
-
-  const response = await proxiedFetch(
-    `${serverConfig.claudeBaseUrl}${CLAUDE_MESSAGES_PATH}`,
-    {
-      method: "POST",
-      headers: buildClaudeQuotaProbeHeaders(credential, {
-        stream: true,
-        sourceHeaders,
-        claudeUserAgent,
-        extraBetas: prepared.extraBetas,
-      }),
-      body: prepared.body,
-      signal: AbortSignal.timeout(serverConfig.requestTimeoutMs),
-    },
-    resolveClaudeCredentialProxy({
-      proxy: credential.proxy,
-      proxyPoolId: credential.proxyPoolId,
-      useGlobalProxy: credential.useGlobalProxy,
-    }),
-  );
-
-  let responseBody: unknown = null;
-  if (response.ok) {
-    await response.body?.cancel();
-  } else {
-    const text = await response.text();
-    responseBody = parseMaybeJson<unknown>(text) || { raw: text };
-    if (response.status !== 429) {
-      throw new HttpError(
-        response.status,
-        "claude_quota_request_failed",
-        `Claude quota probe failed with HTTP ${response.status}`,
-        {
-          upstreamStatus: response.status,
-          upstreamStatusText: response.statusText,
-          upstreamBody: responseBody,
-        },
-      );
-    }
-  }
-  return {
-    ok: response.ok,
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-    body: responseBody,
-    source: "probe",
-  };
-}
-
 export function ensureClaudeRequestIdentity(credential: ClaudeCredentialWithTokens) {
   const stored = credential.metadata.device_ids;
   let deviceId = Array.isArray(stored) ? String(stored[0] || "") : String(credential.metadata.device_id || "");
@@ -941,67 +754,7 @@ export function ensureClaudeRequestIdentity(credential: ClaudeCredentialWithToke
   return { deviceId, accountId: String(credential.metadata.account_uuid || credential.accountId || "") };
 }
 
-function buildClaudeQuotaProbeHeaders(
-  credential: ClaudeCredentialWithTokens,
-  input: {
-    stream: boolean;
-    sourceHeaders: Headers;
-    claudeUserAgent: string;
-    extraBetas: string[];
-  },
-) {
-  return {
-    Authorization: `Bearer ${credential.tokens.access_token}`,
-    "Content-Type": "application/json",
-    Accept: input.stream ? "text/event-stream" : "application/json",
-    "Accept-Encoding": input.stream ? "identity" : "gzip, deflate, br, zstd",
-    "Anthropic-Version":
-      input.sourceHeaders.get("anthropic-version") || "2023-06-01",
-    "Anthropic-Beta": mergeClaudeBeta(
-      input.sourceHeaders.get("anthropic-beta"),
-      input.extraBetas,
-    ),
-    "X-App": "cli",
-    "X-Stainless-Retry-Count": "0",
-    "X-Stainless-Runtime": "node",
-    "X-Stainless-Lang": "js",
-    "X-Stainless-Timeout": sourceClaudeHeaderOrDefault(
-      input.sourceHeaders,
-      "x-stainless-timeout",
-      "600",
-    ),
-    "X-Claude-Code-Session-Id": deterministicUuid(
-      `relayapi:claude:${credential.id}`,
-    ),
-    "x-client-request-id": crypto.randomUUID(),
-    "User-Agent": sourceClaudeCliUserAgent(
-      input.sourceHeaders,
-      input.claudeUserAgent,
-    ),
-    "X-Stainless-Package-Version": sourceClaudeHeaderOrDefault(
-      input.sourceHeaders,
-      "x-stainless-package-version",
-      serverConfig.claudeStainlessPackageVersion,
-    ),
-    "X-Stainless-Runtime-Version": sourceClaudeHeaderOrDefault(
-      input.sourceHeaders,
-      "x-stainless-runtime-version",
-      serverConfig.claudeStainlessRuntimeVersion,
-    ),
-    "X-Stainless-Os": sourceClaudeHeaderOrDefault(
-      input.sourceHeaders,
-      "x-stainless-os",
-      serverConfig.claudeStainlessOs,
-    ),
-    "X-Stainless-Arch": sourceClaudeHeaderOrDefault(
-      input.sourceHeaders,
-      "x-stainless-arch",
-      serverConfig.claudeStainlessArch,
-    ),
-  };
-}
-
-function parseClaudeRateLimitWindows(headers: Headers): ClaudeQuotaWindow[] {
+export function parseClaudeRateLimitWindows(headers: Headers): ClaudeQuotaWindow[] {
   const unifiedWindows = parseClaudeUnifiedRateLimitWindows(headers);
   const groups = new Map<
     string,
@@ -1092,7 +845,7 @@ function parseClaudeUnifiedRateLimitWindows(headers: Headers) {
     const match = rawName
       .toLowerCase()
       .match(
-        /^anthropic-ratelimit-unified-(5h|7d)-(reset|status|utilization)$/,
+        /^anthropic-ratelimit-unified-(5h|7d(?:-(?:opus|sonnet|haiku|fable|mythos))?)-(reset|status|utilization)$/,
       );
     if (!match) {
       continue;
@@ -1188,53 +941,20 @@ function buildClaudeQuotaWindow(
   };
 }
 
-function withClaudeRetryAfterWindow(
-  windows: ClaudeQuotaWindow[],
-  probe: ClaudeQuotaProbeResult,
-  now: Date,
-) {
-  if (probe.status !== 429 || windows.some((window) => window.exhausted)) {
-    return windows;
-  }
-  const resetAt = parseClaudeQuotaRetryAt(probe, now);
-  return [
-    ...windows,
-    {
-      id: "retry-after",
-      label: "上游 429 冷却",
-      limit: null,
-      remaining: 0,
-      used: null,
-      used_percent: null,
-      remaining_percent: 0,
-      reset_label: formatResetLabel(resetAt),
-      reset_at: resetAt?.toISOString() || null,
-      exhausted: true,
-    },
-  ];
-}
-
-function deriveClaudeQuotaStatus(
+export function deriveClaudeQuotaStatus(
   credential: Pick<ClaudeCredentialRecord, "cooldownUntil" | "lastError">,
   windows: ClaudeQuotaReport["windows"],
   now: Date,
-  upstreamStatus?: number,
 ): ClaudeQuotaStatus {
   const cooldownUntil = Date.parse(credential.cooldownUntil || "");
   if (Number.isFinite(cooldownUntil) && cooldownUntil > now.getTime()) {
     return "cooling_down";
   }
-  if (upstreamStatus === 429) {
-    return "exhausted";
-  }
-
   const reportedWindows = windows.filter(
     (window) => window.remaining_percent !== null || window.exhausted,
   );
-  const subscriptionWindow =
-    reportedWindows.find((window) => window.id === "unified-5h") ??
-    reportedWindows.find((window) => window.id === "unified-7d");
-  const statusWindows = subscriptionWindow ? [subscriptionWindow] : reportedWindows;
+  const subscriptionWindows = reportedWindows.filter((window) => window.id.startsWith("unified-"));
+  const statusWindows = subscriptionWindows.length ? subscriptionWindows : reportedWindows;
   if (statusWindows.some((window) => window.exhausted)) {
     return "exhausted";
   }
@@ -1260,24 +980,6 @@ function deriveClaudeQuotaStatus(
   return "full";
 }
 
-function claudeQuotaMessage(
-  probe: ClaudeQuotaProbeResult,
-  windows: ClaudeQuotaWindow[],
-) {
-  const sourceLabel =
-    probe.source === "request_log" ? "最近正常对话" : "/v1/messages 探测";
-  if (probe.status === 429) {
-    return `Claude ${sourceLabel}返回 429，已按真实上游限流/额度耗尽处理；重置时间来自 Retry-After 或 rate-limit 响应头。`;
-  }
-  if (windows.length > 0) {
-    return `Claude 真实额度来自${sourceLabel}的 unified/rate-limit 响应头；本地请求统计仅作为参考。`;
-  }
-  if (probe.ok) {
-    return `Claude ${sourceLabel}成功，但上游未返回可解析的 unified/rate-limit 响应头。`;
-  }
-  return `Claude ${sourceLabel}返回 HTTP ${probe.status}，且未返回可解析的 unified/rate-limit 响应头。`;
-}
-
 function claudeRateLimitLabel(metric: string) {
   const labels: Record<string, string> = {
     "unified-5h": "5h 额度",
@@ -1290,57 +992,6 @@ function claudeRateLimitLabel(metric: string) {
     "cache-creation-input-tokens": "缓存写入额度",
   };
   return labels[metric] || metric.replace(/-/g, " ");
-}
-
-function parseClaudeQuotaRetryAt(probe: ClaudeQuotaProbeResult, now: Date) {
-  const retryAfter = parseRetryAfterHeader(
-    probe.headers.get("retry-after"),
-    now,
-  );
-  if (retryAfter) {
-    return retryAfter;
-  }
-  return parseClaudeQuotaBodyReset(probe.body, now);
-}
-
-function parseRetryAfterHeader(value: string | null, now: Date) {
-  const raw = stringValue(value);
-  if (!raw) {
-    return null;
-  }
-  const numeric = positiveNumberOrNull(raw);
-  if (numeric !== null) {
-    const date = new Date(now.getTime() + numeric * 1000);
-    return Number.isFinite(date.getTime()) ? date : null;
-  }
-  const date = new Date(raw);
-  return Number.isFinite(date.getTime()) ? date : null;
-}
-
-function parseClaudeQuotaBodyReset(body: unknown, now: Date) {
-  const root = objectValue(body);
-  const error = objectValue(root?.error);
-  const resetAt = positiveNumberOrNull(
-    error?.resets_at ?? error?.reset_at ?? root?.resets_at ?? root?.reset_at,
-  );
-  if (resetAt !== null) {
-    const milliseconds = resetAt > 1_000_000_000_000 ? resetAt : resetAt * 1000;
-    const date = new Date(milliseconds);
-    if (Number.isFinite(date.getTime())) {
-      return date;
-    }
-  }
-  const resetAfterSeconds = positiveNumberOrNull(
-    error?.resets_in_seconds ??
-      error?.reset_after_seconds ??
-      root?.resets_in_seconds ??
-      root?.reset_after_seconds,
-  );
-  if (resetAfterSeconds !== null) {
-    const date = new Date(now.getTime() + resetAfterSeconds * 1000);
-    return Number.isFinite(date.getTime()) ? date : null;
-  }
-  return null;
 }
 
 function parseClaudeResetHeader(value: string | undefined) {
@@ -1382,56 +1033,6 @@ function formatResetLabel(date: Date | null) {
   return `${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(
     date.getHours(),
   )}:${pad2(date.getMinutes())}`;
-}
-
-function mergeClaudeBeta(sourceValue: string | null, extraBetas: string[]) {
-  const values = new Set(
-    (sourceValue || CLAUDE_BETA)
-      .split(",")
-      .map((item) => item.trim())
-      .filter(Boolean),
-  );
-  for (const beta of extraBetas) {
-    values.add(beta);
-  }
-  for (const required of [
-    "oauth-2025-04-20",
-    "interleaved-thinking-2025-05-14",
-  ]) {
-    values.add(required);
-  }
-  return [...values].join(",");
-}
-
-function sourceClaudeCliUserAgent(sourceHeaders: Headers, fallback: string) {
-  const userAgent = sourceHeaders.get("user-agent")?.trim() || "";
-  return userAgent.startsWith("claude-cli/") ? userAgent : fallback;
-}
-
-function sourceClaudeHeaderOrDefault(
-  sourceHeaders: Headers,
-  name: string,
-  fallback: string,
-) {
-  const userAgent = sourceHeaders.get("user-agent")?.trim() || "";
-  if (userAgent.startsWith("claude-cli/")) {
-    const value = sourceHeaders.get(name)?.trim();
-    if (value) {
-      return value;
-    }
-  }
-  return fallback;
-}
-
-function deterministicUuid(seed: string) {
-  const hash = crypto.createHash("sha1").update(seed).digest();
-  hash[6] = (hash[6] & 0x0f) | 0x50;
-  hash[8] = (hash[8] & 0x3f) | 0x80;
-  const hex = hash.subarray(0, 16).toString("hex");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(
-    12,
-    16,
-  )}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
 function positiveNumberOrNull(value: unknown) {

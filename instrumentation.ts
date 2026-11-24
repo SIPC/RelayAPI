@@ -6,8 +6,10 @@ export async function register() {
       await import("./src/server/services/codexCredentialRefreshScheduler");
     const { startClaudeCredentialRefreshScheduler } =
       await import("./src/server/services/claudeCredentialRefreshScheduler");
+    const { startClaudeQuotaScheduler } = await import("./src/server/services/claudeQuota");
     initializeWebAccessKey();
     startCodexCredentialRefreshScheduler();
     startClaudeCredentialRefreshScheduler();
+    startClaudeQuotaScheduler();
   }
 }

@@ -68,6 +68,7 @@ import {
   completeSessionBinding, failSessionBinding, reserveSessionBinding, type SessionBinding,
 } from "@/src/server/repositories/sessionBindings";
 import { HttpError } from "@/src/server/http/errors";
+import { claudeQuotaRouting } from "@/src/server/services/claudeQuota";
 
 // Only request-local completion state lives in memory; account bindings live in SQLite.
 const claudeSessions = new WeakMap<ChannelRecord, {
@@ -97,6 +98,7 @@ export interface CreateChannelInput {
   enabled?: boolean;
   priority?: number;
   weight?: number;
+  quotaWeighted?: boolean;
   modelAllowlist?: string[];
   capabilities?: UpstreamOperation[];
 }
@@ -152,6 +154,7 @@ export function createChannel(input: CreateChannelInput) {
     enabled: input.enabled ?? !isApiProvider(provider),
     priority: normalizeInteger(input.priority, 100),
     weight: Math.max(1, normalizeInteger(input.weight, 1)),
+    quotaWeighted: provider === "claude" && input.quotaWeighted === true,
     modelAllowlist: normalizeModelAllowlist(provider, input.modelAllowlist),
     capabilities: normalizeCapabilities(provider, input.capabilities),
     status: "healthy",
@@ -203,6 +206,9 @@ export function patchChannel(
       : {}),
     ...(input.weight !== undefined
       ? { weight: Math.max(1, normalizeInteger(input.weight, 1)) }
+      : {}),
+    ...(input.quotaWeighted !== undefined
+      ? { quotaWeighted: existing.provider === "claude" && input.quotaWeighted === true }
       : {}),
     ...(input.modelAllowlist !== undefined
       ? { modelAllowlist: normalizeModelAllowlist(existing.provider, input.modelAllowlist) }
@@ -277,6 +283,7 @@ export function selectChannel(input: {
       channel,
       credentialsById,
       now,
+      model,
     );
     if (!credential) {
       return [];
@@ -383,9 +390,16 @@ function selectRequestChannel(
       channels.filter((channel) => channel.provider === provider).flatMap((channel) => channel.credentialIds)));
   }
   const excluded = new Set(input.excludeCredentialIds ?? []);
+  const quota = new Map<string, ReturnType<typeof claudeQuotaRouting>>();
   let candidates = channels.flatMap((channel) => {
     const credentials = availableCredentialsForChannel(channel, maps.get(channel.provider)!, now)
-      .filter((credential) => !excluded.has(credential.id) && antigravityServesModel(credential, model, now));
+      .filter((credential) => {
+        if (excluded.has(credential.id) || !antigravityServesModel(credential, model, now)) return false;
+        if (channel.provider !== "claude" || !channel.quotaWeighted) return true;
+        const state = quota.get(credential.id) ?? claudeQuotaRouting(credential.id, model, now);
+        quota.set(credential.id, state);
+        return !state.blocked;
+      });
     return credentials.length ? [{ channel, credentials }] : [];
   });
   if (!candidates.length) {
@@ -407,7 +421,8 @@ function selectRequestChannel(
     (candidate) => usageHealthScore(candidate.channel.usageHealth));
   const selectedCredential = (boundChannel && selected.credentials.find((credential) => credential.id === binding!.credentialId)) || selectRoutingItem(selected.credentials,
     (credential) => credential.priority, (credential) => credential.weight,
-    (credential) => usageHealthScore(credential.usageHealth));
+    (credential) => usageHealthScore(credential.usageHealth),
+    (credential) => selected.channel.quotaWeighted ? quota.get(credential.id)?.multiplier ?? 1 : 1);
   const credential = getCredentialWithTokens(selected.channel.provider, selectedCredential.id);
   if (!credential) throw new HttpError(503, "upstream_credential_not_found", "Selected channel credential was not found");
   const channel = { ...selected.channel, credentialId: credential.id };
@@ -549,6 +564,7 @@ type RoutingCandidate<T> = {
   priority: number;
   weight: number;
   healthScore: number;
+  quotaMultiplier: number;
 };
 
 function attachChannelUsageHealth(
@@ -587,8 +603,15 @@ function selectCredentialForChannel(
   channel: ChannelRecord,
   credentialsById: Map<string, CredentialRoutingRecord>,
   now: number,
+  model: string,
 ) {
-  const credentials = availableCredentialsForChannel(channel, credentialsById, now);
+  const quota = new Map<string, ReturnType<typeof claudeQuotaRouting>>();
+  const credentials = availableCredentialsForChannel(channel, credentialsById, now).filter((credential) => {
+    if (channel.provider !== "claude" || !channel.quotaWeighted) return true;
+    const state = claudeQuotaRouting(credential.id, model, now);
+    quota.set(credential.id, state);
+    return !state.blocked;
+  });
   if (credentials.length === 0) {
     return null;
   }
@@ -597,6 +620,7 @@ function selectCredentialForChannel(
     (credential) => credential.priority,
     (credential) => credential.weight,
     (credential) => usageHealthScore(credential.usageHealth),
+    (credential) => quota.get(credential.id)?.multiplier ?? 1,
   );
 }
 
@@ -681,12 +705,14 @@ function selectRoutingItem<T>(
   getPriority: (item: T) => number,
   getWeight: (item: T) => number,
   getHealthScore: (item: T) => number,
+  getQuotaMultiplier: (item: T) => number = () => 1,
 ) {
   const candidates = items.map((item) => ({
     item,
     priority: getPriority(item),
     weight: getWeight(item),
     healthScore: getHealthScore(item),
+    quotaMultiplier: getQuotaMultiplier(item),
   }));
   const healthTiers = [80, 50, 1];
   for (const tier of healthTiers) {
@@ -721,8 +747,8 @@ function weightedPickHighestPriority<T>(candidates: RoutingCandidate<T>[]) {
   return priorityCandidates[0];
 }
 
-function routingWeight(candidate: { weight: number; healthScore: number }) {
-  return Math.max(1, candidate.weight) * Math.max(1, candidate.healthScore);
+function routingWeight(candidate: { weight: number; healthScore: number; quotaMultiplier: number }) {
+  return Math.max(1, candidate.weight) * Math.max(1, candidate.healthScore) * candidate.quotaMultiplier;
 }
 
 function usageHealthScore(health: CodexAccountUsageHealth | undefined) {

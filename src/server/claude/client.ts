@@ -1,12 +1,14 @@
 import "server-only";
 
 import { withAccountQuotaHeaders } from "@/src/server/http/accountQuota";
+import { recordClaudeQuotaHeaders } from "@/src/server/services/claudeQuota";
 
 import crypto from "node:crypto";
 import { claudeBetas, claudeCacheTtlMs, isNativeClaudeCodeRequest } from "@/src/server/claude/wire";
 import { claudeChannelSession } from "@/src/server/services/channels";
 import { prepareClaudeOAuthUpstreamPayload } from "@/src/server/claude/compat";
 import { serverConfig } from "@/src/server/config/env";
+import { logServerError } from "@/src/server/http/errors";
 import { proxiedFetch } from "@/src/server/net/proxy";
 import {
   ensureFreshClaudeCredential,
@@ -125,6 +127,12 @@ export async function claudeFetch(
       },
       proxy,
     ));
+  try {
+    recordClaudeQuotaHeaders(credential.id, response.headers);
+  } catch (error) {
+    // A cache write failure must not discard an already successful upstream response.
+    logServerError(error, { operation: "claude.quota.record", metadata: { credentialId: credential.id } });
+  }
   return {
     response: withAccountQuotaHeaders(response, "claude", credential.id),
     credential,

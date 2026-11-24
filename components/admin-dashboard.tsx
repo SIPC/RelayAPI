@@ -264,6 +264,7 @@ type ChannelFormState = {
   baseUrl: string;
   priority: string;
   weight: string;
+  quotaWeighted: boolean;
   modelAllowlist: string;
 };
 
@@ -326,6 +327,7 @@ const EMPTY_CHANNEL_FORM: ChannelFormState = {
   baseUrl: "",
   priority: "100",
   weight: "1",
+  quotaWeighted: false,
   modelAllowlist: "",
 };
 
@@ -6064,8 +6066,14 @@ function ClaudeQuotaUsageCell({
     <div className="grid gap-2">
       <div className="flex items-center justify-between gap-2">
         <ClaudeQuotaStatusBadge quota={quota} />
-        <span className="text-xs text-muted-foreground">真实额度</span>
+        <span className="text-xs text-muted-foreground">
+          {quota.source === "oauth_usage" ? "OAuth 用量" : quota.source === "anthropic_headers" ? "响应头额度" : "暂无额度数据"}
+          {quota.cache_state !== "fresh" && " · 缓存待更新"}
+        </span>
       </div>
+      {quota.retrieved_at && (
+        <div className="text-xs text-muted-foreground">观测于 <LocalDateTime value={quota.retrieved_at} /></div>
+      )}
       {quota.cooldown_until && quota.status === "cooling_down" && (
         <div className="text-xs text-amber-600 dark:text-amber-300">
           冷却至 <LocalDateTime value={quota.cooldown_until} />
@@ -6141,7 +6149,7 @@ function ClaudeQuotaUsageCell({
         </div>
       )}
       {quota.windows.length > 0 && (
-        <div className="text-[11px] text-muted-foreground">{quota.message}</div>
+        <div className={quota.last_error ? "text-xs text-destructive" : "text-[11px] text-muted-foreground"}>{quota.message}</div>
       )}
     </div>
   );
@@ -7273,6 +7281,20 @@ function ChannelFields({
             <FieldDescription>同优先级下按权重选择。</FieldDescription>
           </Field>
         </FieldGroup>
+
+        {form.provider === "claude" && (
+          <Field orientation="horizontal">
+            <FieldContent>
+              <FieldLabel htmlFor="channel-quota-weighted">按剩余额度加权</FieldLabel>
+              <FieldDescription>
+                默认关闭。仅影响新分配；健康层和优先级不变，可用的已绑定会话仍留在原账号。
+                综合 5h、周及模型周额度；未知时不加权，15–60 分钟旧的数据逐渐减弱影响。
+              </FieldDescription>
+            </FieldContent>
+            <Switch id="channel-quota-weighted" checked={form.quotaWeighted}
+              onCheckedChange={(checked) => update("quotaWeighted", checked)} />
+          </Field>
+        )}
 
         <Field>
           <FieldLabel id="channel-capabilities-label">通道能力</FieldLabel>
@@ -8617,6 +8639,7 @@ function channelToForm(channel: ChannelRecord): ChannelFormState {
     baseUrl: channel.baseUrl,
     priority: channel.priority.toString(),
     weight: channel.weight.toString(),
+    quotaWeighted: channel.quotaWeighted,
     modelAllowlist: channel.modelAllowlist.join("\n"),
   };
 }
@@ -8633,6 +8656,7 @@ function channelFormToPayload(form: ChannelFormState): ChannelPayload {
     baseUrl: form.baseUrl.trim(),
     priority: integerValue(form.priority, 100),
     weight: Math.max(1, integerValue(form.weight, 1)),
+    quotaWeighted: form.provider === "claude" && form.quotaWeighted,
     modelAllowlist: parseList(form.modelAllowlist),
   };
 }

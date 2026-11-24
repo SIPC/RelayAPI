@@ -193,6 +193,7 @@ export type ChannelPayload = {
   enabled?: boolean;
   priority?: number;
   weight?: number;
+  quotaWeighted?: boolean;
   modelAllowlist?: string[];
   capabilities?: UpstreamOperation[];
   status?: ChannelRecord["status"];

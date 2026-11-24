@@ -442,14 +442,15 @@ export function getApiKeyDailyUsage(apiKeyId: string, day = new Date()) {
 
 export function latestCredentialUpstreamHeaders(
   credentialId: string,
-): Record<string, string> | null {
+): { headers: Record<string, string>; observedAt: number } | null {
   const id = credentialId.trim();
   if (!id) {
     return null;
   }
   const rows = getLogDb()
     .prepare(
-      `SELECT request_log_details.upstream_headers_json AS upstream_headers_json
+      `SELECT request_log_details.upstream_headers_json AS upstream_headers_json,
+              request_logs.started_at AS observed_at
        FROM request_logs INDEXED BY idx_request_logs_credential
        INNER JOIN request_log_details
          ON request_log_details.request_log_id = request_logs.id
@@ -464,7 +465,8 @@ export function latestCredentialUpstreamHeaders(
   for (const row of rows) {
     const headers = parseJsonObject(row.upstream_headers_json);
     if (headers && hasAnthropicUnifiedHeaders(headers)) {
-      return headers;
+      const observedAt = Date.parse(String(row.observed_at));
+      if (Number.isFinite(observedAt)) return { headers, observedAt };
     }
   }
   return null;

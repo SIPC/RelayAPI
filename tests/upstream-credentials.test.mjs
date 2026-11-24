@@ -160,7 +160,11 @@ test("010 upgrades legacy data after the reserved 009 marker, preserving associa
   for (const [table, rows] of Object.entries(legacySnapshot)) {
     const actual = db.prepare("SELECT * FROM " + table + " ORDER BY 1, 2").all().map((row) => {
       const copy = { ...row };
-      if (table === "channels") delete copy.capabilities_json;
+      if (table === "channels") {
+        assert.equal(copy.quota_weighted, 0);
+        delete copy.quota_weighted;
+        delete copy.capabilities_json;
+      }
       return copy;
     });
     assert.deepEqual(actual, rows, table);

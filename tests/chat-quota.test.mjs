@@ -43,12 +43,12 @@ after(() => {
 
 for (const { name, headers, expected } of [
   {
-    name: "5h takes priority even when 7d is exhausted",
+    name: "exhausted weekly quota is the bottleneck even with remaining 5h quota",
     headers: {
       "anthropic-ratelimit-unified-5h-utilization": "0.25",
       "anthropic-ratelimit-unified-7d-utilization": "1",
     },
-    expected: "high",
+    expected: "exhausted",
   },
   {
     name: "a rejected 5h window takes priority even without a percentage",
@@ -88,7 +88,7 @@ for (const { name, headers, expected } of [
       path: "/v1/messages", requestType: "messages", stream: false, statusCode: 200, latencyMs: 1,
     });
     appendRequestLogDetail(requestLogId, { upstreamHeaders: headers });
-    assert.equal((await getClaudeQuota(id)).status, expected);
+    assert.equal((await getClaudeQuota(id, { refreshIfStale: false })).status, expected);
   });
 }
 

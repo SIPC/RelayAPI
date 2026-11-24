@@ -550,6 +550,23 @@ function migrateMainDb(db: DatabaseSync) {
     ) STRICT;
     CREATE INDEX idx_session_bindings_expiry ON session_bindings(expires_at);
   `);
+
+  applyMigration(db, "016_claude_quota_routing", `
+    ALTER TABLE channels ADD COLUMN quota_weighted INTEGER NOT NULL DEFAULT 0
+      CHECK (quota_weighted IN (0, 1));
+    CREATE TABLE claude_quota_cache (
+      account_key TEXT PRIMARY KEY,
+      windows_json TEXT NOT NULL DEFAULT '[]',
+      extra_usage_enabled INTEGER,
+      last_usage_at INTEGER NOT NULL DEFAULT 0,
+      last_attempt_at INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at INTEGER NOT NULL DEFAULT 0,
+      failures INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      owner TEXT,
+      lease_until INTEGER NOT NULL DEFAULT 0
+    ) STRICT;
+  `);
 }
 
 function migrateLogDb(db: DatabaseSync) {

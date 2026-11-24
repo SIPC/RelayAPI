@@ -18,6 +18,7 @@ type ChannelRow = {
   enabled: number;
   priority: number;
   weight: number;
+  quota_weighted: number;
   model_allowlist_json: string;
   capabilities_json: string;
   status: string;
@@ -39,6 +40,7 @@ export interface SaveChannelInput {
   enabled: boolean;
   priority: number;
   weight: number;
+  quotaWeighted?: boolean;
   modelAllowlist: string[];
   capabilities?: UpstreamOperation[];
   status?: ChannelStatus;
@@ -92,8 +94,8 @@ export function insertChannel(input: SaveChannelInput) {
     .prepare(
       `INSERT INTO channels (
         id, name, provider, base_url, credential_id, enabled, priority,
-        weight, model_allowlist_json, capabilities_json, status, health_score, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 100, ?, ?)`,
+        weight, quota_weighted, model_allowlist_json, capabilities_json, status, health_score, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 100, ?, ?)`,
     )
     .run(
       input.id,
@@ -104,6 +106,7 @@ export function insertChannel(input: SaveChannelInput) {
       input.enabled ? 1 : 0,
       input.priority,
       input.weight,
+      input.quotaWeighted ? 1 : 0,
       jsonStringify(input.modelAllowlist),
       jsonStringify(input.capabilities ?? defaultChannelCapabilities(input.provider)),
       input.status || "healthy",
@@ -126,6 +129,7 @@ export function updateChannel(
       | "enabled"
       | "priority"
       | "weight"
+      | "quotaWeighted"
       | "modelAllowlist"
       | "capabilities"
       | "status"
@@ -157,7 +161,7 @@ export function updateChannel(
     .prepare(
       `UPDATE channels SET
         name = ?, base_url = ?, credential_id = ?, enabled = ?,
-        priority = ?, weight = ?, model_allowlist_json = ?, capabilities_json = ?, status = ?,
+        priority = ?, weight = ?, quota_weighted = ?, model_allowlist_json = ?, capabilities_json = ?, status = ?,
         health_score = ?, cooldown_until = ?, last_error = ?,
         last_used_at = ?, updated_at = ?
       WHERE id = ?`,
@@ -169,6 +173,7 @@ export function updateChannel(
       next.enabled ? 1 : 0,
       next.priority,
       next.weight,
+      next.quotaWeighted ? 1 : 0,
       jsonStringify(next.modelAllowlist),
       jsonStringify(next.capabilities),
       next.status,
@@ -291,6 +296,7 @@ function toChannelRecord(
     enabled: row.enabled === 1,
     priority: row.priority,
     weight: row.weight,
+    quotaWeighted: row.quota_weighted === 1,
     modelAllowlist: safeJsonParse<string[]>(row.model_allowlist_json, []),
     capabilities: safeJsonParse<UpstreamOperation[]>(
       row.capabilities_json,

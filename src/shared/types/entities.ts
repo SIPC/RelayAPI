@@ -279,6 +279,7 @@ export interface ChannelRecord {
   enabled: boolean;
   priority: number;
   weight: number;
+  quotaWeighted: boolean;
   modelAllowlist: string[];
   capabilities: UpstreamOperation[];
   status: ChannelStatus;
@@ -366,7 +367,9 @@ export interface ClaudeQuotaWindow {
 
 export interface ClaudeQuotaReport {
   provider: "claude";
-  source: "anthropic_headers";
+  source: "anthropic_headers" | "oauth_usage" | "unavailable";
+  cache_state: "fresh" | "stale" | "missing";
+  next_attempt_at: string | null;
   credential_id: string;
   account_id: string;
   email: string;
