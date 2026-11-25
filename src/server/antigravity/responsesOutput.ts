@@ -18,7 +18,7 @@ export class AntigravityResponsesOutput {
   private readonly model: string;
   private readonly emit?: Emit;
   private reason: string | null = null;
-  private reasoning = { text: "", signature: "" };
+  private reasoning: { item: Item; text: string; signature: string; index: number } | null = null;
   private text: { item: Item; value: string; index: number } | null = null;
   private reasoningTokens = 0;
 
@@ -46,6 +46,7 @@ export class AntigravityResponsesOutput {
     if (finishReason && finishReason !== "FINISH_REASON_UNSPECIFIED") this.reason = finishReason;
     const blocked = string(object(result.promptFeedback).blockReason);
     if (blocked && blocked !== "BLOCK_REASON_UNSPECIFIED" && !this.reason) this.reason = "SAFETY";
+    return this.reason !== null;
   }
 
   finish() {
@@ -102,14 +103,14 @@ export class AntigravityResponsesOutput {
     const text = string(part.text);
     if (part.thought === true) {
       this.closeText();
-      this.reasoning.text += text;
-      if (signature) this.reasoning.signature = signature;
+      this.appendReasoning(text, signature);
       return;
     }
     this.closeReasoning();
     if (signature) {
       this.closeText();
-      this.emitReasoning("", signature, false);
+      this.appendReasoning("", signature);
+      this.closeReasoning(false);
     }
     const inline = object(part.inlineData ?? part.inline_data);
     if (part.functionCall) {
@@ -157,20 +158,30 @@ export class AntigravityResponsesOutput {
     this.text = null;
   }
 
-  private closeReasoning() {
-    const { text, signature } = this.reasoning;
-    if (text || signature) this.emitReasoning(text, signature, true);
-    this.reasoning = { text: "", signature: "" };
+  private appendReasoning(text: string, signature: string) {
+    if (!text && !signature) return;
+    if (!this.reasoning) {
+      const item = { id: "rs_" + randomUUID(), type: "reasoning", summary: [] };
+      this.reasoning = { item, text: "", signature: "", index: this.add(item) };
+    }
+    const { item, index } = this.reasoning;
+    if (text) {
+      const coordinates = { item_id: item.id, output_index: index, summary_index: 0 };
+      if (!this.reasoning.text) this.emit?.("response.reasoning_summary_part.added", {
+        ...coordinates, part: { type: "summary_text", text: "" },
+      });
+      this.reasoning.text += text;
+      this.emit?.("response.reasoning_summary_text.delta", { ...coordinates, delta: text });
+    }
+    if (signature) this.reasoning.signature = signature;
   }
 
-  private emitReasoning(text: string, signature: string, thought: boolean) {
-    const item = { id: "rs_" + randomUUID(), type: "reasoning", summary: [] };
-    const index = this.add(item);
+  private closeReasoning(thought = true) {
+    if (!this.reasoning) return;
+    const { item, index, text, signature } = this.reasoning;
     const part = { type: "summary_text", text };
     if (text) {
       const coordinates = { item_id: item.id, output_index: index, summary_index: 0 };
-      this.emit?.("response.reasoning_summary_part.added", { ...coordinates, part: { ...part, text: "" } });
-      this.emit?.("response.reasoning_summary_text.delta", { ...coordinates, delta: text });
       this.emit?.("response.reasoning_summary_text.done", { ...coordinates, text });
       this.emit?.("response.reasoning_summary_part.done", { ...coordinates, part });
     }
@@ -179,6 +190,7 @@ export class AntigravityResponsesOutput {
       summary: text ? [part] : [],
       encrypted_content: signature ? ANTIGRAVITY_SIGNATURE_PREFIX + (thought ? "thought:" : "") + signature : undefined,
     });
+    this.reasoning = null;
   }
 
   private functionCall(call: Record<string, unknown>) {

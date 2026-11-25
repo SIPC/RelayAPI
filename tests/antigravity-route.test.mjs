@@ -428,6 +428,75 @@ test("Antigravity OAuth, CPA request shape, 429 failover and every relay protoco
   assert.deepEqual(remaining.find(channel => channel.id === catalogChannel.id).credentialIds, [credentialA.id]);
 });
 
+test("Antigravity forwards thinking before generation finishes and preserves signatures", async () => {
+  const admin = { cookie: WEB_SESSION_COOKIE + "=" + createWebSessionToken(), "content-type": "application/json" };
+  const credential = saveAntigravityCredential({ accountId: "live-thinking", email: "thinking@example.invalid", projectId: "fixture-project",
+    tokens: { access_token: "synthetic-token", refresh_token: "synthetic-refresh", expired: "2099-01-01T00:00:00Z", last_refresh: new Date().toISOString() } });
+  const channel = await (await createChannel(request("/channels", {
+    provider: "antigravity", credentialId: credential.id, modelAllowlist: [model],
+  }, admin))).json();
+  const key = createApiKey({ channelAllowlist: [channel.id] });
+  const headers = { authorization: "Bearer " + key.key, "content-type": "application/json" };
+  const encoder = new TextEncoder();
+  let upstream;
+  globalThis.fetch = async () => new Response(new ReadableStream({ start(controller) { upstream = controller; } }),
+    { headers: { "content-type": "text/event-stream" } });
+  const response = await postResponses(request("/v1/responses", { model, input: "Think", stream: true,
+    reasoning: { effort: "high" } }, headers));
+  const reader = response.body.getReader();
+  let received = "";
+  const send = frame => upstream.enqueue(encoder.encode("data: " + JSON.stringify(frame) + "\n\n"));
+  async function until(text) {
+    while (!received.includes(text)) {
+      const chunk = await reader.read();
+      assert.equal(chunk.done, false, "stream ended before " + text);
+      received += new TextDecoder().decode(chunk.value);
+    }
+  }
+  let timer;
+  try {
+    send(responseFrame([{ thought: true, text: "Considering " }], undefined, usage));
+    await Promise.race([
+      until("response.reasoning_summary_text.delta"),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Thinking was buffered until the next part or EOF")), 1000); }),
+    ]);
+    clearTimeout(timer);
+    assert.match(received, /Considering /);
+    assert.doesNotMatch(received, /response\.completed|reasoning_summary_text\.done/);
+    send(responseFrame([{ thought: true, text: "alternatives.", thoughtSignature: toolSignature }]));
+    await until("alternatives.");
+    send(responseFrame([{ text: "Answer" }], "STOP"));
+    // Usage may arrive after the finish reason; do not discard that tail.
+    send(responseFrame([], undefined, { ...usage, candidatesTokenCount: 7, totalTokenCount: 21 }));
+    upstream.close();
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      received += new TextDecoder().decode(chunk.value);
+    }
+    const events = received.split("\n").filter(line => line.startsWith("data: ")).map(line => JSON.parse(line.slice(6)));
+    assert.deepEqual(events.map(event => event.sequence_number), events.map((_, i) => i));
+    assert.deepEqual(events.filter(event => event.type === "response.reasoning_summary_text.delta").map(event => event.delta),
+      ["Considering ", "alternatives."]);
+    const completed = events.at(-1);
+    assert.equal(completed.type, "response.completed");
+    assert.deepEqual(completed.response.output[0].summary, [{ type: "summary_text", text: "Considering alternatives." }]);
+    assert.equal(completed.response.output[0].encrypted_content, "relay-antigravity:thought:" + toolSignature);
+    assert.equal(completed.response.output[1].content[0].text, "Answer");
+    assert.equal(completed.response.usage.output_tokens, 9);
+    const detail = getLogDb().prepare("SELECT stage_timings_json FROM request_log_details ORDER BY rowid DESC LIMIT 1").get();
+    const stages = JSON.parse(detail.stage_timings_json).map(stage => stage.name);
+    for (const name of ["antigravity_authorize", "antigravity_upstream_headers", "antigravity_status_200",
+      "stream_first_byte", "stream_first_token", "stream_first_thought", "stream_first_text",
+      "stream_upstream_finish", "stream_idle_before_end", "stream_end"]) {
+      assert.equal(stages.filter(stage => stage === name).length, 1, "missing or repeated diagnostic: " + name);
+    }
+  } finally {
+    clearTimeout(timer);
+    await reader.cancel();
+  }
+});
+
 test("Antigravity only offers and routes Gemini, including legacy allowlists and unknown catalogs", async () => {
   const admin = { cookie: WEB_SESSION_COOKIE + "=" + createWebSessionToken(), "content-type": "application/json" };
   const agy = saveAntigravityCredential({ accountId: "gemini-only", email: "gemini-only@example.invalid", projectId: "fixture-project",

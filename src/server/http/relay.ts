@@ -973,6 +973,7 @@ async function dispatchAntigravity(input: {
     payload: input.payload,
     stream: input.stream,
     includeThoughtsByDefault: input.includeThoughtsByDefault,
+    timing: input.timing,
     selected: input.selected,
     reselect(exclude) {
       try {

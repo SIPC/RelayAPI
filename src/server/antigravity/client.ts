@@ -15,6 +15,7 @@ import { antigravityResponsesPayload } from "@/src/server/antigravity/responsesR
 import { responsesSseDataPayload } from "@/src/server/codex/sse";
 import { serverConfig } from "@/src/server/config/env";
 import { HttpError } from "@/src/server/http/errors";
+import type { StageTimer } from "@/src/server/http/stageTimer";
 import {
   clearAntigravityModelCooldown,
   markAntigravityModelCooldown,
@@ -52,6 +53,7 @@ export async function sendAntigravity(input: {
   payload: Record<string, unknown>;
   stream: boolean;
   includeThoughtsByDefault?: boolean;
+  timing?: StageTimer;
   selected: SelectedChannel;
   reselect: (exclude: string[]) => SelectedChannel | null;
   onFailover?: (selected: SelectedChannel, error: HttpError) => void;
@@ -84,10 +86,13 @@ export async function sendAntigravity(input: {
 
     const attempt = async (): Promise<{ upstream: Response; credential: AntigravityCredentialWithTokens } | Failure> => {
       let credential: AntigravityCredentialWithTokens;
+      const authorization = input.timing?.start("antigravity_authorize", "刷新 Antigravity 授权");
       try {
         credential = await ensureFreshAntigravityCredential(selected.credential.id);
       } catch (cause) {
         return { error: responseError(cause) };
+      } finally {
+        authorization?.finish();
       }
       if (!tried.some(item => item.id === credential.id)) tried.push(credential);
       // Each account may publish a different tier ID for the requested standard name.
@@ -99,6 +104,7 @@ export async function sendAntigravity(input: {
       };
       const path = upstreamStream ? "/v1internal:streamGenerateContent?alt=sse" : "/v1internal:generateContent";
       let upstream: Response;
+      const headers = input.timing?.start("antigravity_upstream_headers", "等待 Antigravity 响应头");
       try {
         upstream = await fetch(ANTIGRAVITY_BASE_URL + path, {
           method: "POST",
@@ -115,7 +121,10 @@ export async function sendAntigravity(input: {
       } catch {
         throw signal.aborted ? abortError()
           : new HttpError(502, "antigravity_transport_error", "Could not connect to Antigravity");
+      } finally {
+        headers?.finish();
       }
+      input.timing?.mark("antigravity_status_" + upstream.status, "Antigravity HTTP " + upstream.status);
       if (upstream.ok) return { upstream, credential };
       const value = object(await upstream.json().catch(() => null));
       const error = antigravityResponseError(value.error ?? value, upstream.status);
@@ -129,7 +138,9 @@ export async function sendAntigravity(input: {
     for (let round = 0; round < MAX_FAILOVER_ATTEMPTS; round++) {
       let result = await attempt();
       if ("decision" in result && result.decision === "instant" && result.retryAfterMs !== undefined) {
+        const retry = input.timing?.start("antigravity_retry_wait", "等待 Antigravity 限流重试");
         await sleep(result.retryAfterMs, signal);
+        retry?.finish();
         result = await attempt();
       }
       if ("upstream" in result) return await respond(result.upstream, result.credential);
@@ -196,7 +207,7 @@ export async function sendAntigravity(input: {
     return {
       type: "stream",
       body: convertStream(upstream.body, {
-        model: input.model, payload: input.payload, redact, signal, abortError,
+        model: input.model, payload: input.payload, redact, signal, abortError, timing: input.timing,
         abort: () => stopped.abort(),
         onDone(usage, error) {
           if (error?.code === "antigravity_tos_violation") suspendAntigravityCredential(credential, error.message);
@@ -315,7 +326,7 @@ function consumeFrame(output: AntigravityResponsesOutput, frame: string) {
   }
   const event = object(parsed);
   if (!Object.keys(event).length) throw new HttpError(502, "invalid_antigravity_sse", "Antigravity returned malformed SSE");
-  output.observe(event);
+  return output.observe(event);
 }
 
 function convertStream(body: ReadableStream<Uint8Array>, input: {
@@ -325,6 +336,7 @@ function convertStream(body: ReadableStream<Uint8Array>, input: {
   signal: AbortSignal;
   abortError: () => HttpError;
   abort: () => void;
+  timing?: StageTimer;
   onDone: (usage: UsageSnapshot, error?: HttpError) => void;
 }) {
   const reader = body.getReader();
@@ -335,7 +347,19 @@ function convertStream(body: ReadableStream<Uint8Array>, input: {
   let controller: ReadableStreamDefaultController<Uint8Array>;
   let settled = false;
   let started = false;
+  let firstByte = false;
+  let finishSeen = false;
+  const outputStages = new Set<string>();
+  let idle = input.timing?.start("stream_idle_before_end", "流结束前上游静默时长");
   function emit(type: string, fields: Record<string, unknown>) {
+    const stage = type === "response.reasoning_summary_text.delta" ? "stream_first_thought"
+      : type === "response.output_text.delta" ? "stream_first_text"
+        : type === "response.function_call_arguments.delta" || type === "response.custom_tool_call_input.delta" ? "stream_first_tool" : null;
+    if (stage && !outputStages.has(stage)) {
+      if (!outputStages.size) input.timing?.mark("stream_first_token", "收到首字输出");
+      outputStages.add(stage);
+      input.timing?.mark(stage, "Antigravity " + stage);
+    }
     const event = input.redact({ type, sequence_number: sequence++, ...fields });
     controller.enqueue(encoder.encode("event: " + type + "\ndata: " + JSON.stringify(event) + "\n\n"));
   }
@@ -345,6 +369,8 @@ function convertStream(body: ReadableStream<Uint8Array>, input: {
     if (settled) return;
     settled = true;
     input.signal.removeEventListener("abort", onAbort);
+    idle?.finish();
+    input.timing?.mark(error ? "stream_error" : "stream_end", error ? "Antigravity 流异常结束" : "Antigravity 流正常结束");
     input.onDone(output.usage, error);
   }
 
@@ -361,11 +387,18 @@ function convertStream(body: ReadableStream<Uint8Array>, input: {
     fail(input.abortError());
   }
 
+  function consume(frame: string) {
+    if (consumeFrame(output, frame) && !finishSeen) {
+      finishSeen = true;
+      input.timing?.mark("stream_upstream_finish", "收到 Antigravity 生成结束标记");
+    }
+  }
+
   function push(text: string) {
     pending += text;
     const frames = pending.split(/(?:\r\n|\r(?!\n)|\n){2}/);
     pending = frames.pop() ?? "";
-    for (const frame of frames) consumeFrame(output, frame);
+    for (const frame of frames) consume(frame);
     if (pending.length > 4 * 1024 * 1024) {
       throw new HttpError(502, "invalid_antigravity_sse", "Antigravity SSE frame exceeds the response limit");
     }
@@ -389,11 +422,17 @@ function convertStream(body: ReadableStream<Uint8Array>, input: {
           const { done, value } = await reader.read();
           if (settled) return;
           if (!done) {
+            if (!firstByte) {
+              firstByte = true;
+              input.timing?.mark("stream_first_byte", "收到上游首字节");
+            }
+            // Keep only the final gap, rather than one timing entry for every chunk.
+            idle = input.timing?.start("stream_idle_before_end", "流结束前上游静默时长");
             push(decoder.decode(value, { stream: true }));
             continue;
           }
           push(decoder.decode());
-          consumeFrame(output, pending);
+          consume(pending);
           output.finish();
           settle();
           controller.close();
