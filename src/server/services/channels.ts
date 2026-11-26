@@ -357,8 +357,9 @@ function selectRequestChannel(
   const antigravityModel = antigravityModelName(model);
   const oauthProvider = isAntigravityModelId(antigravityModel) ? "antigravity" : isClaudeModel(model) ? "claude" : "codex";
   const oauthModelCandidates = modelAllowlistCandidates(oauthProvider, model);
-  if (input.apiKey.modelAllowlist.length > 0 && model &&
-    !modelMatchesAllowlist(oauthModelCandidates, input.apiKey.modelAllowlist)) {
+  const keyAllowsOAuth = input.apiKey.modelAllowlist.length === 0 || !model ||
+    modelMatchesAllowlist(oauthModelCandidates, input.apiKey.modelAllowlist);
+  if (!keyAllowsOAuth && !apiKeyAllowsApiModel(input.apiKey.modelAllowlist, model)) {
     throw new HttpError(403, "model_not_allowed", `API key is not allowed to use model: ${model}`);
   }
   const now = Date.now();
@@ -368,9 +369,10 @@ function selectRequestChannel(
     if (input.provider && channel.provider !== input.provider) return false;
     const api = isApiProvider(channel.provider);
     if (api) {
-      if (!input.apiKey.channelAllowlist.includes(channel.id) ||
-        channel.modelAllowlist.length === 0 || !channel.modelAllowlist.includes(model)) return false;
-      if (input.apiKey.modelAllowlist.length > 0 && !input.apiKey.modelAllowlist.includes(model)) return false;
+      if (!input.apiKey.channelAllowlist.includes(channel.id) || !apiChannelModel(channel, model)) return false;
+      if (!apiKeyAllowsApiModel(input.apiKey.modelAllowlist, model)) return false;
+    } else if (!keyAllowsOAuth) {
+      return false;
     } else if (channel.provider === "antigravity") {
       // An empty allowlist means every model in the bound accounts' catalogs, like empty OAuth allowlists.
       // Allowlists match by standard name, so "gemini-4-argon" and "gemini-4-argon-high" are one model.
@@ -382,7 +384,7 @@ function selectRequestChannel(
         (channel.provider !== "codex" || !isCodexImageModel(model))) return false;
     }
     return isChannelAvailable(channel, input.apiKey, model,
-      api ? [model] : oauthModelCandidates, now);
+      api ? [apiChannelModel(channel, model)!] : oauthModelCandidates, now);
   });
   const maps = new Map<ChannelProvider, Map<string, CredentialRoutingRecord>>();
   for (const provider of new Set(channels.map((channel) => channel.provider))) {
@@ -791,6 +793,33 @@ function modelAllowlistCandidates(provider: ChannelProvider, model: string) {
   const unprefixed = cleanString(model).replace(/^openai\//i, "");
   const baseModel = stripCodexModelThinkingSuffix(unprefixed);
   return [...new Set([model, unprefixed, baseModel].map(cleanString).filter(Boolean))];
+}
+
+// API channels accept the vendor prefixes other channels accept: openai/gpt-5.4 and gpt-5.4 are one model, but
+// two different vendors are not. Other namespaces such as meta-llama/ stay part of the name.
+function splitModelVendor(model: string) {
+  const value = cleanString(model);
+  const match = /^(openai|anthropic|google)\/(.+)$/i.exec(value);
+  return match ? { vendor: match[1].toLowerCase(), name: match[2] } : { vendor: "", name: value };
+}
+
+function sameStandardModel(a: string, b: string) {
+  const left = splitModelVendor(a);
+  const right = splitModelVendor(b);
+  return left.name === right.name && (!left.vendor || !right.vendor || left.vendor === right.vendor);
+}
+
+// The allowlisted name an API channel serves for a requested model, sent upstream in place of the requested
+// name: the exact entry first, so prefixed entries such as OpenRouter's openai/gpt-5.4 are kept as configured.
+export function apiChannelModel(channel: Pick<ChannelRecord, "modelAllowlist">, model: string) {
+  const value = cleanString(model);
+  if (!value) return undefined;
+  return channel.modelAllowlist.find((allowed) => cleanString(allowed) === value) ??
+    channel.modelAllowlist.find((allowed) => sameStandardModel(allowed, value));
+}
+
+export function apiKeyAllowsApiModel(modelAllowlist: string[], model: string) {
+  return modelAllowlist.length === 0 || modelAllowlist.some((allowed) => sameStandardModel(allowed, model));
 }
 
 function modelMatchesAllowlist(candidates: string[], allowlist: string[]) {

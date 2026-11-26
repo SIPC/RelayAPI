@@ -889,6 +889,70 @@ for (const provider of ["openai", "anthropic"]) {
   });
 }
 
+test("API channels accept vendor prefixes and send the channel's own model name upstream", { timeout: 15000 }, async () => {
+  const id = randomUUID().slice(0, 8);
+  async function upstreamModel(fixture, operation, model, form = false) {
+    calls.length = 0;
+    let payload = payloadFor(operation, model);
+    if (form) {
+      payload = new FormData();
+      payload.append("model", model);
+      payload.append("prompt", "Draw a synthetic cat");
+      payload.append("image[]", new Blob(["a"], { type: "image/png" }), "a.png");
+      payload.append("image[]", new Blob(["b"], { type: "image/png" }), "b.png");
+    }
+    const response = await run(fixture, operation, payload);
+    assert.equal(response.status, 200, operation + " " + model);
+    await response.arrayBuffer();
+    assert.equal(calls.length, 1);
+    if (form) assert.equal(calls[0].form.getAll("image[]").length, 2, "Multipart files survive the model rewrite");
+    return calls[0].payload?.model ?? calls[0].form.get("model");
+  }
+  async function status(fixture, operation, model) {
+    calls.length = 0;
+    const response = await run(fixture, operation, payloadFor(operation, model));
+    await response.arrayBuffer();
+    assert.equal(calls.length, 0, model + " must not reach the upstream");
+    return response.status;
+  }
+
+  // A plain upstream receives the bare name, whatever prefix the client sends; key and channel lists stay bare.
+  const plain = setup("openai", { model: "gpt-plain-" + id });
+  for (const operation of ["chat", "responses", "images_generations"]) {
+    assert.equal(await upstreamModel(plain, operation, "openai/" + plain.model), plain.model);
+    assert.equal(await upstreamModel(plain, operation, "OpenAI/" + plain.model), plain.model);
+    assert.equal(await upstreamModel(plain, operation, plain.model), plain.model);
+  }
+  assert.equal(await upstreamModel(plain, "images_edits", "openai/" + plain.model, true), plain.model);
+  assert.equal(lastLog(plain.channel).model, "openai/" + plain.model, "Logs keep the requested name");
+  const claude = setup("anthropic", { model: "claude-plain-" + id });
+  for (const operation of ["messages", "count_tokens", "chat"]) {
+    assert.equal(await upstreamModel(claude, operation, "anthropic/" + claude.model), claude.model);
+  }
+
+  // An OpenRouter-style channel lists prefixed names and must keep receiving them, even for bare requests.
+  const routed = setup("openai", { model: "openai/gpt-routed-" + id, key: { modelAllowlist: [] } });
+  assert.equal(await upstreamModel(routed, "chat", routed.model), routed.model);
+  assert.equal(await upstreamModel(routed, "chat", "gpt-routed-" + id), routed.model);
+  const both = setup("openai", { model: "gpt-both-" + id, channel: { modelAllowlist: ["gpt-both-" + id, "openai/gpt-both-" + id] },
+    key: { modelAllowlist: [] } });
+  assert.equal(await upstreamModel(both, "chat", "openai/gpt-both-" + id), "openai/gpt-both-" + id, "An exact entry wins");
+  assert.equal(await upstreamModel(both, "chat", "gpt-both-" + id), "gpt-both-" + id);
+
+  // Only known vendor prefixes are equivalent, and only to the bare name or the same vendor.
+  const llama = setup("openai", { model: "meta-llama/llama-" + id, key: { modelAllowlist: [] } });
+  assert.equal(await status(llama, "chat", "llama-" + id), 503, "Other namespaces are part of the model name");
+  assert.equal(await status(routed, "chat", "anthropic/gpt-routed-" + id), 503, "A different vendor is a different model");
+  assert.equal(await status(plain, "chat", "openai/" + plain.model + "(high)"), 503, "Prefixes do not enable OAuth suffixes");
+
+  // The key allowlist still restricts the model, in either spelling.
+  const restricted = setup("openai", { model: "gpt-allowed-" + id,
+    channel: { modelAllowlist: ["gpt-allowed-" + id, "gpt-denied-" + id] }, key: { modelAllowlist: ["openai/gpt-allowed-" + id] } });
+  assert.equal(await upstreamModel(restricted, "chat", "gpt-allowed-" + id), "gpt-allowed-" + id);
+  assert.equal(await status(restricted, "chat", "openai/gpt-denied-" + id), 403);
+  assert.equal(await status(restricted, "chat", "gpt-denied-" + id), 403);
+});
+
 for (const [provider, operation, capabilities] of [
   ["openai", "chat", ["responses"]], ["openai", "responses", ["chat"]],
   ["openai", "images_generations", ["chat"]], ["openai", "images_edits", ["images_generations"]],
@@ -932,6 +996,8 @@ test("/models exposes only explicitly authorized API channel models, filters key
   assert.deepEqual(await models([openai.channel.id, disabled.channel.id]), [...openaiModels].sort());
   assert.deepEqual(await models([disabled.channel.id]), []);
   assert.deepEqual(await models([openai.channel.id], ["gpt-5.4(high)"]), [], "API model filtering is exact, unlike OAuth suffix matching");
+  assert.deepEqual(await models([openai.channel.id], ["openai/gpt-5.4"]), ["gpt-5.4"],
+    "A vendor-prefixed key entry lists the channel's bare model");
   const unbound = await models([]);
   for (const id of ["custom-image-catalog-model", "literal-api-model(high)", "anthropic-private-catalog-model", "disabled-api-catalog-model"]) {
     assert.ok(!unbound.includes(id), "An unbound RelayKey must not discover paid model " + id);

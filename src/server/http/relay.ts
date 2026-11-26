@@ -72,6 +72,8 @@ import {
   selectChannel,
   selectChannelForRequest,
   listChannelRecords,
+  apiChannelModel,
+  apiKeyAllowsApiModel,
 } from "@/src/server/services/channels";
 import { listPublicCodexCredentials } from "@/src/server/services/codexCredentials";
 import { listAntigravityCredentials } from "@/src/server/repositories/antigravityCredentials";
@@ -141,7 +143,9 @@ export async function handleModels(request: Request) {
       for (const model of channelModels) {
         // Ignore non-Gemini entries left in channels configured before AGY became Gemini-only.
         if (isAntigravity && !isAntigravityModelId(model)) continue;
-        if (seen.has(model) || (apiKey.modelAllowlist.length > 0 && !apiKey.modelAllowlist.includes(model))) continue;
+        if (seen.has(model) || (isAntigravity
+          ? apiKey.modelAllowlist.length > 0 && !apiKey.modelAllowlist.includes(model)
+          : !apiKeyAllowsApiModel(apiKey.modelAllowlist, model))) continue;
         seen.add(model);
         payload.data.push({ id: model, object: "model", owned_by: channel.provider });
       }
@@ -1056,11 +1060,24 @@ async function forwardSelectedApiRequest(input: {
       timing: input.timing,
     });
   };
+  // Send the name the channel lists, so openai/gpt-5.4 reaches a gpt-5.4 upstream and the reverse.
+  const requested = stringValue(input.payload instanceof FormData ? input.payload.get("model") : input.payload.model);
+  const upstreamModel = apiChannelModel(channel, requested) ?? requested;
+  let payload = input.payload;
+  if (upstreamModel !== requested) {
+    if (payload instanceof FormData) {
+      payload = new FormData();
+      for (const [name, value] of input.payload as FormData) payload.append(name, value);
+      payload.set("model", upstreamModel);
+    } else {
+      payload = { ...payload, model: upstreamModel };
+    }
+  }
   let response: Response;
   try {
     response = await forwardApiKeyRequest({
       request: input.request, channel, credential,
-      operation: input.operation, payload: input.payload, timing: input.timing,
+      operation: input.operation, payload, timing: input.timing,
       captureBody: getFullRequestLoggingSetting(), onResult: report,
     });
   } catch (error) {

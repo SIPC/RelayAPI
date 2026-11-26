@@ -82,6 +82,7 @@ X-Relay-Quota-7d-Remaining-Percent: 60
 - OpenAI 同协议请求保留原始 JSON 参数和扩展字段，不经过 Codex Responses 转换；图片编辑 multipart 保留文件、多图、重复字段及遮罩，不转为 Codex data URL JSON。
 - Anthropic 原生 Messages 保留调用方 system、metadata、工具名及缓存设置，使用 `x-api-key` 和 `anthropic-version`；可显式传入 `anthropic-beta`，不自动添加 OAuth beta。token count 不强制添加 `max_tokens`，不按流式请求发送；返回的估算 Token 数保留在响应中，不计入本地每日 Token 消耗。
 - Chat / Responses 转 Anthropic 复用现有协议转换器，但不进行 Claude Code 工具改名或 OAuth 身份注入。转换能力仍以现有转换器和上游模型为准。
+- API 渠道的模型名兼容 `openai/`、`anthropic/`、`google/` 前缀：`openai/gpt-5.4` 与 `gpt-5.4` 视为同一模型（不同厂商前缀不互通），发给上游的是渠道白名单里配置的写法，因此 OpenRouter 等以 `openai/gpt-5.4` 配置的渠道仍收到带前缀的名称；其他命名空间（如 `meta-llama/`）按原样精确匹配。
 - API 渠道必须配置非空模型白名单。不会自动附加 OAuth 思考后缀、映射到旧模型，或认为 Codex 目录中的 `gpt-image-2.6-*` 必然可被官方 API Key 调用。`GET /v1/models` 会补入客户端显式授权且启用的 API 渠道模型；仅绑定 API 渠道的客户端不会继承 OAuth 订阅模型目录。
 - 请求先选渠道，再按协议转发。上游 401、429 或其他失败不会自动尝试其他凭据，也不会回退到 OAuth；混合渠道的首次选择仍由显式授权、能力、模型、优先级和权重决定。
 - usage 从实际 JSON / SSE 结果提取并写入本地统计，返回的请求/Token 限流头不代表账户余额。API Key 不自动进行生成探测；连接测试、真实可用性及费用应由账号持有人确认。
