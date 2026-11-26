@@ -3,6 +3,7 @@ import "server-only";
 import { randomUUID } from "node:crypto";
 import { serverConfig } from "@/src/server/config/env";
 import { HttpError, logServerError } from "@/src/server/http/errors";
+import { liveAccountQuotaSnapshot } from "@/src/server/http/accountQuota";
 import { proxiedFetch } from "@/src/server/net/proxy";
 import { getCodexCredentialById } from "@/src/server/repositories/codexCredentials";
 import {
@@ -12,13 +13,16 @@ import {
   upsertCodexQuotaCache,
 } from "@/src/server/repositories/quota";
 import { ensureFreshCredential } from "@/src/server/services/codexCredentials";
+import { evaluateQuotaFloor, type QuotaFloorWindow } from "@/src/server/services/quotaFloor";
 import {
+  getCredentialQuotaFloorPercent,
   getEffectiveCodexUserAgent,
   getGlobalProxySetting,
 } from "@/src/server/services/settings";
 import type {
   CodexCredentialRecord,
   CodexCredentialWithTokens,
+  CredentialQuotaFloorState,
 } from "@/src/shared/types/entities";
 
 export const WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
@@ -26,6 +30,9 @@ export const WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const WINDOW_5H_SECONDS = 5 * 60 * 60;
 const WINDOW_7D_SECONDS = 7 * 24 * 60 * 60;
 export const CODEX_QUOTA_FRESH_MS = 2 * 60 * 1000;
+// A credential skipped at the floor gets no traffic and so no response headers;
+// routing re-reads WHAM at most this often so recovery is noticed.
+const FLOOR_RECHECK_MS = 15 * 60 * 1000;
 const QUOTA_TIMEOUT_MS = Math.min(serverConfig.requestTimeoutMs, 8_000);
 const refreshes = new Map<string, Promise<PublicCodexQuotaReport>>();
 
@@ -68,6 +75,7 @@ interface CodexQuotaReport {
 interface PublicCodexQuotaReport extends CodexQuotaReport {
   cached: boolean;
   cache_state: CacheState;
+  quota_floor: CredentialQuotaFloorState;
 }
 
 interface MissingCodexQuotaReport {
@@ -83,6 +91,7 @@ interface MissingCodexQuotaReport {
   cached: false;
   cache_state: "missing";
   message: string;
+  quota_floor: CredentialQuotaFloorState;
 }
 
 export async function getCodexQuota({
@@ -226,6 +235,44 @@ async function refreshCodexQuota(credentialId: string, includeRaw: boolean): Pro
   }
 }
 
+// The 5h and weekly windows from the WHAM cache and the newest response headers,
+// whichever was observed later. Additional (feature) limits are not mapped to models.
+export function codexQuotaFloorState(
+  credentialId: string,
+  { now = Date.now(), floor = getCredentialQuotaFloorPercent(), recheck = false } = {},
+) {
+  const windows = new Map<string, QuotaFloorWindow>();
+  const add = (id: string, window: QuotaFloorWindow) => {
+    const previous = windows.get(id);
+    if (!previous || !(previous.observedAt > window.observedAt)) windows.set(id, window);
+  };
+  const cached = getCodexQuotaCacheByCredentialId(credentialId);
+  const retrievedAt = cached ? Date.parse(cached.retrievedAt) : NaN;
+  for (const raw of Array.isArray(cached?.cache.windows) ? cached.cache.windows : []) {
+    const window = objectFrom(raw);
+    const id = window?.id === "code-5h" ? "5h" : window?.id === "code-7d" ? "7d" : null;
+    if (!window || !id) continue;
+    add(id, {
+      remainingPercent: typeof window.remaining_percent === "number" ? window.remaining_percent : null,
+      observedAt: retrievedAt, resetAt: typeof window.reset_at === "string" ? window.reset_at : null, scope: null,
+    });
+  }
+  const live = liveAccountQuotaSnapshot("codex", credentialId);
+  for (const window of live?.windows ?? []) {
+    if (window.id !== "5h" && window.id !== "7d") continue;
+    add(window.id, { remainingPercent: window.remainingPercent ?? null, observedAt: live!.observedAt,
+      resetAt: window.resetAt ?? null, scope: null });
+  }
+  const state = evaluateQuotaFloor([...windows.values()], floor, now, null);
+  if (recheck && state.skipped && !(now - retrievedAt < FLOOR_RECHECK_MS)) {
+    // Selection may hold the session SQLite write lock. Start IO only after it returns.
+    queueMicrotask(() => {
+      void getCodexQuota({ credentialId, refreshIfStale: true }).catch(() => {});
+    });
+  }
+  return state;
+}
+
 function retryAfterMs(value: string | null) {
   if (!value) return 0;
   const seconds = Number(value);
@@ -241,6 +288,7 @@ function markQuotaCacheState(
     ...cleanReport,
     cached: state === "cached",
     cache_state: state,
+    quota_floor: codexQuotaFloorState(cleanReport.credential_id),
   };
 }
 
@@ -260,6 +308,7 @@ function missingQuotaResponse(
     cached: false,
     cache_state: "missing",
     message: "Quota has not been refreshed for this credential yet.",
+    quota_floor: codexQuotaFloorState(credential.id),
   };
 }
 

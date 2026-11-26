@@ -16,6 +16,8 @@ import {
   parseClaudeRateLimitWindows, resolveClaudeCredentialProxy,
 } from "@/src/server/services/claudeCredentials";
 import { stripClaudeModelSuffixes } from "@/src/server/claude/modelSuffix";
+import { getCredentialQuotaFloorPercent } from "@/src/server/services/settings";
+import { evaluateQuotaFloor } from "@/src/server/services/quotaFloor";
 import type { ClaudeCredentialRecord, ClaudeQuotaReport } from "@/src/shared/types/entities";
 
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
@@ -77,6 +79,7 @@ export async function getClaudeQuota(
     windows, local_windows: credentialUsageWindows(credential.id, new Date(now)),
     retrieved_at: observedAt ? new Date(observedAt).toISOString() : "",
     cooldown_until: credential.cooldownUntil, last_error: cache.lastError,
+    quota_floor: claudeQuotaFloorState(credential.id, null, now),
     message: cache.lastError || (state === "fresh" ? "OAuth 只读用量 / 正常推理响应头；未发送额度探测推理。"
       : "额度数据不完整或已过期；保留最后有效观测，后台按退避周期补查。"),
   };
@@ -199,13 +202,32 @@ export function claudeQuotaRouting(credentialId: string, model: string, now = Da
   return { multiplier: 1 + confidence * (0.25 + 1.5 * q - 1), blocked };
 }
 
+// model null reports the account for the dashboard; with a model, routing applies
+// the shared 5h/7d windows plus the weekly window of that model family.
+export function claudeQuotaFloorState(
+  credentialId: string, model: string | null, now = Date.now(), floor = getCredentialQuotaFloorPercent(),
+) {
+  const key = claudeQuotaAccountKey(credentialId);
+  const windows = key ? getClaudeQuotaCache(key).windows.filter((window) => window.id.startsWith("unified-")) : [];
+  const canonical = model === null ? null : stripClaudeModelSuffixes(model).toLowerCase();
+  return evaluateQuotaFloor(windows.map((window) => ({
+    // An upstream "rejected" status is exhausted even when no percentage came with it.
+    remainingPercent: window.rejected ? 0 : window.remaining_percent, observedAt: window.observedAt,
+    resetAt: window.reset_at, scope: window.scope,
+  })), floor, now, canonical === null ? null : (scope) => canonical.includes(`claude-${scope}`));
+}
+
 export async function refreshDueClaudeQuotas() {
   const now = Date.now();
   const accounts = new Map<string, { credential: ClaudeCredentialRecord; active: boolean }>();
   for (const credential of listClaudeCredentials()) {
     if (!credential.enabled) continue;
     const key = claudeQuotaAccountKey(credential.id)!;
-    const active = now - Date.parse(credential.lastUsedAt || "") < MAX_AGE_MS;
+    // A credential skipped at the quota floor receives no traffic, so no headers;
+    // poll it like an active one so recovery is noticed before its data expires.
+    const floor = claudeQuotaFloorState(credential.id, null, now);
+    const active = now - Date.parse(credential.lastUsedAt || "") < MAX_AGE_MS ||
+      floor.skipped || floor.skipped_scopes.length > 0;
     const previous = accounts.get(key);
     if (!previous || active) accounts.set(key, { credential, active: active || !!previous?.active });
   }

@@ -10,6 +10,7 @@ import type {
   CreatedApiKey,
   PublicApiKey,
   CodexCredentialRecord,
+  CredentialQuotaFloorState,
   CredentialProxyType,
   GlobalSettingsRecord,
   JsonValue,
@@ -240,6 +241,7 @@ export type CodexQuotaReport = {
   cache_state: "cached" | "fresh" | "missing";
   message?: string;
   raw?: unknown;
+  quota_floor?: CredentialQuotaFloorState;
 };
 
 export type PruneRequestLogsResponse = {
@@ -667,6 +669,7 @@ export function updateGlobalSettings(payload: {
   codexAutoDisableRefreshExhausted?: boolean;
   requestLogRetentionDays?: number;
   requestLogDetailRetentionDays?: number;
+  credentialQuotaFloorPercent?: number;
 }) {
   return adminRequest<GlobalSettingsRecord>("/api/admin/settings", {
     method: "PATCH",

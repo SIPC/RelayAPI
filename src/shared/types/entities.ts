@@ -264,6 +264,7 @@ export interface GlobalSettingsRecord {
   userAgentSource: "database" | "environment" | "default";
   fullRequestLoggingEnabled: boolean;
   codexAutoDisableRefreshExhausted: boolean;
+  credentialQuotaFloorPercent: number;
   requestLogRetentionDays: number | null;
   requestLogDetailRetentionDays: number | null;
   updatedAt: string | null;
@@ -380,6 +381,16 @@ export interface ClaudeQuotaReport {
   cooldown_until: string | null;
   last_error: string | null;
   message: string;
+  quota_floor: CredentialQuotaFloorState;
+}
+
+// Routing skips a credential whose fresh remaining quota is at or below the floor.
+// skipped_scopes lists model families (e.g. "opus") skipped only for matching models.
+export interface CredentialQuotaFloorState {
+  percent: number;
+  lowest_remaining_percent: number | null;
+  skipped: boolean;
+  skipped_scopes: string[];
 }
 
 // Antigravity quota mirrors retrieveUserQuotaSummary: groups of models sharing weekly and 5-hour buckets.

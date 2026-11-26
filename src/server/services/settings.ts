@@ -24,9 +24,12 @@ const CODEX_AUTO_DISABLE_REFRESH_EXHAUSTED_SETTING_KEY =
 const REQUEST_LOG_RETENTION_DAYS_SETTING_KEY = "request_log_retention_days";
 const REQUEST_LOG_DETAIL_RETENTION_DAYS_SETTING_KEY =
   "request_log_detail_retention_days";
+const CREDENTIAL_QUOTA_FLOOR_SETTING_KEY = "credential_quota_floor_percent";
 
 const DEFAULT_REQUEST_LOG_RETENTION_DAYS = 90;
 const DEFAULT_REQUEST_LOG_DETAIL_RETENTION_DAYS = 14;
+const DEFAULT_CREDENTIAL_QUOTA_FLOOR_PERCENT = 5;
+const MAX_CREDENTIAL_QUOTA_FLOOR_PERCENT = 50;
 const MIN_RETENTION_DAYS = 1;
 const MAX_RETENTION_DAYS = 3650;
 const MAX_USER_AGENT_LENGTH = 2048;
@@ -55,6 +58,7 @@ export function getPublicGlobalSettings(): GlobalSettingsRecord {
   const codexAutoDisableRefreshExhausted =
     getCodexAutoDisableRefreshExhaustedSetting();
   const retentionSettings = getRequestLogRetentionSettings();
+  const credentialQuotaFloorPercent = getCredentialQuotaFloorPercent();
   const updatedAt = latestUpdatedAt(
     getSettingUpdatedAt(GLOBAL_PROXY_SETTING_KEY),
     getSettingUpdatedAt(CODEX_USER_AGENT_SETTING_KEY),
@@ -62,6 +66,7 @@ export function getPublicGlobalSettings(): GlobalSettingsRecord {
     getSettingUpdatedAt(CODEX_AUTO_DISABLE_REFRESH_EXHAUSTED_SETTING_KEY),
     getSettingUpdatedAt(REQUEST_LOG_RETENTION_DAYS_SETTING_KEY),
     getSettingUpdatedAt(REQUEST_LOG_DETAIL_RETENTION_DAYS_SETTING_KEY),
+    getSettingUpdatedAt(CREDENTIAL_QUOTA_FLOOR_SETTING_KEY),
   );
   if (stored) {
     return {
@@ -73,6 +78,7 @@ export function getPublicGlobalSettings(): GlobalSettingsRecord {
         : serverConfig.userAgentSource,
       fullRequestLoggingEnabled,
       codexAutoDisableRefreshExhausted,
+      credentialQuotaFloorPercent,
       ...retentionSettings,
       updatedAt,
     };
@@ -87,6 +93,7 @@ export function getPublicGlobalSettings(): GlobalSettingsRecord {
         : serverConfig.userAgentSource,
       fullRequestLoggingEnabled,
       codexAutoDisableRefreshExhausted,
+      credentialQuotaFloorPercent,
       ...retentionSettings,
       updatedAt,
     };
@@ -100,6 +107,7 @@ export function getPublicGlobalSettings(): GlobalSettingsRecord {
       : serverConfig.userAgentSource,
     fullRequestLoggingEnabled,
     codexAutoDisableRefreshExhausted,
+    credentialQuotaFloorPercent,
     ...retentionSettings,
     updatedAt,
   };
@@ -112,6 +120,7 @@ export function patchGlobalSettings(input: {
   codexAutoDisableRefreshExhausted?: unknown;
   requestLogRetentionDays?: unknown;
   requestLogDetailRetentionDays?: unknown;
+  credentialQuotaFloorPercent?: unknown;
 }) {
   if (Object.hasOwn(input, "proxy")) {
     const proxy = normalizeProxyInput(input.proxy, readStoredGlobalProxy());
@@ -153,6 +162,12 @@ export function patchGlobalSettings(input: {
       String(normalizeRetentionDays(input.requestLogDetailRetentionDays)),
     );
   }
+  if (Object.hasOwn(input, "credentialQuotaFloorPercent")) {
+    upsertSettingValue(
+      CREDENTIAL_QUOTA_FLOOR_SETTING_KEY,
+      String(normalizeQuotaFloorPercent(input.credentialQuotaFloorPercent)),
+    );
+  }
   return getPublicGlobalSettings();
 }
 
@@ -164,6 +179,30 @@ export function getCodexAutoDisableRefreshExhaustedSetting() {
   return (
     getSettingValue(CODEX_AUTO_DISABLE_REFRESH_EXHAUSTED_SETTING_KEY) === "1"
   );
+}
+
+// One floor for every OAuth credential: an account can sit in several channels,
+// and a per-channel floor would let another channel keep draining it. 0 disables.
+export function getCredentialQuotaFloorPercent() {
+  const value = getSettingValue(CREDENTIAL_QUOTA_FLOOR_SETTING_KEY);
+  if (value === undefined) return DEFAULT_CREDENTIAL_QUOTA_FLOOR_PERCENT;
+  try {
+    return normalizeQuotaFloorPercent(value);
+  } catch {
+    return DEFAULT_CREDENTIAL_QUOTA_FLOOR_PERCENT;
+  }
+}
+
+function normalizeQuotaFloorPercent(value: unknown) {
+  const parsed = typeof value === "string" && value.trim() === "" ? NaN : Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > MAX_CREDENTIAL_QUOTA_FLOOR_PERCENT) {
+    throw new HttpError(
+      400,
+      "invalid_credential_quota_floor",
+      `Credential quota floor must be an integer between 0 and ${MAX_CREDENTIAL_QUOTA_FLOOR_PERCENT}`,
+    );
+  }
+  return parsed;
 }
 
 export function getRequestLogRetentionSettings() {

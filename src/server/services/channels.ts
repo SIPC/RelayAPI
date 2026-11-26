@@ -68,7 +68,9 @@ import {
   completeSessionBinding, failSessionBinding, reserveSessionBinding, type SessionBinding,
 } from "@/src/server/repositories/sessionBindings";
 import { HttpError } from "@/src/server/http/errors";
-import { claudeQuotaRouting } from "@/src/server/services/claudeQuota";
+import { claudeQuotaFloorState, claudeQuotaRouting } from "@/src/server/services/claudeQuota";
+import { codexQuotaFloorState } from "@/src/server/services/codexQuota";
+import { getCredentialQuotaFloorPercent } from "@/src/server/services/settings";
 
 // Only request-local completion state lives in memory; account bindings live in SQLite.
 const claudeSessions = new WeakMap<ChannelRecord, {
@@ -273,6 +275,7 @@ export function selectChannel(input: {
   const credentialIds = channels.flatMap((channel) => channel.credentialIds);
   const credentialsById = credentialRoutingMap(provider, credentialIds);
   const now = Date.now();
+  const floor = quotaFloorFilter(model, now);
   const candidates = channels.flatMap((channel) => {
     if (
       !isChannelAvailable(channel, input.apiKey, model, modelCandidates, now)
@@ -284,6 +287,7 @@ export function selectChannel(input: {
       credentialsById,
       now,
       model,
+      floor,
     );
     if (!credential) {
       return [];
@@ -293,11 +297,12 @@ export function selectChannel(input: {
   });
 
   if (candidates.length === 0) {
-    throw new HttpError(
-      503,
-      "no_available_channel",
-      `No usable ${providerLabel(provider)} channel is available for this request`,
-    );
+    throw floor.skipped.size ? quotaFloorError(floor.percent)
+      : new HttpError(
+        503,
+        "no_available_channel",
+        `No usable ${providerLabel(provider)} channel is available for this request`,
+      );
   }
 
   const selected = selectRoutingItem(
@@ -393,8 +398,11 @@ function selectRequestChannel(
   }
   const excluded = new Set(input.excludeCredentialIds ?? []);
   const quota = new Map<string, ReturnType<typeof claudeQuotaRouting>>();
+  const floor = quotaFloorFilter(model, now);
   let candidates = channels.flatMap((channel) => {
-    const credentials = availableCredentialsForChannel(channel, maps.get(channel.provider)!, now)
+    // The quota floor is a hard filter like cooldown: it applies to bound sessions
+    // too, so a session on a low account moves on its next request.
+    const credentials = availableCredentialsForChannel(channel, maps.get(channel.provider)!, now, floor)
       .filter((credential) => {
         if (excluded.has(credential.id) || !antigravityServesModel(credential, model, now)) return false;
         if (channel.provider !== "claude" || !channel.quotaWeighted) return true;
@@ -405,6 +413,9 @@ function selectRequestChannel(
     return credentials.length ? [{ channel, credentials }] : [];
   });
   if (!candidates.length) {
+    // Low credentials are skipped across every channel first, so lower-priority
+    // channels with headroom still serve. Only when none is left does this fail.
+    if (floor.skipped.size) throw quotaFloorError(floor.percent);
     throw new HttpError(503, "no_available_channel", "No usable channel is available for this request");
   }
   const boundChannel = !binding?.failed && binding
@@ -606,9 +617,10 @@ function selectCredentialForChannel(
   credentialsById: Map<string, CredentialRoutingRecord>,
   now: number,
   model: string,
+  floor: QuotaFloorFilter,
 ) {
   const quota = new Map<string, ReturnType<typeof claudeQuotaRouting>>();
-  const credentials = availableCredentialsForChannel(channel, credentialsById, now).filter((credential) => {
+  const credentials = availableCredentialsForChannel(channel, credentialsById, now, floor).filter((credential) => {
     if (channel.provider !== "claude" || !channel.quotaWeighted) return true;
     const state = claudeQuotaRouting(credential.id, model, now);
     quota.set(credential.id, state);
@@ -630,6 +642,7 @@ function availableCredentialsForChannel(
   channel: ChannelRecord,
   credentialsById: Map<string, CredentialRoutingRecord>,
   now: number,
+  floor: QuotaFloorFilter,
 ) {
   return channel.credentialIds
     .map((credentialId) => credentialsById.get(credentialId))
@@ -640,9 +653,43 @@ function availableCredentialsForChannel(
         (credential.provider !== "claude" || !credential.expiresAt ||
           !(Date.parse(credential.expiresAt) <= now)) &&
         (!credential.cooldownUntil ||
-          Date.parse(credential.cooldownUntil) <= now),
+          Date.parse(credential.cooldownUntil) <= now) &&
+        !floor.blocks(credential),
       ),
     );
+}
+
+type QuotaFloorFilter = ReturnType<typeof quotaFloorFilter>;
+
+// Claude and Codex have persisted quota data. Antigravity quota is only read on
+// demand by the dashboard, and API Key upstreams have no subscription windows.
+// Unknown, stale or reset windows never count as below the floor.
+function quotaFloorFilter(model: string, now: number) {
+  const percent = getCredentialQuotaFloorPercent();
+  const results = new Map<string, boolean>();
+  const skipped = new Set<string>();
+  return {
+    percent,
+    skipped,
+    blocks(credential: CredentialRoutingRecord) {
+      if (percent <= 0 || (credential.provider !== "claude" && credential.provider !== "codex")) return false;
+      const key = credential.provider + ":" + credential.id;
+      let blocked = results.get(key);
+      if (blocked === undefined) {
+        blocked = credential.provider === "claude"
+          ? claudeQuotaFloorState(credential.id, model, now, percent).skipped
+          : codexQuotaFloorState(credential.id, { now, floor: percent, recheck: true }).skipped;
+        results.set(key, blocked);
+      }
+      if (blocked) skipped.add(key);
+      return blocked;
+    },
+  };
+}
+
+function quotaFloorError(percent: number) {
+  return new HttpError(503, "credential_quota_floor",
+    `Every credential that can serve this request has ${percent}% or less of its quota left`);
 }
 
 function isChannelAvailable(

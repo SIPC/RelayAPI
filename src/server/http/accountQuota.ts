@@ -184,6 +184,10 @@ export function withAccountQuotaHeaders(response: Response, provider: Provider, 
   for (const [name, value] of accountQuotaHeaders(provider, credentialId, response.headers)) headers.set(name, value);
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
+// The newest windows parsed from this process's upstream responses, unfiltered.
+export function liveAccountQuotaSnapshot(provider: Provider, credentialId: string) {
+  return snapshots.get(provider + ":" + credentialId);
+}
 export function copyAccountQuotaHeaders(upstream: Headers, target = new Headers()) {
   for (const [name, value] of upstream) if (isAccountQuotaHeader(name)) target.set(name, value);
   return target;

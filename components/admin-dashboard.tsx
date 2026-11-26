@@ -162,6 +162,7 @@ import type {
   CodexCredentialRecord,
   CodexUpstreamTransport,
   CredentialProxyType,
+  CredentialQuotaFloorState,
   CreatedApiKey,
   GlobalSettingsRecord,
   ProxyPoolRecord,
@@ -872,7 +873,7 @@ export function AdminDashboard({
             )}
             {activeSection === "settings" && (
               <SettingsSection
-                key={`${globalSettings.proxySource}:${globalSettings.proxy?.enabled}:${globalSettings.proxy?.type}:${globalSettings.proxy?.host}:${globalSettings.proxy?.port}:${globalSettings.proxy?.username}:${globalSettings.proxy?.passwordSet}:${globalSettings.userAgentSource}:${globalSettings.userAgent}:${globalSettings.fullRequestLoggingEnabled}:${globalSettings.codexAutoDisableRefreshExhausted}:${globalSettings.requestLogRetentionDays}:${globalSettings.requestLogDetailRetentionDays}:${globalSettings.updatedAt}`}
+                key={`${globalSettings.proxySource}:${globalSettings.proxy?.enabled}:${globalSettings.proxy?.type}:${globalSettings.proxy?.host}:${globalSettings.proxy?.port}:${globalSettings.proxy?.username}:${globalSettings.proxy?.passwordSet}:${globalSettings.userAgentSource}:${globalSettings.userAgent}:${globalSettings.fullRequestLoggingEnabled}:${globalSettings.codexAutoDisableRefreshExhausted}:${globalSettings.credentialQuotaFloorPercent}:${globalSettings.requestLogRetentionDays}:${globalSettings.requestLogDetailRetentionDays}:${globalSettings.updatedAt}`}
                 settings={globalSettings}
                 onSaved={setGlobalSettings}
               />
@@ -909,6 +910,10 @@ function SettingsSection({
   const [userAgentSaving, setUserAgentSaving] = React.useState(false);
   const [loggingSaving, setLoggingSaving] = React.useState(false);
   const [refreshPolicySaving, setRefreshPolicySaving] = React.useState(false);
+  const [quotaFloor, setQuotaFloor] = React.useState(() =>
+    String(settings.credentialQuotaFloorPercent),
+  );
+  const [quotaFloorSaving, setQuotaFloorSaving] = React.useState(false);
   const [retentionSaving, setRetentionSaving] = React.useState(false);
   const [pruning, setPruning] = React.useState(false);
   const [retentionForm, setRetentionForm] = React.useState(() => ({
@@ -1068,6 +1073,25 @@ function SettingsSection({
       toast.error(adminErrorMessage(error));
     } finally {
       setRefreshPolicySaving(false);
+    }
+  }
+
+  async function saveQuotaFloor() {
+    const percent = Number(quotaFloor.trim());
+    if (quotaFloor.trim() === "" || !Number.isInteger(percent) || percent < 0 || percent > 50) {
+      toast.error("额度下限必须是 0 到 50 之间的整数");
+      return;
+    }
+    setQuotaFloorSaving(true);
+    try {
+      const updated = await updateGlobalSettings({ credentialQuotaFloorPercent: percent });
+      onSaved(updated);
+      setQuotaFloor(String(updated.credentialQuotaFloorPercent));
+      toast.success(percent === 0 ? "额度下限已关闭" : `额度下限已设为 ${percent}%`);
+    } catch (error) {
+      toast.error(adminErrorMessage(error));
+    } finally {
+      setQuotaFloorSaving(false);
     }
   }
 
@@ -1255,6 +1279,47 @@ function SettingsSection({
                   void updateCodexAutoDisableRefreshExhausted(Boolean(checked))
                 }
               />
+            </div>
+          </div>
+
+          <div className="grid h-full gap-3 rounded-lg border border-border/60 bg-muted/25 p-3 text-sm">
+            <div className="grid gap-1">
+              <div className="font-medium">凭据额度下限</div>
+              <div className="text-xs text-muted-foreground">
+                Claude / Codex 凭据剩余额度（5h、周、匹配模型的周窗口取最小）不高于该百分比时，
+                选号会像冷却一样跳过它，已绑定的会话下一次请求改用其他凭据；窗口重置或新额度高于下限后自动恢复。
+                额度未知或数据超过 60 分钟时不跳过。不受通道“按额度加权”开关影响；0 表示关闭。
+                Antigravity 暂无可靠的持久额度数据，不参与。
+              </div>
+            </div>
+            <div className="flex flex-wrap items-end gap-2">
+              <label className="grid gap-1 text-xs text-muted-foreground">
+                下限百分比（0–50）
+                <Input
+                  className="w-28"
+                  disabled={quotaFloorSaving}
+                  inputMode="numeric"
+                  value={quotaFloor}
+                  onChange={(event) => setQuotaFloor(event.target.value)}
+                />
+              </label>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={quotaFloorSaving}
+                onClick={saveQuotaFloor}
+              >
+                {quotaFloorSaving && <Spinner data-icon="inline-start" />}
+                保存下限
+              </Button>
+            </div>
+            <div className="text-xs text-muted-foreground">
+              当前下限：
+              {settings.credentialQuotaFloorPercent > 0
+                ? `${formatNumber(settings.credentialQuotaFloorPercent)}%`
+                : "已关闭"}
+              。所有可用凭据都低于下限时，请求返回 503 credential_quota_floor。
             </div>
           </div>
 
@@ -5938,6 +6003,22 @@ function OAuthDialog({
   );
 }
 
+// Shown only while routing skips the credential (or a model family on it).
+function QuotaFloorNotice({ floor }: { floor: CredentialQuotaFloorState | undefined }) {
+  if (!floor || (!floor.skipped && floor.skipped_scopes.length === 0)) return null;
+  const lowest = floor.lowest_remaining_percent;
+  return (
+    <div className="flex flex-wrap items-center gap-2 text-xs text-destructive">
+      <Badge variant="destructive">低于下限已跳过</Badge>
+      <span>
+        {floor.skipped
+          ? `剩余 ${lowest === null ? "未知" : `${Math.round(lowest)}%`}，不高于下限 ${floor.percent}%，新请求和已绑定会话都会改用其他凭据`
+          : `${floor.skipped_scopes.join(" / ")} 周额度不高于下限 ${floor.percent}%，仅这些模型跳过`}
+      </span>
+    </div>
+  );
+}
+
 function QuotaSummaryBadge({ quota }: { quota: CodexQuotaReport }) {
   if (quota.status === "not_cached" || quota.status === "unknown") {
     return <Badge variant="outline">{quotaStatusLabel(quota.status)}</Badge>;
@@ -5993,6 +6074,7 @@ function QuotaProgressCell({
 
   return (
     <div className="grid gap-2">
+      <QuotaFloorNotice floor={quota.quota_floor} />
       {windows.map((window, index) => {
         const remainingPercent = window.remaining_percent;
         const progressValue =
@@ -6079,6 +6161,7 @@ function ClaudeQuotaUsageCell({
           冷却至 <LocalDateTime value={quota.cooldown_until} />
         </div>
       )}
+      <QuotaFloorNotice floor={quota.quota_floor} />
       {quota.windows.length === 0 ? (
         <div className="text-xs text-muted-foreground">
           {quota.message || "Anthropic 未返回可展示的额度窗口"}

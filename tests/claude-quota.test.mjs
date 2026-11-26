@@ -31,6 +31,11 @@ const { appendRequestLog } = await import("../src/server/repositories/logs.ts");
 const { createChannel, patchChannel, selectChannelForRequest, recordChannelSuccess } =
   await import("../src/server/services/channels.ts");
 const { createApiKey, authenticateRelayRequest } = await import("../src/server/services/apiKeys.ts");
+const { patchGlobalSettings, getPublicGlobalSettings } = await import("../src/server/services/settings.ts");
+const { upsertCodexCredential } = await import("../src/server/repositories/codexCredentials.ts");
+const { upsertCodexQuotaCache } = await import("../src/server/repositories/quota.ts");
+const { codexQuotaFloorState } = await import("../src/server/services/codexQuota.ts");
+const { accountQuotaHeaders } = await import("../src/server/http/accountQuota.ts");
 const originalFetch = globalThis.fetch;
 const minute = 60_000;
 let calls;
@@ -38,7 +43,8 @@ let response;
 let now;
 
 beforeEach((t) => {
-  for (const table of ["channels", "claude_credentials", "claude_quota_cache", "api_keys"]) getMainDb().exec("DELETE FROM " + table);
+  for (const table of ["channels", "claude_credentials", "codex_credentials", "codex_quota_cache",
+    "claude_quota_cache", "api_keys", "settings", "session_bindings"]) getMainDb().exec("DELETE FROM " + table);
   now = Date.now();
   t.mock.method(Date, "now", () => now);
   calls = [];
@@ -242,23 +248,24 @@ test("scheduler refreshes active accounts after 15m and idle after 60m, includin
 test("opt-in weighting multiplies configured weight, preserves priority and sticky sessions, and never jumps back", (t) => {
   const { a, b, channel, select } = fixture();
   assert.equal(channel.quotaWeighted, false);
-  headers(a, 0.95, 0.9); headers(b, 0.1, 0.2);
+  headers(a, 0.9, 0.9); headers(b, 0.1, 0.2);
   t.mock.method(Math, "random", () => 0.4);
-  // Off: equal weights select the first account. On: 0.325 vs 1.45 selects the second.
+  // Off: equal weights select the first account. On: 0.4 vs 1.45 selects the second.
   assert.equal(select().credential.id, a);
   patchChannel(channel.id, { quotaWeighted: true });
   const session = randomUUID();
   const bound = select(session);
   assert.equal(bound.credential.id, b);
   recordChannelSuccess(bound.channel, 1);
-  headers(a, 0, 0); headers(b, 0.99, 0.99);
+  // Above the 5% floor: weighting alone never moves a bound session.
+  headers(a, 0, 0); headers(b, 0.9, 0.9);
   assert.equal(select(session).credential.id, b);
   updateClaudeCredential(b, { cooldownUntil: new Date(now + minute).toISOString() });
   const rebound = select(session);
   assert.equal(rebound.credential.id, a);
   recordChannelSuccess(rebound.channel, 1);
   now += minute;
-  headers(a, 0.99, 0.99); headers(b, 0, 0);
+  headers(a, 0.9, 0.9); headers(b, 0, 0);
   assert.equal(select(session).credential.id, a);
   updateClaudeCredential(b, { priority: 999 });
   assert.equal(select().credential.id, b);
@@ -295,4 +302,134 @@ test("confirmed exhaustion filters until reset; usage 429 alone does not, and ex
   now += 7 * 86400_000;
   assert.equal(claudeQuotaRouting(a, "claude-sonnet-4-6").blocked, false);
   await getClaudeQuota(a);
+});
+
+test("quota floor: default 5% skips like cooldown even with weighting off, and a bound session moves", (t) => {
+  const { a, b, channel, select } = fixture();
+  assert.equal(channel.quotaWeighted, false);
+  assert.equal(getPublicGlobalSettings().credentialQuotaFloorPercent, 5);
+  t.mock.method(Math, "random", () => 0);
+  headers(a, 0.2, 0.3); headers(b, 0.2, 0.3);
+  const session = randomUUID();
+  const bound = select(session);
+  assert.equal(bound.credential.id, a);
+  recordChannelSuccess(bound.channel, 1);
+  // 6% left on the weekly window is above the floor: the session stays put.
+  headers(a, 0.2, 0.94);
+  assert.equal(select(session).credential.id, a);
+  // Exactly 5% is at the floor. The bound session moves on its next request,
+  // and the minimum across windows counts even when 5h has plenty left.
+  headers(a, 0.1, 0.95);
+  const moved = select(session);
+  assert.equal(moved.credential.id, b);
+  recordChannelSuccess(moved.channel, 1);
+  // When A recovers the session does not jump back.
+  headers(a, 0, 0);
+  assert.equal(select(session).credential.id, b);
+});
+
+test("quota floor: unknown, stale and reset windows are not treated as below the floor", (t) => {
+  const { a, b, select } = fixture();
+  t.mock.method(Math, "random", () => 0);
+  updateClaudeCredential(b, { enabled: false });
+  // Unknown: no quota data at all for A.
+  assert.equal(select().credential.id, a);
+  // Stale: a 2% observation older than 60 minutes no longer blocks.
+  headers(a, 0.98, 0.98, now - 61 * minute);
+  assert.equal(select().credential.id, a);
+  // Fresh: the same value blocks, and with no alternative the error is explicit.
+  headers(a, 0.98, 0.98, now);
+  assert.throws(() => select(), (error) => error.status === 503 && error.code === "credential_quota_floor");
+  // Reset: once the window's reset time passes, A is usable again without new data.
+  headers(a, 0.98, 0.98, now, now + minute);
+  assert.throws(() => select(), (error) => error.code === "credential_quota_floor");
+  now += minute;
+  assert.equal(select().credential.id, a);
+});
+
+test("quota floor: a newer observation above the floor restores the credential", (t) => {
+  const { a, b, select } = fixture();
+  t.mock.method(Math, "random", () => 0);
+  headers(a, 0.97, 0.5); headers(b, 0.2, 0.2);
+  assert.equal(select().credential.id, b);
+  now += minute;
+  headers(a, 0.5, 0.5);
+  assert.equal(select().credential.id, a);
+});
+
+test("quota floor: a model-family weekly window only blocks that family", async (t) => {
+  const { a, b, select } = fixture();
+  t.mock.method(Math, "random", () => 0);
+  // Opus weekly 97% used; shared 5h/7d have room.
+  response = () => Response.json(usage(10, 20, 97));
+  await getClaudeQuota(a);
+  headers(b, 0.2, 0.2);
+  assert.equal(select(randomUUID(), "claude-opus-4-7").credential.id, b);
+  assert.equal(select(randomUUID(), "claude-sonnet-4-6").credential.id, a);
+  const report = await getClaudeQuota(a, { refreshIfStale: false });
+  assert.equal(report.quota_floor.skipped, false);
+  assert.deepEqual(report.quota_floor.skipped_scopes, ["opus"]);
+});
+
+test("quota floor: lower-priority channels still serve before the explicit floor error", (t) => {
+  const { a, select } = fixture();
+  t.mock.method(Math, "random", () => 0);
+  const low = credential();
+  const backup = createChannel({ provider: "claude", credentialIds: [low], priority: 1 });
+  headers(a, 0.99, 0.99);
+  getMainDb().prepare("UPDATE claude_credentials SET enabled = 0 WHERE id NOT IN (?, ?)").run(a, low);
+  const key = createApiKey({ channelAllowlist: [] });
+  const apiKey = authenticateRelayRequest(new Request("http://relay.invalid/v1/messages", {
+    headers: { authorization: `Bearer ${key.key}` },
+  }));
+  const pick = () => selectChannelForRequest({ operation: "messages", model: "claude-sonnet-4-6", apiKey });
+  // The higher-priority channel's only usable account is at the floor; the backup serves.
+  assert.equal(pick().channel.id, backup.id);
+  headers(low, 0.99, 0.99);
+  assert.throws(pick, (error) => error.status === 503 && error.code === "credential_quota_floor");
+  void select;
+});
+
+test("quota floor: configurable, 0 disables, invalid values are rejected", (t) => {
+  const { a, b, select } = fixture();
+  t.mock.method(Math, "random", () => 0);
+  headers(a, 0.85, 0.85); headers(b, 0.5, 0.5);
+  assert.equal(select().credential.id, a);
+  patchGlobalSettings({ credentialQuotaFloorPercent: 20 });
+  assert.equal(select().credential.id, b);
+  headers(a, 0.99, 0.99);
+  patchGlobalSettings({ credentialQuotaFloorPercent: 0 });
+  assert.equal(select().credential.id, a);
+  for (const value of [-1, 51, 2.5, "", "abc"]) {
+    assert.throws(() => patchGlobalSettings({ credentialQuotaFloorPercent: value }),
+      (error) => error.code === "invalid_credential_quota_floor");
+  }
+  assert.equal(getPublicGlobalSettings().credentialQuotaFloorPercent, 0);
+});
+
+test("quota floor: Codex uses the WHAM cache and newer live headers, with the same rules", () => {
+  const id = randomUUID();
+  upsertCodexCredential({ id, email: "codex@example.invalid", accountId: randomUUID(), planType: "plus",
+    tokens: { access_token: "synthetic", refresh_token: "", id_token: "", expired: "2099-01-01T00:00:00Z", last_refresh: "" } });
+  const reset = new Date(now + 86400_000).toISOString();
+  const cache = (fiveUsed, weekUsed, at) => upsertCodexQuotaCache({ credentialId: id, status: "low",
+    retrievedAt: new Date(at).toISOString(), cache: { windows: [
+      { id: "code-5h", remaining_percent: 100 - fiveUsed, reset_at: reset },
+      { id: "code-7d", remaining_percent: 100 - weekUsed, reset_at: reset },
+    ] } });
+  assert.equal(codexQuotaFloorState(id).skipped, false);
+  cache(10, 96, now);
+  assert.equal(codexQuotaFloorState(id).skipped, true);
+  assert.equal(codexQuotaFloorState(id).lowest_remaining_percent, 4);
+  // Stale WHAM data is unknown, not low.
+  cache(10, 96, now - 61 * minute);
+  assert.equal(codexQuotaFloorState(id).skipped, false);
+  // A newer live response header above the floor wins over the older low cache.
+  cache(10, 96, now - minute);
+  accountQuotaHeaders("codex", id, new Headers({
+    "x-codex-primary-used-percent": "10", "x-codex-primary-window-minutes": "300",
+    "x-codex-secondary-used-percent": "50", "x-codex-secondary-window-minutes": "10080",
+  }), now);
+  assert.equal(codexQuotaFloorState(id).skipped, false);
+  assert.equal(codexQuotaFloorState(id).lowest_remaining_percent, 50);
 });
