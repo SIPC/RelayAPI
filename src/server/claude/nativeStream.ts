@@ -36,11 +36,21 @@ export function createClaudeNativeSseStream(
         while ((match = /\r?\n\r?\n/.exec(buffer))) {
           inspect(buffer.slice(0, match.index));
           buffer = buffer.slice(match.index + match[0].length);
-          if (failed) break;
+          if (failed || completed) break;
         }
         if (value) controller.enqueue(value);
         if (failed) {
           await reader.cancel(); reader.releaseLock(); controller.close(); return;
+        }
+        // message_stop is the protocol boundary, not a later socket EOF. A
+        // complete response must not become a failure if the connection lingers
+        // or resets after that event. Missing message_stop still fails below.
+        if (completed) {
+          input.onCompleted(extractUsageFromClaudeSseText(usageFrames));
+          controller.close();
+          try { await reader.cancel(); } catch { /* The response is already complete. */ }
+          reader.releaseLock();
+          return;
         }
         if (done) {
           if (buffer.trim()) inspect(buffer);

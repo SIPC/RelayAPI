@@ -6,7 +6,7 @@ import {
   relocateClaudeCountSystem,
 } from "@/src/server/claude/wire";
 
-const CLAUDE_CCH_SEED = BigInt("0x6e52736ac806831e");
+const CLAUDE_CCH_SEED = BigInt("0x4d659218e32a3268");
 const MAX_CACHE_CONTROL_BLOCKS = 4;
 const BILLING_CCH_PATTERN = /\bcch=([0-9a-f]{5});/;
 
@@ -33,7 +33,10 @@ export function prepareClaudeOAuthUpstreamPayload(
   let payload = cloneRecord(inputPayload);
   const native = isNativeClaudeCodeRequest(input.sourceHeaders, payload, input.countTokens);
   const sessionId = input.sessionId || claudeSessionId(payload, input.sourceHeaders);
-  const explicitCache = recordValue(payload.prompt_cache_options)?.mode === "explicit";
+  // Standard Anthropic cache controls already express caller intent. Do not
+  // require a Relay-only flag to keep their anchors, scope and default 5m TTL.
+  const explicitCache = recordValue(payload.prompt_cache_options)?.mode === "explicit"
+    || countCacheControls(payload) > 0;
   applyClaudeModelOptions(payload);
   if (input.countTokens) payload = relocateClaudeCountSystem(payload, native);
   else payload = cloakClaudeRequest(payload, {
@@ -106,7 +109,12 @@ function extractAndRemoveBetas(payload: Record<string, unknown>) {
 }
 
 function ensureCacheControl(payload: Record<string, unknown>) {
-  injectToolsCacheControl(payload);
+  // A system breakpoint already includes all tools. Match CPA by spending
+  // that slot on conversation history instead of a redundant tools prefix.
+  const system = typeof payload.system === "string" ? payload.system.trim()
+    : (Array.isArray(payload.system) ? payload.system : [])
+      .some((block) => stringValue(recordValue(block)?.text));
+  if (!system) injectToolsCacheControl(payload);
   injectSystemCacheControl(payload);
   injectMessagesCacheControl(payload);
   return payload;
@@ -251,7 +259,8 @@ function normalizeCacheControlTTL(payload: Record<string, unknown>) {
 }
 
 function countCacheControls(payload: Record<string, unknown>) {
-  let count = 0;
+  // Automatic caching consumes a slot too, even without block-level markers.
+  let count = payload.cache_control !== undefined ? 1 : 0;
   const countBlock = (item: unknown) => {
     if (recordValue(item)?.cache_control !== undefined) {
       count += 1;
@@ -334,7 +343,7 @@ function signAnthropicMessagesPayload(
   firstSystem.text = billingHeader.replace(BILLING_CCH_PATTERN, "cch=00000;");
   const unsignedBody = JSON.stringify(payload);
   const cch = (
-    xxHash64(Buffer.from(unsignedBody), CLAUDE_CCH_SEED) & BigInt(0xfffff)
+    xxHash64(Buffer.from(normalizeClaudeCCHInput(JSON.parse(unsignedBody))), CLAUDE_CCH_SEED) & BigInt(0xfffff)
   )
     .toString(16)
     .padStart(5, "0");
@@ -343,6 +352,30 @@ function signAnthropicMessagesPayload(
     `cch=${cch};`,
   );
   return { payload, body: JSON.stringify(payload), extraBetas };
+}
+
+// The wire body above is compact JSON.stringify output, so its hash view can
+// be rebuilt in insertion order without a raw JSON scanner. Normalize only
+// the hash view, never the payload: messages still participate in the CCH.
+function normalizeClaudeCCHInput(value: unknown): string {
+  if (Array.isArray(value)) return "[" + value.map(normalizeClaudeCCHInput).join(",") + "]";
+  const item = recordValue(value);
+  if (!item) return JSON.stringify(value);
+  const members = Object.entries(item);
+  const kept: string[] = [];
+  let trailingDispatch = 0;
+  for (const [key, child] of members) {
+    if (["max_tokens", "fallbacks", "fallback_credit_token"].includes(key)) {
+      trailingDispatch++;
+      continue;
+    }
+    trailingDispatch = 0;
+    kept.push(JSON.stringify(key) + ":" + (key === "model" && typeof child === "string"
+      ? '""' : normalizeClaudeCCHInput(child)));
+  }
+  // CPA reproduces the native hash-view quirk: multiple trailing dispatch
+  // members leave a comma after any retained members (this is not wire JSON).
+  return "{" + kept.join(",") + (kept.length && trailingDispatch > 1 ? "," : "") + "}";
 }
 
 function textBlock(text: string, cacheControl?: Record<string, string>) {

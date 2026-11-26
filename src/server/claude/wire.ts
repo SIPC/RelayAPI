@@ -207,8 +207,8 @@ export function cloakClaudeRequest(
   const firstUserIndex = messages.findIndex((message) => message.role === "user");
   const firstUser = messages[firstUserIndex];
   const fingerprintText = contentText(firstUser?.content);
-  const chars = Array.from(fingerprintText);
-  const hash = crypto.createHash("sha256").update("59cf53e54c78" + [4, 7, 20].map((i) => chars[i] || "0").join("") + version).digest("hex").slice(0, 3);
+  // Native JavaScript indices sample UTF-16 code units, not Unicode code points.
+  const hash = crypto.createHash("sha256").update("59cf53e54c78" + [4, 7, 20].map((i) => fingerprintText[i] || "0").join("") + version).digest("hex").slice(0, 3);
   const billing = "x-anthropic-billing-header: cc_version=" + version + "." + hash
     + "; cc_entrypoint=cli; cch=00000;" + (input.workload ? " cc_workload=" + input.workload + ";" : "");
   payload.system = [
