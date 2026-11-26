@@ -10,6 +10,7 @@ import {
 } from "@/src/server/claude/chat";
 import { HttpError } from "@/src/server/http/errors";
 import { redactResponseText } from "@/src/server/upstream/redact";
+import { prepareAnthropicApiPayload } from "@/src/server/upstream/anthropicBetas";
 import type { StageTimer } from "@/src/server/http/stageTimer";
 import type {
   ChannelRecord,
@@ -73,12 +74,20 @@ export async function forwardApiKeyRequest(input: {
   const conversion = converted
     ? (operation === "chat" ? chatCompletionsToClaude : responsesToClaude)(json, { stream: true, oauth: false })
     : undefined;
-  const payload = conversion?.payload ?? (operation === "count_tokens" ? { ...json } : input.payload);
+  let payload = conversion?.payload ?? (operation === "count_tokens" ? { ...json } : input.payload);
   if (operation === "count_tokens" && !(payload instanceof FormData)) delete payload.stream;
+  let anthropicBeta: string | undefined;
+  if (credential.provider === "anthropic" && !(payload instanceof FormData)) {
+    // Converted requests never carried the caller's header; only betas their body asks for.
+    const prepared = prepareAnthropicApiPayload(payload, converted ? null : input.request.headers.get("anthropic-beta"));
+    payload = prepared.payload;
+    anthropicBeta = prepared.beta;
+  }
   const upstream = await fetchApiUpstream({
     ...input,
     baseUrl: input.channel.baseUrl,
     payload,
+    anthropicBeta,
     stream: downstreamStream || converted,
     streamTimeout: downstreamStream,
   });

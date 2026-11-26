@@ -55,6 +55,8 @@ export async function fetchApiUpstream(input: {
   stream: boolean;
   streamTimeout?: boolean;
   timing?: StageTimer;
+  // Built from the outgoing body; the caller's Anthropic-Beta header is never copied.
+  anthropicBeta?: string;
 }) {
   const { credential } = input;
   const url = apiUpstreamUrl(credential.provider, input.baseUrl, input.operation);
@@ -65,8 +67,7 @@ export async function fetchApiUpstream(input: {
   } else {
     headers.set("x-api-key", credential.apiKey);
     headers.set("anthropic-version", input.request.headers.get("anthropic-version") || "2023-06-01");
-    const beta = input.request.headers.get("anthropic-beta");
-    if (beta) headers.set("anthropic-beta", beta);
+    if (input.anthropicBeta) headers.set("anthropic-beta", input.anthropicBeta);
   }
   let body: string | Uint8Array<ArrayBuffer>;
   if (input.payload instanceof FormData) {

@@ -80,7 +80,7 @@ X-Relay-Quota-7d-Remaining-Percent: 60
 ### 协议与费用边界
 
 - OpenAI 同协议请求保留原始 JSON 参数和扩展字段，不经过 Codex Responses 转换；图片编辑 multipart 保留文件、多图、重复字段及遮罩，不转为 Codex data URL JSON。
-- Anthropic 原生 Messages 保留调用方 system、metadata、工具名及缓存设置，使用 `x-api-key` 和 `anthropic-version`；可显式传入 `anthropic-beta`，不自动添加 OAuth beta。token count 不强制添加 `max_tokens`，不按流式请求发送；返回的估算 Token 数保留在响应中，不计入本地每日 Token 消耗。
+- Anthropic 原生 Messages 保留调用方对话、system 文本、工具名、thinking 及缓存设置，使用渠道配置的 base URL、`x-api-key` 和 `anthropic-version`；不透传客户端身份头，并去掉 `metadata.user_id`、`diagnostics` 与 Claude Code 计费块。`anthropic-beta` 由 Relay 按发送的 body 生成：body 用到的功能（如 `output_config.format`、advisor 工具、逐轮 effort、1h 缓存）自动带上对应 beta，调用方声明的 thinking/上下文类 beta 在可用时保留，`claude-code-*`、`oauth-*`、`redact-thinking`、`afk-mode` 及未知 beta 不发送；Chat / Responses 转换请求 body 里的 `betas` 移到请求头。token count 不强制添加 `max_tokens`，不按流式请求发送；返回的估算 Token 数保留在响应中，不计入本地每日 Token 消耗。
 - Chat / Responses 转 Anthropic 复用现有协议转换器，但不进行 Claude Code 工具改名或 OAuth 身份注入。转换能力仍以现有转换器和上游模型为准。
 - API 渠道的模型名兼容 `openai/`、`anthropic/`、`google/` 前缀：`openai/gpt-5.4` 与 `gpt-5.4` 视为同一模型（不同厂商前缀不互通），发给上游的是渠道白名单里配置的写法，因此 OpenRouter 等以 `openai/gpt-5.4` 配置的渠道仍收到带前缀的名称；其他命名空间（如 `meta-llama/`）按原样精确匹配。
 - API 渠道必须配置非空模型白名单。不会自动附加 OAuth 思考后缀、映射到旧模型，或认为 Codex 目录中的 `gpt-image-2.6-*` 必然可被官方 API Key 调用。`GET /v1/models` 会补入客户端显式授权且启用的 API 渠道模型；仅绑定 API 渠道的客户端不会继承 OAuth 订阅模型目录。

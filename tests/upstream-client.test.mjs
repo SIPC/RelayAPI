@@ -146,7 +146,7 @@ for (const operation of ["messages", "count_tokens"]) {
     assert.equal(requests[0].url, "http://mock.test/custom/prefix/v1/messages" + (operation === "count_tokens" ? "/count_tokens" : ""));
     assert.deepEqual(JSON.parse(requests[0].body), payload);
     assert.deepEqual(Object.fromEntries(requests[0].headers), {
-      accept: "application/json", "anthropic-beta": "caller-explicit-beta", "anthropic-version": "2023-06-01",
+      accept: "application/json", "anthropic-version": "2023-06-01",
       "content-type": "application/json", "x-api-key": key,
     });
     assert.deepEqual(results[0].usage, operation === "count_tokens" ? { promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0 } : claudeUsage);

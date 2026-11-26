@@ -539,11 +539,63 @@ for (const scenario of [{ operation: "messages", stream: false }, { operation: "
     assert.equal(calls[0].path, "/custom/anthropic" + routes[scenario.operation][1]);
     assert.deepEqual(calls[0].payload, payload);
     assertAuth(calls[0], fixture, scenario.stream ? "text/event-stream" : "application/json");
-    assert.equal(calls[0].headers["anthropic-beta"], scenario.operation === "count_tokens" ? undefined : "caller-explicit-beta");
+    assert.equal(calls[0].headers["anthropic-beta"], undefined, "Unknown caller betas are not forwarded to an API Key upstream");
     // count_tokens is an estimate, not actual inference usage or daily token consumption.
     assertLogged(fixture, scenario.operation === "count_tokens" ? [0, 0, 0, 0] : [10, 4, 14, 3]);
   });
 }
+
+test("Anthropic API Key Messages builds Anthropic-Beta from the body and drops Claude Code client identity", { timeout: 15000 }, async () => {
+  const fixture = setup("anthropic", { model: "claude-opus-5-5" });
+  const claudeCodeBetas = ["claude-code-20250219", "oauth-2025-04-20", "interleaved-thinking-2025-05-14", "redact-thinking-2026-02-12",
+    "context-management-2025-06-27", "per-turn-control-2026-07-01", "advisor-tool-2026-03-01", "thinking-token-count-2026-05-13",
+    "advanced-tool-use-2025-11-20", "effort-2025-11-24", "afk-mode-2026-01-31", "unknown-future-2099-01-01"].join(",");
+  const billing = "x-anthropic-billing-header: cc_version=2.1.332.abc; cc_entrypoint=cli; cch=12345;";
+  const tools = [{ name: "Bash", input_schema: { type: "object" } }];
+  const messages = [
+    { role: "user", content: [{ type: "text", text: "Hi" }] },
+    { role: "assistant", content: [{ type: "thinking", thinking: "plan", signature: "sig-synthetic" }, { type: "text", text: "Hello" }] },
+    { role: "user", content: "Run pwd", output_config: { effort: "high" } },
+  ];
+  const payload = { model: "anthropic/claude-opus-5-5", max_tokens: 64, stream: true, messages, tools,
+    system: [{ type: "text", text: billing }, { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+      { type: "text", text: system, cache_control: { type: "ephemeral", ttl: "1h" } }],
+    thinking: { type: "adaptive" }, output_config: { effort: "high", format: { type: "json_schema", schema: { type: "object" } } },
+    metadata: { user_id: '{"device_id":"' + "a".repeat(64) + '"}' }, diagnostics: { previous_message_id: "msg_prev" } };
+  const response = await run(fixture, "messages", payload, { "anthropic-version": "2023-06-01", "anthropic-beta": claudeCodeBetas });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal(calls.length, 1);
+  const call = calls[0];
+  assert.equal(call.path, "/custom/anthropic/v1/messages", "The channel's configured base URL is used");
+  assertAuth(call, fixture, "text/event-stream");
+  assert.deepEqual(call.headers["anthropic-beta"].split(","), [
+    "interleaved-thinking-2025-05-14", "thinking-token-count-2026-05-13",
+    "effort-2025-11-24", "per-turn-control-2026-07-01", "structured-outputs-2025-12-15", "extended-cache-ttl-2025-04-11",
+  ], "Identity, display and unused betas are dropped; betas the body depends on are added");
+  for (const name of ["user-agent", "x-app", "x-claude-code-session-id", "x-stainless-os", "anthropic-dangerous-direct-browser-access"]) {
+    assert.ok(!call.headers[name]?.includes?.("synthetic-downstream") && call.headers[name] !== "cli", name);
+  }
+  const sent = call.payload;
+  assert.equal(sent.model, "claude-opus-5-5");
+  assert.deepEqual(sent.messages, messages, "Conversation, thinking signatures and per-turn controls are kept");
+  assert.deepEqual(sent.tools, tools);
+  assert.deepEqual(sent.system, payload.system.slice(1), "Only the billing block is removed; system text and cache markers stay");
+  assert.deepEqual(sent.thinking, payload.thinking);
+  assert.deepEqual(sent.output_config, payload.output_config);
+  assert.equal(sent.metadata, undefined);
+  assert.equal(sent.diagnostics, undefined);
+
+  // A converted request carries no caller header; only betas its body needs, such as a context suffix moved out of the body.
+  calls.length = 0;
+  const converted = setup("anthropic", { model: "gateway-converted", channel: { capabilities: ["messages"] } });
+  const chat = await run(converted, "chat", { ...payloadFor("chat", converted.model), betas: ["claude-code-20250219", "context-1m-2025-08-07"] },
+    { "anthropic-beta": claudeCodeBetas });
+  assert.equal(chat.status, 200);
+  await chat.text();
+  assert.equal(calls[0].headers["anthropic-beta"], "context-1m-2025-08-07");
+  assert.equal(calls[0].payload.betas, undefined, "Body betas are moved to the header");
+});
 
 for (const operation of ["chat", "responses"]) for (const stream of [false, true]) {
   test("Anthropic via " + operation + " stream=" + stream + ": exact gateway(high) model converts without suffix-derived thinking, tool renaming or OAuth identity", { timeout: 15000 }, async () => {
