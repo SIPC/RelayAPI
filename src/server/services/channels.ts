@@ -689,7 +689,7 @@ function quotaFloorFilter(model: string, now: number) {
 
 function quotaFloorError(percent: number) {
   return new HttpError(503, "credential_quota_floor",
-    `Every credential that can serve this request has ${percent}% or less of its quota left`);
+    `Every credential that can serve this request has ${percent}% or less of its weekly quota left`);
 }
 
 function isChannelAvailable(

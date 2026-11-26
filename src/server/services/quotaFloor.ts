@@ -1,4 +1,4 @@
-﻿import "server-only";
+import "server-only";
 
 import type { CredentialQuotaFloorState } from "@/src/shared/types/entities";
 
@@ -6,6 +6,8 @@ import type { CredentialQuotaFloorState } from "@/src/shared/types/entities";
 export const QUOTA_FLOOR_MAX_AGE_MS = 60 * 60_000;
 
 export interface QuotaFloorWindow {
+  // Display name of the window, such as "7d 额度", reported as the trigger.
+  label: string;
   remainingPercent: number | null;
   observedAt: number;
   resetAt: string | null;
@@ -13,9 +15,11 @@ export interface QuotaFloorWindow {
   scope: string | null;
 }
 
-// Without a scope matcher the account is evaluated for display: shared windows
-// decide `skipped` and scoped windows are listed in `skipped_scopes`. With one,
-// only the shared windows and the scoped windows of the requested model count.
+// Callers pass only weekly windows: the 5h window is free to use up and is
+// handled by the normal 429 cooldown. Without a scope matcher the account is
+// evaluated for display: shared windows decide `skipped` and scoped windows are
+// listed in `skipped_scopes`. With one, only the shared windows and the scoped
+// windows of the requested model count.
 export function evaluateQuotaFloor(
   windows: QuotaFloorWindow[], floor: number, now: number,
   matchesScope: ((scope: string) => boolean) | null,
@@ -27,6 +31,7 @@ export function evaluateQuotaFloor(
     (!window.resetAt || Date.parse(window.resetAt) > now));
   const relevant = known.filter((window) => !window.scope || Boolean(matchesScope?.(window.scope)));
   const below = (window: QuotaFloorWindow) => floor > 0 && window.remainingPercent! <= floor;
+  const triggers = (matchesScope === null ? known : relevant).filter(below);
   return {
     percent: floor,
     lowest_remaining_percent: relevant.length
@@ -35,5 +40,6 @@ export function evaluateQuotaFloor(
     skipped_scopes: matchesScope === null
       ? [...new Set(known.filter((window) => window.scope && below(window)).map((window) => window.scope!))]
       : [],
+    triggered_by: triggers.map((window) => `${window.label} 剩余 ${Math.round(window.remainingPercent!)}%`),
   };
 }

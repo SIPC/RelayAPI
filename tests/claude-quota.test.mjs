@@ -23,7 +23,7 @@ registerHooks({ resolve(specifier, context, nextResolve) {
 const { getMainDb, getLogDb } = await import("../src/server/db/sqlite.ts");
 const { upsertClaudeCredential, updateClaudeCredential, getClaudeCredentialWithTokens } =
   await import("../src/server/repositories/claudeCredentials.ts");
-const { getClaudeQuota, recordClaudeQuotaHeaders, claudeQuotaRouting, refreshDueClaudeQuotas } =
+const { getClaudeQuota, recordClaudeQuotaHeaders, claudeQuotaRouting, refreshDueClaudeQuotas, claudeQuotaFloorState } =
   await import("../src/server/services/claudeQuota.ts");
 const { claudeQuotaAccountKey, acquireClaudeQuotaRefresh } =
   await import("../src/server/repositories/claudeQuota.ts");
@@ -317,9 +317,13 @@ test("quota floor: default 5% skips like cooldown even with weighting off, and a
   // 6% left on the weekly window is above the floor: the session stays put.
   headers(a, 0.2, 0.94);
   assert.equal(select(session).credential.id, a);
-  // Exactly 5% is at the floor. The bound session moves on its next request,
-  // and the minimum across windows counts even when 5h has plenty left.
+  // The 5h window is free to use up; only the weekly window counts.
+  headers(a, 0.99, 0.2);
+  assert.equal(select(session).credential.id, a);
+  assert.equal(claudeQuotaFloorState(a, null).skipped, false);
+  // Exactly 5% weekly is at the floor. The bound session moves on its next request.
   headers(a, 0.1, 0.95);
+  assert.deepEqual(claudeQuotaFloorState(a, null).triggered_by, ["7d 额度 剩余 5%"]);
   const moved = select(session);
   assert.equal(moved.credential.id, b);
   recordChannelSuccess(moved.channel, 1);
@@ -350,7 +354,7 @@ test("quota floor: unknown, stale and reset windows are not treated as below the
 test("quota floor: a newer observation above the floor restores the credential", (t) => {
   const { a, b, select } = fixture();
   t.mock.method(Math, "random", () => 0);
-  headers(a, 0.97, 0.5); headers(b, 0.2, 0.2);
+  headers(a, 0.5, 0.97); headers(b, 0.2, 0.2);
   assert.equal(select().credential.id, b);
   now += minute;
   headers(a, 0.5, 0.5);
@@ -369,6 +373,7 @@ test("quota floor: a model-family weekly window only blocks that family", async 
   const report = await getClaudeQuota(a, { refreshIfStale: false });
   assert.equal(report.quota_floor.skipped, false);
   assert.deepEqual(report.quota_floor.skipped_scopes, ["opus"]);
+  assert.deepEqual(report.quota_floor.triggered_by, ["Opus 周额度 剩余 3%"]);
 });
 
 test("quota floor: lower-priority channels still serve before the explicit floor error", (t) => {
@@ -418,9 +423,13 @@ test("quota floor: Codex uses the WHAM cache and newer live headers, with the sa
       { id: "code-7d", remaining_percent: 100 - weekUsed, reset_at: reset },
     ] } });
   assert.equal(codexQuotaFloorState(id).skipped, false);
+  // An exhausted 5h window is left to the 429 cooldown, not the floor.
+  cache(99, 10, now);
+  assert.equal(codexQuotaFloorState(id).skipped, false);
   cache(10, 96, now);
   assert.equal(codexQuotaFloorState(id).skipped, true);
   assert.equal(codexQuotaFloorState(id).lowest_remaining_percent, 4);
+  assert.deepEqual(codexQuotaFloorState(id).triggered_by, ["7d 额度 剩余 4%"]);
   // Stale WHAM data is unknown, not low.
   cache(10, 96, now - 61 * minute);
   assert.equal(codexQuotaFloorState(id).skipped, false);

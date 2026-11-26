@@ -235,35 +235,31 @@ async function refreshCodexQuota(credentialId: string, includeRaw: boolean): Pro
   }
 }
 
-// The 5h and weekly windows from the WHAM cache and the newest response headers,
-// whichever was observed later. Additional (feature) limits are not mapped to models.
+// The weekly window from the WHAM cache and the newest response headers, whichever
+// was observed later. The 5h window is free to use up (a 5h 429 goes through the
+// normal cooldown). Additional (feature) limits are not mapped to models.
 export function codexQuotaFloorState(
   credentialId: string,
   { now = Date.now(), floor = getCredentialQuotaFloorPercent(), recheck = false } = {},
 ) {
-  const windows = new Map<string, QuotaFloorWindow>();
-  const add = (id: string, window: QuotaFloorWindow) => {
-    const previous = windows.get(id);
-    if (!previous || !(previous.observedAt > window.observedAt)) windows.set(id, window);
-  };
+  let weekly: QuotaFloorWindow | null = null;
   const cached = getCodexQuotaCacheByCredentialId(credentialId);
   const retrievedAt = cached ? Date.parse(cached.retrievedAt) : NaN;
   for (const raw of Array.isArray(cached?.cache.windows) ? cached.cache.windows : []) {
     const window = objectFrom(raw);
-    const id = window?.id === "code-5h" ? "5h" : window?.id === "code-7d" ? "7d" : null;
-    if (!window || !id) continue;
-    add(id, {
-      remainingPercent: typeof window.remaining_percent === "number" ? window.remaining_percent : null,
+    if (window?.id !== "code-7d") continue;
+    weekly = {
+      label: "7d 额度", remainingPercent: typeof window.remaining_percent === "number" ? window.remaining_percent : null,
       observedAt: retrievedAt, resetAt: typeof window.reset_at === "string" ? window.reset_at : null, scope: null,
-    });
+    };
   }
   const live = liveAccountQuotaSnapshot("codex", credentialId);
-  for (const window of live?.windows ?? []) {
-    if (window.id !== "5h" && window.id !== "7d") continue;
-    add(window.id, { remainingPercent: window.remainingPercent ?? null, observedAt: live!.observedAt,
-      resetAt: window.resetAt ?? null, scope: null });
+  const liveWeekly = live?.windows.find((window) => window.id === "7d");
+  if (liveWeekly && !(weekly && weekly.observedAt > live!.observedAt)) {
+    weekly = { label: "7d 额度", remainingPercent: liveWeekly.remainingPercent ?? null, observedAt: live!.observedAt,
+      resetAt: liveWeekly.resetAt ?? null, scope: null };
   }
-  const state = evaluateQuotaFloor([...windows.values()], floor, now, null);
+  const state = evaluateQuotaFloor(weekly ? [weekly] : [], floor, now, null);
   if (recheck && state.skipped && !(now - retrievedAt < FLOOR_RECHECK_MS)) {
     // Selection may hold the session SQLite write lock. Start IO only after it returns.
     queueMicrotask(() => {

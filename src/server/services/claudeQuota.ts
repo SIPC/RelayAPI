@@ -203,14 +203,16 @@ export function claudeQuotaRouting(credentialId: string, model: string, now = Da
 }
 
 // model null reports the account for the dashboard; with a model, routing applies
-// the shared 5h/7d windows plus the weekly window of that model family.
+// the shared 7d window plus the weekly window of that model family. The 5h window
+// is free to use up: a 5h 429 goes through the normal cooldown instead.
 export function claudeQuotaFloorState(
   credentialId: string, model: string | null, now = Date.now(), floor = getCredentialQuotaFloorPercent(),
 ) {
   const key = claudeQuotaAccountKey(credentialId);
-  const windows = key ? getClaudeQuotaCache(key).windows.filter((window) => window.id.startsWith("unified-")) : [];
+  const windows = key ? getClaudeQuotaCache(key).windows.filter((window) => window.id.startsWith("unified-7d")) : [];
   const canonical = model === null ? null : stripClaudeModelSuffixes(model).toLowerCase();
   return evaluateQuotaFloor(windows.map((window) => ({
+    label: window.label,
     // An upstream "rejected" status is exhausted even when no percentage came with it.
     remainingPercent: window.rejected ? 0 : window.remaining_percent, observedAt: window.observedAt,
     resetAt: window.reset_at, scope: window.scope,

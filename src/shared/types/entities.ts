@@ -384,13 +384,15 @@ export interface ClaudeQuotaReport {
   quota_floor: CredentialQuotaFloorState;
 }
 
-// Routing skips a credential whose fresh remaining quota is at or below the floor.
-// skipped_scopes lists model families (e.g. "opus") skipped only for matching models.
+// Routing skips a credential whose fresh remaining weekly quota is at or below the
+// floor; the 5h window is not part of it. skipped_scopes lists model families
+// (e.g. "opus") skipped only for matching models; triggered_by names the windows.
 export interface CredentialQuotaFloorState {
   percent: number;
   lowest_remaining_percent: number | null;
   skipped: boolean;
   skipped_scopes: string[];
+  triggered_by: string[];
 }
 
 // Antigravity quota mirrors retrieveUserQuotaSummary: groups of models sharing weekly and 5-hour buckets.

@@ -1286,8 +1286,9 @@ function SettingsSection({
             <div className="grid gap-1">
               <div className="font-medium">凭据额度下限</div>
               <div className="text-xs text-muted-foreground">
-                Claude / Codex 凭据剩余额度（5h、周、匹配模型的周窗口取最小）不高于该百分比时，
+                Claude / Codex 凭据的周额度（7d 和匹配模型的周窗口）剩余不高于该百分比时，
                 选号会像冷却一样跳过它，已绑定的会话下一次请求改用其他凭据；窗口重置或新额度高于下限后自动恢复。
+                5h 额度不参与下限，用完后仍按 429 冷却处理。
                 额度未知或数据超过 60 分钟时不跳过。不受通道“按额度加权”开关影响；0 表示关闭。
                 Antigravity 暂无可靠的持久额度数据，不参与。
               </div>
@@ -6006,14 +6007,14 @@ function OAuthDialog({
 // Shown only while routing skips the credential (or a model family on it).
 function QuotaFloorNotice({ floor }: { floor: CredentialQuotaFloorState | undefined }) {
   if (!floor || (!floor.skipped && floor.skipped_scopes.length === 0)) return null;
-  const lowest = floor.lowest_remaining_percent;
+  const trigger = floor.triggered_by.join("、");
   return (
     <div className="flex flex-wrap items-center gap-2 text-xs text-destructive">
       <Badge variant="destructive">低于下限已跳过</Badge>
       <span>
         {floor.skipped
-          ? `剩余 ${lowest === null ? "未知" : `${Math.round(lowest)}%`}，不高于下限 ${floor.percent}%，新请求和已绑定会话都会改用其他凭据`
-          : `${floor.skipped_scopes.join(" / ")} 周额度不高于下限 ${floor.percent}%，仅这些模型跳过`}
+          ? `${trigger}，不高于下限 ${floor.percent}%，新请求和已绑定会话都会改用其他凭据`
+          : `${trigger}，不高于下限 ${floor.percent}%，仅 ${floor.skipped_scopes.join(" / ")} 模型跳过`}
       </span>
     </div>
   );
