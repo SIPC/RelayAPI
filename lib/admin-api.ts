@@ -15,12 +15,13 @@ import type {
   GlobalSettingsRecord,
   JsonValue,
   ProxyPoolRecord,
+  QuotaBurnReport,
   UpstreamCredentialRecord,
   UpstreamOperation,
 } from "@/src/shared/types/entities";
 
 export type ClaudeQuotaReport = SharedClaudeQuotaReport;
-export type { AntigravityQuotaReport };
+export type { AntigravityQuotaReport, QuotaBurnReport };
 
 export type AdminListResponse<T> = {
   object: "list";
@@ -520,6 +521,12 @@ export function downloadClaudeCredentialsExport(id?: string) {
 export function getClaudeCredentialQuota(id: string) {
   return adminRequest<ClaudeQuotaReport>(
     `/api/admin/claude/credentials/${encodePath(id)}/quota`,
+  );
+}
+
+export function getQuotaBurn(provider: "claude" | "codex", id: string) {
+  return adminRequest<QuotaBurnReport>(
+    `/api/admin/${provider}/credentials/${encodePath(id)}/quota-burn`,
   );
 }
 

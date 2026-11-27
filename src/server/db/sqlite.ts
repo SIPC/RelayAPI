@@ -778,6 +778,33 @@ function migrateLogDb(db: DatabaseSync) {
       "TEXT",
     );
   });
+
+  // Both statements are metadata-only in SQLite, so they are instant on a large
+  // request_logs. cache_write_tokens stays NULL on older rows: Claude
+  // prompt_tokens include cache writes, and NULL means "not split", not zero.
+  // quota_snapshots keeps one row per 5-minute bucket of one quota window
+  // cycle; reset_key is the window's reset time in whole minutes.
+  applyMigration(db, "009_quota_burn", (database) => {
+    addColumnIfMissing(database, "request_logs", "cache_write_tokens", "INTEGER");
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS quota_snapshots (
+        provider TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        window_id TEXT NOT NULL,
+        reset_key INTEGER NOT NULL,
+        bucket INTEGER NOT NULL,
+        first_at INTEGER NOT NULL,
+        first_used REAL NOT NULL,
+        last_at INTEGER NOT NULL,
+        last_used REAL NOT NULL,
+        min_used REAL NOT NULL,
+        max_used REAL NOT NULL,
+        samples INTEGER NOT NULL,
+        PRIMARY KEY (provider, subject, window_id, reset_key, bucket)
+      ) STRICT, WITHOUT ROWID;
+      CREATE INDEX IF NOT EXISTS idx_quota_snapshots_last_at ON quota_snapshots(last_at);
+    `);
+  });
 }
 
 function addColumnIfMissing(

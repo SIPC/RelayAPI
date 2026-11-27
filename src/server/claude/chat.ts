@@ -1107,6 +1107,9 @@ function mergeClaudeUsage(usage: UsageSnapshot, rawUsage: unknown) {
   if (cacheReadTokens !== null) {
     usage.cachedTokens = cacheReadTokens;
   }
+  if (inputTokens !== null || cacheCreationTokens !== null) {
+    usage.cacheWriteTokens = cacheCreationTokens ?? usage.cacheWriteTokens ?? 0;
+  }
   usage.totalTokens = usage.promptTokens + usage.completionTokens;
 }
 

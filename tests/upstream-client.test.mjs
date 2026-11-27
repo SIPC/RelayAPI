@@ -94,7 +94,7 @@ function claudeSse(stop = true) {
 function sseResponse(text, size = 7, ending = "close") {
   return new Response(stream(text, size, ending), { headers: { "content-type": "text/event-stream; charset=utf-8", "request-id": "req_mock" } });
 }
-const claudeUsage = { promptTokens: 10, completionTokens: 4, totalTokens: 14, cachedTokens: 3 };
+const claudeUsage = { promptTokens: 10, completionTokens: 4, totalTokens: 14, cachedTokens: 3, cacheWriteTokens: 2 };
 
 for (const [operation, path] of [
   ["chat", "/chat/completions"], ["responses", "/responses"],

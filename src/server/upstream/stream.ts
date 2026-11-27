@@ -46,6 +46,7 @@ export class UsageTracker {
         (count(this.claude.cache_creation_input_tokens) ?? 0) + (count(this.claude.cache_read_input_tokens) ?? 0);
       this.usage.completionTokens = count(this.claude.output_tokens) ?? 0;
       this.usage.cachedTokens = count(this.claude.cache_read_input_tokens) ?? 0;
+      this.usage.cacheWriteTokens = count(this.claude.cache_creation_input_tokens) ?? 0;
     } else {
       this.usage.promptTokens = count(raw.prompt_tokens ?? raw.input_tokens) ?? this.usage.promptTokens;
       this.usage.completionTokens = count(raw.completion_tokens ?? raw.output_tokens) ?? this.usage.completionTokens;

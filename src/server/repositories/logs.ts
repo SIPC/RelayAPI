@@ -3,6 +3,7 @@ import "server-only";
 import { getLogDb, getMainDb } from "@/src/server/db/sqlite";
 import { jsonStringify, randomId } from "@/src/server/services/crypto";
 import type { StageTimingEntry } from "@/src/server/http/stageTimer";
+import { QUOTA_SNAPSHOT_RETENTION_MS } from "@/src/server/repositories/quotaSnapshots";
 import type {
   AdminOverviewStats,
   AdminOverviewTotals,
@@ -100,8 +101,8 @@ export function appendRequestLog(input: RequestLogInput) {
         model, status_code, latency_ms, api_key_id, api_key_prefix,
         api_key_name, channel_id, channel_name, credential_id, credential_email,
         prompt_tokens, completion_tokens, total_tokens, cached_tokens,
-        error_code, error_message
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        cache_write_tokens, error_code, error_message
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       id,
@@ -125,6 +126,7 @@ export function appendRequestLog(input: RequestLogInput) {
       usage.completionTokens,
       usage.totalTokens,
       usage.cachedTokens,
+      usage.cacheWriteTokens ?? null,
       input.errorCode || null,
       input.errorMessage || null,
     );
@@ -345,6 +347,9 @@ export function pruneRequestLogs(
         .prepare("DELETE FROM channel_health_events WHERE created_at < ?")
         .run(summaryCutoff),
     );
+    // Quota burn only reads the last 7 days; keep a month for context.
+    db.prepare("DELETE FROM quota_snapshots WHERE last_at < ?")
+      .run(Date.now() - QUOTA_SNAPSHOT_RETENTION_MS);
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");
@@ -1648,6 +1653,8 @@ function normalizeUsageSnapshot(usage?: UsageSnapshot): UsageSnapshot {
     ),
     totalTokens: Math.max(0, Math.floor(numberValue(usage?.totalTokens))),
     cachedTokens: Math.max(0, Math.floor(numberValue(usage?.cachedTokens))),
+    cacheWriteTokens: usage?.cacheWriteTokens === undefined ? undefined
+      : Math.max(0, Math.floor(numberValue(usage.cacheWriteTokens))),
   };
 }
 

@@ -36,6 +36,9 @@ const { upsertCodexCredential } = await import("../src/server/repositories/codex
 const { upsertCodexQuotaCache } = await import("../src/server/repositories/quota.ts");
 const { codexQuotaFloorState } = await import("../src/server/services/codexQuota.ts");
 const { accountQuotaHeaders } = await import("../src/server/http/accountQuota.ts");
+const { getQuotaBurnReport } = await import("../src/server/services/quotaBurn.ts");
+const { UsageTracker } = await import("../src/server/upstream/stream.ts");
+const { extractUsageFromClaudeMessage } = await import("../src/server/claude/chat.ts");
 const originalFetch = globalThis.fetch;
 const minute = 60_000;
 let calls;
@@ -45,6 +48,7 @@ let now;
 beforeEach((t) => {
   for (const table of ["channels", "claude_credentials", "codex_credentials", "codex_quota_cache",
     "claude_quota_cache", "api_keys", "settings", "session_bindings"]) getMainDb().exec("DELETE FROM " + table);
+  for (const table of ["quota_snapshots", "request_logs", "usage_records", "usage_daily_buckets"]) getLogDb().exec("DELETE FROM " + table);
   now = Date.now();
   t.mock.method(Date, "now", () => now);
   calls = [];
@@ -441,4 +445,111 @@ test("quota floor: Codex uses the WHAM cache and newer live headers, with the sa
   }), now);
   assert.equal(codexQuotaFloorState(id).skipped, false);
   assert.equal(codexQuotaFloorState(id).lowest_remaining_percent, 50);
+});
+
+test("quota burn: per-cycle deltas with precision error, shared accounts, and split token classes", () => {
+  now = Math.floor(Date.now() / (5 * minute)) * 5 * minute;
+  const account = randomUUID(); const a = credential(account); const b = credential(account);
+  const other = credential();
+  const weekly = (id, week, at, reset, five) => recordClaudeQuotaHeaders(id, new Headers({
+    "anthropic-ratelimit-unified-7d-utilization": String(week),
+    "anthropic-ratelimit-unified-7d-reset": String(reset / 1000),
+    ...(five === undefined ? {} : { "anthropic-ratelimit-unified-5h-utilization": String(five),
+      "anthropic-ratelimit-unified-5h-reset": String((now + 3 * 3600_000) / 1000) }),
+  }), at);
+  const log = (id, at, usage) => appendRequestLog({ credentialId: id, startedAt: new Date(at).toISOString(),
+    method: "POST", path: "/v1/messages", requestType: "messages", stream: true, statusCode: 200, latencyMs: 1,
+    usage: { ...usage, totalTokens: usage.promptTokens + usage.completionTokens } });
+  // Previous cycle, reset two hours ago: 80% -> 90% with 2M tokens between.
+  const oldReset = now - 2 * 3600_000;
+  weekly(a, 0.80, now - 10 * 3600_000, oldReset);
+  log(a, now - 7 * 3600_000, { promptTokens: 2_000_000, cachedTokens: 1_000_000, cacheWriteTokens: 0, completionTokens: 0 });
+  weekly(a, 0.90, now - 4 * 3600_000, oldReset);
+  // Current cycle, observed through both imports of the account. 4% after 5%
+  // is another upstream replica answering, so each end may be off by 2 steps.
+  const reset = now + 5 * 86400_000;
+  log(a, now - 100 * minute, { promptTokens: 9_000_000, cachedTokens: 0, completionTokens: 0 });
+  weekly(a, 0.02, now - 90 * minute, reset, 0.30);
+  log(a, now - 80 * minute, { promptTokens: 3_800_000, cachedTokens: 3_500_000, cacheWriteTokens: 200_000, completionTokens: 200_000 });
+  weekly(b, 0.05, now - 60 * minute, reset);
+  log(other, now - 50 * minute, { promptTokens: 7_000_000, cachedTokens: 0, completionTokens: 0 });
+  weekly(a, 0.04, now - 55 * minute, reset);
+  // Logged before cache writes were split: input and cache write together.
+  log(b, now - 40 * minute, { promptTokens: 4_100_000, cachedTokens: 3_900_000, completionTokens: 100_000 });
+  weekly(b, 0.10, now - 30 * minute, reset, 0.31);
+  log(a, now - 10 * minute, { promptTokens: 5_000_000, cachedTokens: 0, completionTokens: 0 });
+
+  const report = getQuotaBurnReport("claude", a);
+  assert.equal(report.shared_credentials, 2);
+  const week = report.windows.find((window) => window.id === "7d");
+  assert.equal(week.resetAt, new Date(reset).toISOString());
+  assert.equal(week.resolution, 1);
+  assert.deepEqual(week.current.tokens, { requests: 2, requestsWithoutTokens: 0, input: 100_000,
+    cacheRead: 7_400_000, cacheWrite: 200_000, inputUnsplit: 200_000, output: 300_000, total: 8_200_000 });
+  assert.equal(week.current.delta, 8);
+  assert.equal(week.current.deltaError, 2);
+  assert.equal(week.current.status, "rough");
+  assert.deepEqual([week.current.tokensPerPercent, week.current.tokensPerPercentLow, week.current.tokensPerPercentHigh],
+    [1_025_000, 820_000, 1_366_667]);
+  // The previous cycle adds its own 10% (��1) and 2M tokens; nothing spans the reset.
+  assert.equal(week.recent.cycles, 2);
+  assert.equal(week.recent.delta, 18);
+  assert.equal(week.recent.deltaError, 3);
+  assert.equal(week.recent.tokens.total, 10_200_000);
+  assert.equal(week.recent.status, "ok");
+  assert.deepEqual([week.recent.tokensPerPercent, week.recent.tokensPerPercentLow, week.recent.tokensPerPercentHigh],
+    [566_667, 485_714, 680_000]);
+  // 30% -> 31% is within one reporting step: no ratio.
+  const five = report.windows.find((window) => window.id === "5h");
+  assert.equal(five.current.status, "insufficient");
+  assert.equal(five.current.tokensPerPercent, null);
+  assert.match(five.current.reason, /精度误差/);
+});
+
+test("quota burn: Codex WHAM and header samples with reset jitter share a cycle; a reset starts over", () => {
+  now = Math.floor(Date.now() / (5 * minute)) * 5 * minute;
+  const id = randomUUID();
+  upsertCodexCredential({ id, email: "codex@example.invalid", accountId: randomUUID(), planType: "plus",
+    tokens: { access_token: "synthetic", refresh_token: "", id_token: "", expired: "2099-01-01T00:00:00Z", last_refresh: "" } });
+  const reset = now - 15 * minute;
+  const header = (used, at, resetAt) => accountQuotaHeaders("codex", id, new Headers({
+    "x-codex-primary-used-percent": String(used), "x-codex-primary-window-minutes": "10080",
+    "x-codex-primary-reset-at": String(Math.floor(resetAt / 1000)),
+    "x-codex-secondary-used-percent": "0", "x-codex-secondary-window-minutes": "0", "x-codex-secondary-reset-at": "",
+  }), at);
+  header(10, now - 60 * minute, reset);
+  appendRequestLog({ credentialId: id, startedAt: new Date(now - 40 * minute).toISOString(), method: "POST",
+    path: "/v1/responses", requestType: "responses", stream: true, statusCode: 200, latencyMs: 1,
+    usage: { promptTokens: 1_200_000, cachedTokens: 1_000_000, completionTokens: 50_000, totalTokens: 1_250_000 } });
+  // The same reset reported 40 seconds later (reset_after_seconds drift).
+  header(30, now - 20 * minute, reset + 40_000);
+  // The window reset; the new cycle has a single observation.
+  header(1, now - 10 * minute, reset + 7 * 86400_000);
+  appendRequestLog({ credentialId: id, startedAt: new Date(now - 5 * minute).toISOString(), method: "POST",
+    path: "/v1/responses", requestType: "responses", stream: true, statusCode: 200, latencyMs: 1,
+    usage: { promptTokens: 9_000_000, cachedTokens: 0, completionTokens: 0, totalTokens: 9_000_000 } });
+
+  const week = getQuotaBurnReport("codex", id).windows.find((window) => window.id === "7d");
+  assert.equal(week.current.status, "insufficient");
+  assert.equal(week.current.tokensPerPercent, null);
+  assert.equal(week.recent.cycles, 1);
+  assert.equal(week.recent.delta, 20);
+  assert.equal(week.recent.deltaError, 1);
+  assert.deepEqual(week.recent.tokens, { requests: 1, requestsWithoutTokens: 0, input: 200_000,
+    cacheRead: 1_000_000, cacheWrite: null, inputUnsplit: 0, output: 50_000, total: 1_250_000 });
+  assert.deepEqual([week.recent.tokensPerPercent, week.recent.tokensPerPercentLow, week.recent.tokensPerPercentHigh],
+    [62_500, 59_524, 65_789]);
+  assert.equal(getLogDb().prepare("SELECT COUNT(DISTINCT reset_key) AS n FROM quota_snapshots").get().n, 2);
+});
+
+test("Claude usage keeps cache writes separate from input", () => {
+  const raw = { input_tokens: 10, cache_creation_input_tokens: 20, cache_read_input_tokens: 30, output_tokens: 4 };
+  const tracker = new UsageTracker(true);
+  tracker.consume({ type: "message_start", message: { usage: raw } });
+  assert.equal(tracker.usage.promptTokens, 60);
+  assert.equal(tracker.usage.cachedTokens, 30);
+  assert.equal(tracker.usage.cacheWriteTokens, 20);
+  const message = extractUsageFromClaudeMessage({ usage: raw });
+  assert.equal(message.promptTokens, 60);
+  assert.equal(message.cacheWriteTokens, 20);
 });

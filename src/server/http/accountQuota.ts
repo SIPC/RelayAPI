@@ -1,6 +1,7 @@
 import "server-only";
 
 import { getCodexQuotaCacheByCredentialId } from "@/src/server/repositories/quota";
+import { recordQuotaSnapshots } from "@/src/server/repositories/quotaSnapshots";
 import type { ChannelProvider } from "@/src/shared/types/entities";
 
 type Provider = ChannelProvider;
@@ -154,6 +155,12 @@ export function accountQuotaHeaders(
     if (snapshot) source = "cache";
   }
   if (hasLive) {
+    // Claude headers are recorded with their account key in claudeQuota.
+    if (provider === "codex") {
+      recordQuotaSnapshots("codex", credentialId, live.windows.flatMap((window) =>
+        window.id === "5h" || window.id === "7d"
+          ? [{ windowId: window.id, usedPercent: window.usedPercent, resetAt: window.resetAt }] : []), now);
+    }
     snapshots.delete(key);
     if (snapshots.size >= 4096) snapshots.delete(snapshots.keys().next().value!);
     snapshots.set(key, live);

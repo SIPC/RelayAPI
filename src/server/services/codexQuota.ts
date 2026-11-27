@@ -12,6 +12,7 @@ import {
   getCodexQuotaCacheByCredentialId,
   upsertCodexQuotaCache,
 } from "@/src/server/repositories/quota";
+import { recordQuotaSnapshots } from "@/src/server/repositories/quotaSnapshots";
 import { ensureFreshCredential } from "@/src/server/services/codexCredentials";
 import { evaluateQuotaFloor, type QuotaFloorWindow } from "@/src/server/services/quotaFloor";
 import {
@@ -214,6 +215,10 @@ async function refreshCodexQuota(credentialId: string, includeRaw: boolean): Pro
       cache: reportToRecord(report),
       retrievedAt: report.retrieved_at,
     });
+    recordQuotaSnapshots("codex", credential.id, (["5h", "7d"] as const).flatMap((id) => {
+      const window = report.windows.find((item) => item.id === `code-${id}`);
+      return window ? [{ windowId: id, usedPercent: window.used_percent, resetAt: window.reset_at }] : [];
+    }), Date.parse(report.retrieved_at));
 
     const publicReport = markQuotaCacheState(reportToRecord(report), "fresh");
     if (includeRaw) {

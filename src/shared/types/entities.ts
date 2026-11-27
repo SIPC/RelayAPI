@@ -322,6 +322,9 @@ export interface UsageSnapshot {
   completionTokens: number;
   totalTokens: number;
   cachedTokens: number;
+  // Anthropic cache_creation_input_tokens, included in promptTokens. Undefined
+  // where the provider does not report cache writes separately.
+  cacheWriteTokens?: number;
 }
 
 export interface CredentialUsageWindow {
@@ -382,6 +385,59 @@ export interface ClaudeQuotaReport {
   last_error: string | null;
   message: string;
   quota_floor: CredentialQuotaFloorState;
+}
+
+// Relay tokens of one credential (or one Claude account) in a time range.
+// inputUnsplit: Claude prompt tokens logged before cache writes were recorded
+// separately; they are input and cache write together. cacheWrite is null for
+// providers without a cache-write class (Codex).
+export interface QuotaBurnTokens {
+  requests: number;
+  requestsWithoutTokens: number;
+  input: number;
+  cacheRead: number;
+  cacheWrite: number | null;
+  inputUnsplit: number;
+  output: number;
+  total: number;
+}
+
+// "insufficient": no ratio is given; reason says why. "rough": the ratio's
+// range is wider than ±20%. delta and deltaError are percentage points.
+export interface QuotaBurnEstimate {
+  status: "ok" | "rough" | "insufficient";
+  reason: string | null;
+  from: string | null;
+  to: string | null;
+  cycles: number;
+  usedFrom: number | null;
+  usedTo: number | null;
+  delta: number | null;
+  deltaError: number | null;
+  tokens: QuotaBurnTokens;
+  tokensPerPercent: number | null;
+  tokensPerPercentLow: number | null;
+  tokensPerPercentHigh: number | null;
+}
+
+export interface QuotaBurnWindow {
+  id: "5h" | "7d";
+  resetAt: string | null;
+  // Smallest step the provider reported, in percentage points.
+  resolution: number | null;
+  current: QuotaBurnEstimate;
+  recent: QuotaBurnEstimate;
+}
+
+export interface QuotaBurnReport {
+  provider: "claude" | "codex";
+  credential_id: string;
+  generated_at: string;
+  shared_credentials: number;
+  // API list-price ratios relative to input, used only for the "likely cost
+  // share" hint; subscription quota weights are not published.
+  price_weights: { input: number; cacheRead: number; cacheWrite: number | null; output: number };
+  windows: QuotaBurnWindow[];
 }
 
 // Routing skips a credential whose fresh remaining weekly quota is at or below the

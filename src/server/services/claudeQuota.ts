@@ -11,6 +11,7 @@ import {
   getClaudeQuotaCache, mergeClaudeQuotaObservations, ownsClaudeQuotaRefresh,
   type ClaudeQuotaObservation,
 } from "@/src/server/repositories/claudeQuota";
+import { recordQuotaSnapshots } from "@/src/server/repositories/quotaSnapshots";
 import {
   deriveClaudeQuotaStatus, ensureFreshClaudeCredential, getEffectiveClaudeUserAgent,
   parseClaudeRateLimitWindows, resolveClaudeCredentialProxy,
@@ -44,7 +45,18 @@ export function recordClaudeQuotaHeaders(credentialId: string, headers: Headers,
   }));
   if (!windows.length) return;
   const key = claudeQuotaAccountKey(credentialId);
-  if (key) mergeClaudeQuotaObservations(key, windows);
+  if (key) {
+    mergeClaudeQuotaObservations(key, windows);
+    recordClaudeQuotaSnapshots(key, windows, observedAt);
+  }
+}
+
+// Quota is per subscription account; duplicate imports share one history.
+function recordClaudeQuotaSnapshots(key: string, windows: ClaudeQuotaObservation[], observedAt: number) {
+  recordQuotaSnapshots("claude", key, (["5h", "7d"] as const).flatMap((id) => {
+    const window = windows.find((item) => item.id === `unified-${id}`);
+    return window ? [{ windowId: id, usedPercent: window.used_percent, resetAt: window.reset_at }] : [];
+  }), observedAt);
 }
 
 export async function getClaudeQuota(
@@ -116,6 +128,7 @@ async function refreshClaudeQuota(credential: ClaudeCredentialRecord, key: strin
       const { windows, extraUsageEnabled } = parseUsage(payload, observedAt);
       if (!ownsClaudeQuotaRefresh(key, owner) || claudeQuotaAccountKey(credential.id) !== key) return;
       mergeClaudeQuotaObservations(key, windows, { observedAt, extraUsageEnabled });
+      recordClaudeQuotaSnapshots(key, windows, observedAt);
       finishClaudeQuotaRefresh(key, owner, 0, Date.now() + FRESH_MS, null);
     } catch (error) {
       const failures = Math.min(lease.failures + 1, 10);

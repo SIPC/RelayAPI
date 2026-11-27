@@ -29,6 +29,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
+import { QuotaBurnPanel } from "@/components/quota-burn-panel";
 import { UpstreamCredentialsPanel } from "@/components/upstream-credentials-panel";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -3567,6 +3568,8 @@ function CredentialsSection({
                           />
                         </div>
                       </div>
+
+                      <QuotaBurnPanel provider="codex" credentialId={credential.id} />
                     </CardContent>
                     {refreshingAllQuotas && quotaLoading && (
                       <div className="absolute inset-0 z-10 flex items-center justify-center bg-card/70 backdrop-blur-[1px]">
@@ -4154,6 +4157,8 @@ function ClaudeCredentialsPanel({
                           />
                         </div>
                       </div>
+
+                      <QuotaBurnPanel provider="claude" credentialId={credential.id} />
                     </CardContent>
                     {refreshingAllQuotas && quotaLoading && (
                       <div className="absolute inset-0 z-10 flex items-center justify-center bg-card/70 backdrop-blur-[1px]">
