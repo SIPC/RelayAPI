@@ -352,6 +352,14 @@ for (const stream of [false, true]) {
     }
     assert.equal(log(channel).prompt_tokens, 10);
     assert.equal(log(channel).completion_tokens, 5);
+    // Large image sessions are slow in the upload, in Relay's payload work or upstream; each needs its own stage.
+    const detail = getLogDb().prepare("SELECT stage_timings_json FROM request_log_details WHERE request_log_id=?").get(log(channel).id);
+    const stages = JSON.parse(detail.stage_timings_json).map(stage => stage.name);
+    for (const name of ["read_request_body", "prepare_payload", "upstream_fetch"]) {
+      assert.equal(stages.filter(stage => stage === name).length, 1, "missing or repeated stage: " + name);
+    }
+    assert.ok(stages.indexOf("read_request_body") < stages.indexOf("prepare_payload"));
+    assert.ok(stages.indexOf("prepare_payload") < stages.indexOf("upstream_fetch"));
   });
 }
 test("Native Claude token counting keeps caller instructions in the counted payload", async () => {

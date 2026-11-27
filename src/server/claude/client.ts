@@ -62,7 +62,9 @@ export async function claudeFetch(
     throw new Error("Saved Claude credential does not contain access_token");
   }
   const claudeUserAgent = getEffectiveClaudeUserAgent(credential);
-  const prepared = prepareClaudeOAuthUpstreamPayload(cloneJsonObject(payload), {
+  // Rewriting, signing and serializing a 25 MB body blocks the event loop for about a second,
+  // so it gets its own stage: the log can then tell Relay's work from the upload and the upstream wait.
+  const prepare = () => prepareClaudeOAuthUpstreamPayload(cloneJsonObject(payload), {
     accessToken: credential.tokens.access_token,
     sourceHeaders: input.sourceHeaders,
     claudeUserAgent,
@@ -71,6 +73,7 @@ export async function claudeFetch(
     countTokens: input.upstreamPath === "/v1/messages/count_tokens",
     overage: claudeCredentialInOverage(credential.id),
   });
+  const prepared = input.timing ? input.timing.time("prepare_payload", "准备上游 Payload", prepare) : prepare();
   const upstreamPayload = prepared.payload;
   const proxy = resolveClaudeCredentialProxy({
     proxy: credential.proxy,

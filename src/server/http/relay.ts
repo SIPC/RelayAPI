@@ -2335,7 +2335,7 @@ async function handleClaudeNativeRequest(request: Request, countTokens: boolean)
   let payload: Record<string, unknown> | undefined;
   try {
     apiKey = authenticateRelayRequest(request);
-    payload = await readJsonObject(request);
+    payload = await timing.timeAsync("read_request_body", "读取请求 Body", () => readJsonObject(request));
     const model = stringValue(payload.model);
     if (!model) throw new HttpError(400, "missing_model", "A model is required");
     if (!Array.isArray(payload.messages) || payload.messages.length === 0) {
