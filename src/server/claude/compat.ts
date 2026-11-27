@@ -5,9 +5,11 @@ import {
   cloakClaudeRequest, isNativeClaudeCodeRequest, normalizeClaudeSampling,
   relocateClaudeCountSystem,
 } from "@/src/server/claude/wire";
+import {
+  countCacheControls, enforceCacheControlLimit, ensureCacheControl, MAX_CACHE_CONTROL_BLOCKS,
+} from "@/src/server/claude/cacheControl";
 
 const CLAUDE_CCH_SEED = BigInt("0x4d659218e32a3268");
-const MAX_CACHE_CONTROL_BLOCKS = 4;
 const BILLING_CCH_PATTERN = /\bcch=([0-9a-f]{5});/;
 
 export interface ClaudeOAuthPreparedPayload {
@@ -109,123 +111,6 @@ function extractAndRemoveBetas(payload: Record<string, unknown>) {
   return { payload, extraBetas };
 }
 
-function ensureCacheControl(payload: Record<string, unknown>) {
-  // A system breakpoint already includes all tools. Match CPA by spending
-  // that slot on conversation history instead of a redundant tools prefix.
-  const system = typeof payload.system === "string" ? payload.system.trim()
-    : (Array.isArray(payload.system) ? payload.system : [])
-      .some((block) => stringValue(recordValue(block)?.text));
-  if (!system) injectToolsCacheControl(payload);
-  injectSystemCacheControl(payload);
-  injectMessagesCacheControl(payload);
-  return payload;
-}
-
-function injectToolsCacheControl(payload: Record<string, unknown>) {
-  const tools = Array.isArray(payload.tools) ? payload.tools : [];
-  if (
-    tools.length === 0 ||
-    tools.some((tool) => recordValue(tool)?.cache_control !== undefined)
-  ) {
-    return;
-  }
-  const lastTool = recordValue(tools[tools.length - 1]);
-  if (lastTool) {
-    lastTool.cache_control = { type: "ephemeral" };
-  }
-}
-
-function injectSystemCacheControl(payload: Record<string, unknown>) {
-  if (payload.system === undefined) {
-    return;
-  }
-  if (typeof payload.system === "string") {
-    payload.system = [textBlock(payload.system, { type: "ephemeral" })];
-    return;
-  }
-  const system = Array.isArray(payload.system) ? payload.system : [];
-  if (
-    system.length === 0 ||
-    system.some((item) => recordValue(item)?.cache_control !== undefined)
-  ) {
-    return;
-  }
-  const lastSystem = recordValue(system[system.length - 1]);
-  if (lastSystem) {
-    lastSystem.cache_control = { type: "ephemeral" };
-  }
-}
-
-function injectMessagesCacheControl(payload: Record<string, unknown>) {
-  const messages = Array.isArray(payload.messages) ? payload.messages : [];
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const message = recordValue(messages[index]);
-    if (!message || !["user", "assistant"].includes(stringValue(message.role))) continue;
-    if (typeof message.content === "string") {
-      if (!message.content.trim()) continue;
-      message.content = [textBlock(message.content, { type: "ephemeral" })];
-      return;
-    }
-    if (!Array.isArray(message.content)) continue;
-    const parts = message.content;
-    const last = recordValue(parts[parts.length - 1]);
-    if (message.role === "assistant" && ["thinking", "redacted_thinking"].includes(stringValue(last?.type))) continue;
-    if (parts.some((part) => recordValue(part)?.cache_control)) return;
-    for (let block = parts.length - 1; block >= 0; block--) {
-      const part = recordValue(parts[block]);
-      if (!part || ["thinking", "redacted_thinking"].includes(stringValue(part.type))) continue;
-      if (part.type === "text" && !stringValue(part.text)) continue;
-      part.cache_control = { type: "ephemeral" };
-      return;
-    }
-  }
-}
-
-function enforceCacheControlLimit(
-  payload: Record<string, unknown>,
-  maxBlocks: number,
-) {
-  let excess = countCacheControls(payload) - maxBlocks;
-  if (excess <= 0) {
-    return payload;
-  }
-
-  const removeFromItems = (items: unknown[], preserveLast: boolean) => {
-    const cacheIndexes = items.flatMap((item, index) =>
-      recordValue(item)?.cache_control !== undefined ? [index] : [],
-    );
-    const preserved = preserveLast ? cacheIndexes.at(-1) : undefined;
-    for (const index of cacheIndexes) {
-      if (excess <= 0) {
-        return;
-      }
-      if (index === preserved) {
-        continue;
-      }
-      const item = recordValue(items[index]);
-      if (item) {
-        delete item.cache_control;
-        excess -= 1;
-      }
-    }
-  };
-
-  removeFromItems(Array.isArray(payload.system) ? payload.system : [], true);
-  removeFromItems(Array.isArray(payload.tools) ? payload.tools : [], true);
-
-  const messages = Array.isArray(payload.messages) ? payload.messages : [];
-  for (const message of messages) {
-    if (excess <= 0) {
-      break;
-    }
-    removeFromItems(messageContentParts(message), false);
-  }
-
-  removeFromItems(Array.isArray(payload.system) ? payload.system : [], false);
-  removeFromItems(Array.isArray(payload.tools) ? payload.tools : [], false);
-  return payload;
-}
-
 function normalizeCacheControlTTL(payload: Record<string, unknown>) {
   let seenFiveMinute = false;
   const process = (item: unknown) => {
@@ -257,30 +142,6 @@ function normalizeCacheControlTTL(payload: Record<string, unknown>) {
     }
   }
   return payload;
-}
-
-function countCacheControls(payload: Record<string, unknown>) {
-  // Automatic caching consumes a slot too, even without block-level markers.
-  let count = payload.cache_control !== undefined ? 1 : 0;
-  const countBlock = (item: unknown) => {
-    if (recordValue(item)?.cache_control !== undefined) {
-      count += 1;
-    }
-  };
-  for (const system of Array.isArray(payload.system) ? payload.system : []) {
-    countBlock(system);
-  }
-  for (const tool of Array.isArray(payload.tools) ? payload.tools : []) {
-    countBlock(tool);
-  }
-  for (const message of Array.isArray(payload.messages)
-    ? payload.messages
-    : []) {
-    for (const item of messageContentParts(message)) {
-      countBlock(item);
-    }
-  }
-  return count;
 }
 
 function sanitizeClaudeMessagesForClaudeUpstream(
@@ -377,14 +238,6 @@ function normalizeClaudeCCHInput(value: unknown): string {
   // CPA reproduces the native hash-view quirk: multiple trailing dispatch
   // members leave a comma after any retained members (this is not wire JSON).
   return "{" + kept.join(",") + (kept.length && trailingDispatch > 1 ? "," : "") + "}";
-}
-
-function textBlock(text: string, cacheControl?: Record<string, string>) {
-  return {
-    type: "text",
-    text,
-    ...(cacheControl ? { cache_control: cacheControl } : {}),
-  };
 }
 
 function cloneRecord(value: Record<string, unknown>) {

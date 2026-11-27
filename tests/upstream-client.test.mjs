@@ -134,6 +134,14 @@ test("OpenAI Chat usage and streaming parameters are not normalized or injected"
   assert.equal(results[0].forwardedHeaders, undefined);
 });
 
+// Default cache breakpoints are the only change to a native Messages body; undo them to compare the caller's own fields.
+const asCallerBody = (body) => {
+  const copy = JSON.parse(JSON.stringify(body, (key, value) => key === "cache_control" ? undefined : value));
+  const flat = (parts) => Array.isArray(parts) && parts.length === 1 && parts[0].type === "text" && Object.keys(parts[0]).length === 2 ? parts[0].text : parts;
+  if (copy.system) copy.system = flat(copy.system);
+  for (const message of copy.messages ?? []) message.content = flat(message.content);
+  return copy;
+};
 for (const operation of ["messages", "count_tokens"]) {
   test("Anthropic native " + operation + " bypasses OAuth preparation and max_tokens policy", async (t) => {
     const requests = mockFetch(t, Response.json(operation === "count_tokens" ? { input_tokens: 23 } : {
@@ -144,7 +152,9 @@ for (const operation of ["messages", "count_tokens"]) {
     const { response, results } = await forward(fixture({ provider: "anthropic", operation, request, payload, captureBody: true }));
     assert.equal(response.status, 200);
     assert.equal(requests[0].url, "http://mock.test/custom/prefix/v1/messages" + (operation === "count_tokens" ? "/count_tokens" : ""));
-    assert.deepEqual(JSON.parse(requests[0].body), payload);
+    assert.deepEqual(asCallerBody(JSON.parse(requests[0].body)), payload);
+    // Inference gets default breakpoints on the last cacheable blocks; a token-count estimate never writes a cache.
+    assert.equal(JSON.stringify(JSON.parse(requests[0].body)).includes("cache_control"), operation === "messages");
     assert.deepEqual(Object.fromEntries(requests[0].headers), {
       accept: "application/json", "anthropic-version": "2023-06-01",
       "content-type": "application/json", "x-api-key": key,
@@ -188,7 +198,8 @@ for (const operation of ["chat", "responses"]) {
       assert.equal(sent.tools[0].name, "bash");
       const serialized = JSON.stringify(sent);
       assert.ok(serialized.includes("CALLER_ONLY_SYSTEM"));
-      for (const forbidden of ["Claude Code", "cache_control", "billing", "user_id", "oauth"]) assert.ok(!serialized.includes(forbidden));
+      for (const forbidden of ["Claude Code", "billing", "user_id", "oauth"]) assert.ok(!serialized.includes(forbidden));
+      assert.ok(serialized.includes("cache_control"), "Converted requests get the same default breakpoints as OAuth");
       if (streaming) {
         assert.equal(results.length, 0);
         const output = await response.text();

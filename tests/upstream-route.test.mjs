@@ -37,6 +37,15 @@ const system = "CALLER_ONLY_SYSTEM: Keep the caller instructions unchanged.";
 const usage = { input_tokens: 7, output_tokens: 4, total_tokens: 11, input_tokens_details: { cached_tokens: 2 } };
 const chatUsage = { prompt_tokens: 7, completion_tokens: 4, total_tokens: 11, prompt_tokens_details: { cached_tokens: 2 } };
 const claudeUsage = { input_tokens: 5, output_tokens: 4, cache_creation_input_tokens: 2, cache_read_input_tokens: 3 };
+const withoutCacheControl = (value) => JSON.parse(JSON.stringify(value, (key, item) => key === "cache_control" ? undefined : item));
+// Default breakpoints turn a string system/message into one text block; undo that to compare the caller's own fields.
+const asCallerShape = (value) => {
+  const body = withoutCacheControl(value);
+  const flat = (parts) => Array.isArray(parts) && parts.length === 1 && parts[0].type === "text" && Object.keys(parts[0]).length === 2 ? parts[0].text : parts;
+  if (body.system) body.system = flat(body.system);
+  for (const message of body.messages ?? []) message.content = flat(message.content);
+  return body;
+};
 const event = (type, value = {}) => "event: " + type + "\ndata: " + JSON.stringify({ type, ...value }) + "\n\n";
 
 function responseHeaders(provider) {
@@ -537,7 +546,8 @@ for (const scenario of [{ operation: "messages", stream: false }, { operation: "
     else assert.equal((await response.json()).content[0].text, text);
     assert.equal(calls.length, 1);
     assert.equal(calls[0].path, "/custom/anthropic" + routes[scenario.operation][1]);
-    assert.deepEqual(calls[0].payload, payload);
+    // Default cache breakpoints are the only addition; every caller field is otherwise untouched.
+    assert.deepEqual(asCallerShape(calls[0].payload), payload);
     assertAuth(calls[0], fixture, scenario.stream ? "text/event-stream" : "application/json");
     assert.equal(calls[0].headers["anthropic-beta"], undefined, "Unknown caller betas are not forwarded to an API Key upstream");
     // count_tokens is an estimate, not actual inference usage or daily token consumption.
@@ -597,6 +607,137 @@ test("Anthropic API Key Messages builds Anthropic-Beta from the body and drops C
   assert.equal(calls[0].payload.betas, undefined, "Body betas are moved to the header");
 });
 
+// Where each outgoing cache breakpoint sits, in Anthropic's evaluation order (tools, system, messages),
+// as a path with its TTL. A top-level automatic marker is reported as "top".
+function breakpoints(body) {
+  const found = [];
+  const visit = (value, at) => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) return value.forEach((item, index) => visit(item, at + "." + index));
+    if (at && value.cache_control) found.push(at + ":" + (value.cache_control.ttl ?? "5m"));
+    for (const [key, child] of Object.entries(value)) if (key !== "cache_control") visit(child, at + "." + key);
+  };
+  for (const section of ["tools", "system", "messages"]) visit(body[section], section);
+  return [...(body.cache_control ? ["top:" + (body.cache_control.ttl ?? "5m")] : []), ...found];
+}
+function turns(count) {
+  const messages = [{ role: "user", content: [{ type: "text", text: "Initial question with enough distinct text" }] }];
+  for (let turn = 1; turn < count; turn++) {
+    messages.push({ role: "assistant", content: [{ type: "text", text: "Answer " + turn }] });
+    messages.push({ role: "user", content: [{ type: "text", text: "Question " + (turn + 1) }] });
+  }
+  return messages;
+}
+async function sendMessages(fixture, payload, headers = {}) {
+  const before = calls.length;
+  const response = await run(fixture, "messages", { max_tokens: 64, stream: true, ...payload }, headers);
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal(calls.length, before + 1);
+  return calls.at(-1);
+}
+
+test("Anthropic API Key Messages: default breakpoints follow OAuth placement, keep the prefix across turns and stay on the 5m pool", { timeout: 15000 }, async () => {
+  const fixture = setup("anthropic", { model: "claude-opus-5-5" });
+  const tools = [{ name: "lookup", input_schema: { type: "object" } }];
+  const base = { model: "claude-opus-5-5", system, tools };
+  const first = await sendMessages(fixture, { ...base, messages: turns(1) });
+  const second = await sendMessages(fixture, { ...base, messages: turns(2) });
+  const third = await sendMessages(fixture, { ...base, messages: turns(3) });
+  // A system breakpoint already covers the tools, so tools carry none (as CPA does); the last message moves with the conversation.
+  assert.deepEqual(breakpoints(first.payload), ["system.0:5m", "messages.0.content.0:5m"]);
+  assert.deepEqual(breakpoints(second.payload), ["system.0:5m", "messages.2.content.0:5m"]);
+  assert.deepEqual(breakpoints(third.payload), ["system.0:5m", "messages.4.content.0:5m"]);
+  // Bytes before the moving breakpoint are identical, so the earlier write stays readable.
+  const prefix = (call, count) => JSON.stringify([call.payload.tools, call.payload.system, call.payload.messages.slice(0, count).map(
+    (message) => ({ ...message, content: message.content.map((part) => withoutCacheControl(part)) }))]);
+  assert.equal(prefix(second, 1), prefix(first, 1));
+  assert.equal(prefix(third, 3), prefix(second, 3));
+  // No 1h TTL on an API Key channel unless a caller asks for it, so no extended-cache-ttl beta either.
+  for (const call of [first, second, third]) assert.ok(!JSON.stringify(call.payload).includes('"1h"') && !call.headers["anthropic-beta"]?.includes("extended-cache-ttl"));
+  // Identical requests stay byte-identical, so a retry does not fragment the cache.
+  const again = await sendMessages(fixture, { ...base, messages: turns(3) });
+  assert.equal(JSON.stringify(again.payload), JSON.stringify(third.payload));
+});
+
+for (const operation of ["chat", "responses"]) {
+  test("Anthropic API Key via " + operation + ": converted multi-turn requests get the same default breakpoints", { timeout: 15000 }, async () => {
+    const fixture = setup("anthropic", { model: "gateway-converted", channel: { capabilities: ["messages"] } });
+    const history = (count) => {
+      const items = [{ role: "user", content: "Initial question" }];
+      for (let turn = 1; turn < count; turn++) items.push({ role: "assistant", content: "Answer " + turn }, { role: "user", content: "Question " + (turn + 1) });
+      return items;
+    };
+    const send = async (count) => {
+      const payload = operation === "chat"
+        ? { model: fixture.model, stream: false, messages: [{ role: "system", content: system }, ...history(count)] }
+        : { model: fixture.model, stream: false, instructions: system, input: history(count) };
+      const response = await run(fixture, operation, payload);
+      assert.equal(response.status, 200);
+      await response.text();
+      return calls.at(-1);
+    };
+    const one = await send(1);
+    const two = await send(2);
+    const three = await send(3);
+    assert.deepEqual(breakpoints(one.payload), ["system.0:5m", "messages.0.content.0:5m"]);
+    assert.deepEqual(breakpoints(two.payload), ["system.0:5m", "messages.2.content.0:5m"]);
+    assert.deepEqual(breakpoints(three.payload), ["system.0:5m", "messages.4.content.0:5m"]);
+    assert.equal(JSON.stringify(three.payload.messages.slice(0, 3)).replaceAll(',"cache_control":{"type":"ephemeral"}', ""),
+      JSON.stringify(two.payload.messages.slice(0, 3)).replaceAll(',"cache_control":{"type":"ephemeral"}', ""));
+    for (const call of [one, two, three]) assert.equal(call.headers["anthropic-beta"], undefined, "A 5m breakpoint needs no beta");
+  });
+}
+
+test("Anthropic API Key Messages: caller cache_control is kept as written and no default breakpoint is added", { timeout: 15000 }, async () => {
+  const fixture = setup("anthropic", { model: "claude-opus-5-5" });
+  const messages = turns(3);
+  messages[0].content[0].cache_control = { type: "ephemeral", ttl: "1h" };
+  const call = await sendMessages(fixture, { model: "claude-opus-5-5", system, messages,
+    tools: [{ name: "lookup", input_schema: { type: "object" } }] });
+  assert.deepEqual(breakpoints(call.payload), ["messages.0.content.0:1h"], "Only the caller's marker, with its own TTL");
+  assert.equal(typeof call.payload.system, "string", "An untouched caller system string stays a string");
+  // A caller-owned 1h marker is the only thing that makes the extended TTL beta travel.
+  assert.deepEqual(call.headers["anthropic-beta"].split(","), ["extended-cache-ttl-2025-04-11"]);
+  // The explicit-mode flag is Relay-only and must not reach the upstream.
+  const explicit = await sendMessages(fixture, { model: "claude-opus-5-5", system, messages: turns(2), prompt_cache_options: { mode: "explicit" } });
+  assert.deepEqual(breakpoints(explicit.payload), []);
+  assert.equal(explicit.payload.prompt_cache_options, undefined);
+  // Top-level automatic caching is the caller's choice and also suppresses defaults.
+  const automatic = await sendMessages(fixture, { model: "claude-opus-5-5", system, messages: turns(2), cache_control: { type: "ephemeral" } });
+  assert.deepEqual(breakpoints(automatic.payload), ["top:5m"]);
+});
+
+test("Anthropic API Key Messages: more than four breakpoints are trimmed to four without rewriting the survivors", { timeout: 15000 }, async () => {
+  const fixture = setup("anthropic", { model: "claude-opus-5-5" });
+  const messages = turns(6);
+  const scoped = { type: "ephemeral", ttl: "1h" };
+  for (const index of [0, 2, 4, 6, 8, 10]) messages[index].content[0].cache_control = scoped;
+  const call = await sendMessages(fixture, { model: "claude-opus-5-5", system, messages });
+  const kept = breakpoints(call.payload);
+  assert.equal(kept.length, 4, "Anthropic allows at most four breakpoints");
+  assert.deepEqual(kept, ["messages.4.content.0:1h", "messages.6.content.0:1h", "messages.8.content.0:1h", "messages.10.content.0:1h"],
+    "The earliest markers go first; the ones closest to the end of the conversation survive untouched");
+  // Exactly four caller breakpoints are accepted as they are.
+  const exact = turns(4);
+  for (const index of [0, 2, 4, 6]) exact[index].content[0].cache_control = { type: "ephemeral" };
+  const same = await sendMessages(fixture, { model: "claude-opus-5-5", system, messages: exact });
+  assert.deepEqual(breakpoints(same.payload), ["messages.0.content.0:5m", "messages.2.content.0:5m", "messages.4.content.0:5m", "messages.6.content.0:5m"]);
+});
+
+test("Anthropic API Key Messages: a native Claude Code caller owns its breakpoints and count_tokens is never decorated", { timeout: 15000 }, async () => {
+  const fixture = setup("anthropic", { model: "claude-opus-5-5" });
+  const identity = { device_id: "a".repeat(64), account_uuid: "10000000-0000-4000-8000-000000000001", session_id: "20000000-0000-4000-8000-000000000002" };
+  const native = await sendMessages(fixture, { model: "claude-opus-5-5", system, messages: turns(2), metadata: { user_id: JSON.stringify(identity) } },
+    { "user-agent": "claude-cli/2.1.280 (external, cli)", "x-app": "cli", "anthropic-beta": "claude-code-20250219" });
+  assert.deepEqual(breakpoints(native.payload), [], "A confirmed native client writes its own markers");
+  const before = calls.length;
+  const response = await run(fixture, "count_tokens", { model: "claude-opus-5-5", system, messages: turns(2) });
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, before + 1);
+  assert.deepEqual(breakpoints(calls.at(-1).payload), []);
+});
+
 for (const operation of ["chat", "responses"]) for (const stream of [false, true]) {
   test("Anthropic via " + operation + " stream=" + stream + ": exact gateway(high) model converts without suffix-derived thinking, tool renaming or OAuth identity", { timeout: 15000 }, async () => {
     const fixture = setup("anthropic", { model: "gateway(high)", channel: { capabilities: ["messages"] } });
@@ -642,7 +783,7 @@ for (const operation of ["chat", "responses"]) for (const stream of [false, true
     assert.deepEqual(calls[0].payload.tools.map((tool) => tool.name), ["bash", "read_file"]);
     assert.ok(JSON.stringify(calls[0].payload.system).includes(system));
     const sent = JSON.stringify(calls[0].payload);
-    for (const forbidden of ["Claude Code", "user_id", "account_uuid", "device_id", "billing", "oauth", "cache_control"]) {
+    for (const forbidden of ["Claude Code", "user_id", "account_uuid", "device_id", "billing", "oauth"]) {
       assert.ok(!sent.includes(forbidden), "Do not inject OAuth " + forbidden);
     }
     assertLogged(fixture, [10, 4, 14, 3]);
@@ -726,7 +867,7 @@ for (const [provider, operation] of [
     assert.equal(calls[0].path, provider === "anthropic" && (operation === "chat" || operation === "responses")
       ? "/custom/anthropic/v1/messages" : "/custom/" + provider + routes[operation][1]);
     if (provider === "openai" || operation === "messages" || operation === "count_tokens") {
-      assert.deepEqual(calls[0].payload, payload, "The original request really contains the synthetic key before logging redaction");
+      assert.deepEqual(asCallerShape(calls[0].payload), payload, "The original request really contains the synthetic key before logging redaction");
     }
     assertAuth(calls[0], fixture, provider === "anthropic" && (operation === "chat" || operation === "responses")
       ? "text/event-stream" : "application/json");

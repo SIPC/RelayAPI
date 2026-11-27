@@ -9,7 +9,9 @@ import {
   createOpenAIResponsesStreamFromClaude,
 } from "@/src/server/claude/chat";
 import { HttpError } from "@/src/server/http/errors";
+import { isNativeClaudeCodeRequest } from "@/src/server/claude/wire";
 import { redactResponseText } from "@/src/server/upstream/redact";
+import { prepareAnthropicApiCacheControl } from "@/src/server/claude/cacheControl";
 import { prepareAnthropicApiPayload } from "@/src/server/upstream/anthropicBetas";
 import type { StageTimer } from "@/src/server/http/stageTimer";
 import type {
@@ -78,6 +80,9 @@ export async function forwardApiKeyRequest(input: {
   if (operation === "count_tokens" && !(payload instanceof FormData)) delete payload.stream;
   let anthropicBeta: string | undefined;
   if (credential.provider === "anthropic" && !(payload instanceof FormData)) {
+    // Default breakpoints come first so the beta derivation below sees the body that is sent.
+    if (operation !== "count_tokens") payload = prepareAnthropicApiCacheControl(payload, input.request.headers,
+      (body) => isNativeClaudeCodeRequest(input.request.headers, body));
     // Converted requests never carried the caller's header; only betas their body asks for.
     const prepared = prepareAnthropicApiPayload(payload, converted ? null : input.request.headers.get("anthropic-beta"));
     payload = prepared.payload;
