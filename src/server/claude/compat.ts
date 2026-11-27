@@ -1,4 +1,4 @@
-import "server-only";
+﻿import "server-only";
 
 import {
   alignClaudeBillingVersion, applyClaudeCredentialIdentity, applyClaudeModelOptions, claudePayloadHasOneHourCache, claudeSessionId,
@@ -287,118 +287,125 @@ function stringValue(value: unknown) {
       : "";
 }
 
-const MASK_64 = (BigInt(1) << BigInt(64)) - BigInt(1);
-const PRIME64_1 = BigInt("11400714785074694791");
-const PRIME64_2 = BigInt("14029467366897019727");
-const PRIME64_3 = BigInt("1609587929392839161");
-const PRIME64_4 = BigInt("9650029242287828579");
-const PRIME64_5 = BigInt("2870177450012600261");
+// xxHash64 on 32-bit halves. A BigInt version took seconds of event-loop time on the 25 MB bodies
+// Claude Code sends once a session carries images, stalling every other request on this process.
+const P1H = 0x9e3779b1, P1L = 0x85ebca87, P2H = 0xc2b2ae3d, P2L = 0x27d4eb4f, P3H = 0x165667b1, P3L = 0x9e3779f9;
+const P4H = 0x85ebca77, P4L = 0xc2b2ae63, P5H = 0x27d4eb2f, P5L = 0x165667c5, NEG_P1H = 0x61c8864e, NEG_P1L = 0x7a143579;
+// Every helper returns its 64-bit result in (rh, rl).
+let rh = 0, rl = 0;
+
+function mulHi32(a: number, b: number) {
+  const a0 = a & 0xffff, a1 = a >>> 16, b0 = b & 0xffff, b1 = b >>> 16;
+  return (a1 * b1 + Math.floor((a0 * b1 + a1 * b0 + ((a0 * b0) >>> 16)) / 65536)) >>> 0;
+}
+function mul(ah: number, al: number, bh: number, bl: number) {
+  rl = Math.imul(al, bl) >>> 0;
+  rh = (mulHi32(al, bl) + Math.imul(ah, bl) + Math.imul(al, bh)) >>> 0;
+}
+function add(ah: number, al: number, bh: number, bl: number) {
+  const low = al + bl;
+  rl = low >>> 0;
+  rh = (ah + bh + (low > 0xffffffff ? 1 : 0)) >>> 0;
+}
+function rotl(h: number, l: number, n: number) {
+  rh = ((h << n) | (l >>> (32 - n))) >>> 0;
+  rl = ((l << n) | (h >>> (32 - n))) >>> 0;
+}
+function round(ah: number, al: number, ih: number, il: number) {
+  mul(ih, il, P2H, P2L);
+  add(ah, al, rh, rl);
+  rotl(rh, rl, 31);
+  mul(rh, rl, P1H, P1L);
+}
+function mergeRound(ah: number, al: number, vh: number, vl: number) {
+  round(0, 0, vh, vl);
+  mul(ah ^ rh, al ^ rl, P1H, P1L);
+  add(rh, rl, P4H, P4L);
+}
 
 function xxHash64(buffer: Buffer, seed: bigint) {
+  const sh = Number(seed >> BigInt(32)) >>> 0;
+  const sl = Number(seed & BigInt(0xffffffff)) >>> 0;
+  const length = buffer.length;
   let offset = 0;
-  let hash: bigint;
+  let hh: number, hl: number;
 
-  if (buffer.length >= 32) {
-    let v1 = add64(add64(seed, PRIME64_1), PRIME64_2);
-    let v2 = add64(seed, PRIME64_2);
-    let v3 = seed & MASK_64;
-    let v4 = sub64(seed, PRIME64_1);
+  if (length >= 32) {
+    add(sh, sl, P1H, P1L);
+    add(rh, rl, P2H, P2L);
+    let v1h = rh, v1l = rl;
+    add(sh, sl, P2H, P2L);
+    let v2h = rh, v2l = rl;
+    let v3h = sh, v3l = sl;
+    add(sh, sl, NEG_P1H, NEG_P1L);
+    let v4h = rh, v4l = rl;
 
-    const limit = buffer.length - 32;
+    const limit = length - 32;
     while (offset <= limit) {
-      v1 = xxHashRound(v1, readUInt64LE(buffer, offset));
-      offset += 8;
-      v2 = xxHashRound(v2, readUInt64LE(buffer, offset));
-      offset += 8;
-      v3 = xxHashRound(v3, readUInt64LE(buffer, offset));
-      offset += 8;
-      v4 = xxHashRound(v4, readUInt64LE(buffer, offset));
-      offset += 8;
+      round(v1h, v1l, buffer.readUInt32LE(offset + 4), buffer.readUInt32LE(offset));
+      v1h = rh; v1l = rl;
+      round(v2h, v2l, buffer.readUInt32LE(offset + 12), buffer.readUInt32LE(offset + 8));
+      v2h = rh; v2l = rl;
+      round(v3h, v3l, buffer.readUInt32LE(offset + 20), buffer.readUInt32LE(offset + 16));
+      v3h = rh; v3l = rl;
+      round(v4h, v4l, buffer.readUInt32LE(offset + 28), buffer.readUInt32LE(offset + 24));
+      v4h = rh; v4l = rl;
+      offset += 32;
     }
 
-    hash = add64(
-      add64(rotl64(v1, 1), rotl64(v2, 7)),
-      add64(rotl64(v3, 12), rotl64(v4, 18)),
-    );
-    hash = xxHashMergeRound(hash, v1);
-    hash = xxHashMergeRound(hash, v2);
-    hash = xxHashMergeRound(hash, v3);
-    hash = xxHashMergeRound(hash, v4);
+    rotl(v1h, v1l, 1);
+    let ah = rh, al = rl;
+    rotl(v2h, v2l, 7);
+    add(ah, al, rh, rl);
+    ah = rh; al = rl;
+    rotl(v3h, v3l, 12);
+    add(ah, al, rh, rl);
+    ah = rh; al = rl;
+    rotl(v4h, v4l, 18);
+    add(ah, al, rh, rl);
+    mergeRound(rh, rl, v1h, v1l);
+    mergeRound(rh, rl, v2h, v2l);
+    mergeRound(rh, rl, v3h, v3l);
+    mergeRound(rh, rl, v4h, v4l);
+    hh = rh; hl = rl;
   } else {
-    hash = add64(seed, PRIME64_5);
+    add(sh, sl, P5H, P5L);
+    hh = rh; hl = rl;
   }
 
-  hash = add64(hash, BigInt(buffer.length));
+  add(hh, hl, 0, length >>> 0);
+  hh = rh; hl = rl;
 
-  while (offset + 8 <= buffer.length) {
-    const k1 = xxHashRound(BigInt(0), readUInt64LE(buffer, offset));
-    hash = xor64(hash, k1);
-    hash = add64(mul64(rotl64(hash, 27), PRIME64_1), PRIME64_4);
+  while (offset + 8 <= length) {
+    round(0, 0, buffer.readUInt32LE(offset + 4), buffer.readUInt32LE(offset));
+    rotl(hh ^ rh, hl ^ rl, 27);
+    mul(rh, rl, P1H, P1L);
+    add(rh, rl, P4H, P4L);
+    hh = rh; hl = rl;
     offset += 8;
   }
 
-  if (offset + 4 <= buffer.length) {
-    hash = xor64(hash, mul64(BigInt(buffer.readUInt32LE(offset)), PRIME64_1));
-    hash = add64(mul64(rotl64(hash, 23), PRIME64_2), PRIME64_3);
+  if (offset + 4 <= length) {
+    mul(0, buffer.readUInt32LE(offset), P1H, P1L);
+    rotl(hh ^ rh, hl ^ rl, 23);
+    mul(rh, rl, P2H, P2L);
+    add(rh, rl, P3H, P3L);
+    hh = rh; hl = rl;
     offset += 4;
   }
 
-  while (offset < buffer.length) {
-    hash = xor64(hash, mul64(BigInt(buffer[offset]), PRIME64_5));
-    hash = mul64(rotl64(hash, 11), PRIME64_1);
+  while (offset < length) {
+    mul(0, buffer[offset], P5H, P5L);
+    rotl(hh ^ rh, hl ^ rl, 11);
+    mul(rh, rl, P1H, P1L);
+    hh = rh; hl = rl;
     offset += 1;
   }
 
-  hash = xor64(hash, hash >> BigInt(33));
-  hash = mul64(hash, PRIME64_2);
-  hash = xor64(hash, hash >> BigInt(29));
-  hash = mul64(hash, PRIME64_3);
-  hash = xor64(hash, hash >> BigInt(32));
-  return hash & MASK_64;
-}
-
-function xxHashRound(acc: bigint, input: bigint) {
-  acc = add64(acc, mul64(input, PRIME64_2));
-  acc = rotl64(acc, 31);
-  acc = mul64(acc, PRIME64_1);
-  return acc;
-}
-
-function xxHashMergeRound(acc: bigint, value: bigint) {
-  acc = xor64(acc, xxHashRound(BigInt(0), value));
-  return add64(mul64(acc, PRIME64_1), PRIME64_4);
-}
-
-function readUInt64LE(buffer: Buffer, offset: number) {
-  return (
-    BigInt(buffer[offset]) |
-    (BigInt(buffer[offset + 1]) << BigInt(8)) |
-    (BigInt(buffer[offset + 2]) << BigInt(16)) |
-    (BigInt(buffer[offset + 3]) << BigInt(24)) |
-    (BigInt(buffer[offset + 4]) << BigInt(32)) |
-    (BigInt(buffer[offset + 5]) << BigInt(40)) |
-    (BigInt(buffer[offset + 6]) << BigInt(48)) |
-    (BigInt(buffer[offset + 7]) << BigInt(56))
-  );
-}
-
-function rotl64(value: bigint, shift: number) {
-  const bits = BigInt(shift);
-  return ((value << bits) | (value >> (BigInt(64) - bits))) & MASK_64;
-}
-
-function add64(left: bigint, right: bigint) {
-  return (left + right) & MASK_64;
-}
-
-function sub64(left: bigint, right: bigint) {
-  return (left - right) & MASK_64;
-}
-
-function mul64(left: bigint, right: bigint) {
-  return (left * right) & MASK_64;
-}
-
-function xor64(left: bigint, right: bigint) {
-  return (left ^ right) & MASK_64;
+  // h ^= h >> 33; h *= P2; h ^= h >> 29; h *= P3; h ^= h >> 32
+  mul(hh, hl ^ (hh >>> 1), P2H, P2L);
+  mul(rh ^ (rh >>> 29), rl ^ (((rh << 3) | (rl >>> 29)) >>> 0), P3H, P3L);
+  const high = (rh >>> 0);
+  const low = (rl ^ rh) >>> 0;
+  return (BigInt(high) << BigInt(32)) | BigInt(low);
 }

@@ -73,6 +73,22 @@ test("Claude CCH matches CPA recursive normalization and trailing-dispatch golde
   }
 });
 
+test("Claude CCH stays identical across xxHash64 tail and stripe boundaries", () => {
+  // Expected values come from the original BigInt xxHash64, one per body length class
+  // (<32 bytes, the 32-byte stripe loop, and the 8/4/1-byte tails), including multibyte text.
+  const expected = new Map([
+    [0, "31a0d"], [1, "2091a"], [2, "d94c2"], [3, "eb855"], [4, "2043e"], [5, "a7ab2"], [7, "88532"],
+    [8, "27eaa"], [9, "5568b"], [12, "db987"], [15, "26002"], [16, "e1be5"], [31, "4447e"], [32, "b0e1c"],
+    [33, "79cca"], [63, "a4f1a"], [100, "637f9"], [1000, "5312c"], [100000, "96b09"],
+  ]);
+  for (const [pad, want] of expected) {
+    const payload = nativePayload();
+    payload.model = "claude-opus-5-5";
+    payload.messages = [{ role: "user", content: [{ type: "text", text: "q".repeat(pad) + "\u00e9\u20ac" }] }];
+    assert.equal(cch(prepare(payload, nativeContext)), want, "padding " + pad);
+  }
+});
+
 test("Claude default cache layout preserves the first-user anchor with tools and a growing tail", () => {
   const original = conversation();
   const first = prepare(original, context);
