@@ -1,9 +1,9 @@
 import "server-only";
 
 import {
-  alignClaudeBillingVersion, applyClaudeCredentialIdentity, applyClaudeModelOptions, claudeSessionId,
-  cloakClaudeRequest, isNativeClaudeCodeRequest, normalizeClaudeSampling,
-  relocateClaudeCountSystem,
+  alignClaudeBillingVersion, applyClaudeCredentialIdentity, applyClaudeModelOptions, claudePayloadHasOneHourCache, claudeSessionId,
+  cloakClaudeRequest, isClaudeProbeOrHelperRequest, isClaudeSubagentRequest,
+  isNativeClaudeCodeRequest, normalizeClaudeSampling, relocateClaudeCountSystem,
 } from "@/src/server/claude/wire";
 import {
   countCacheControls, enforceCacheControlLimit, ensureCacheControl, MAX_CACHE_CONTROL_BLOCKS,
@@ -56,9 +56,14 @@ export function prepareClaudeOAuthUpstreamPayload(
   payload = enforceCacheControlLimit(payload, MAX_CACHE_CONTROL_BLOCKS);
   if (!native && !explicitCache) {
     if (!input.countTokens) {
-      // Claude Code 2.1.332 keeps the 1h pool for subscriber main turns and falls back to 5m on overage.
-      const ttl = claudeCacheTtlFor({ subscriber: true, overage: Boolean(input.overage), shortLane: false });
-      walkCacheControls(payload, (control) => { if (!control.ttl && ttl === "1h") control.ttl = "1h"; });
+      // Native Claude Code keeps probes, title helpers and subagents on the
+      // default 5m pool; only main-agent turns use the 1h pool. A 1h write
+      // costs 2x base input versus 1.25x for 5m, and helpers never reuse it.
+      const ttl = claudeCacheTtlFor({ subscriber: true, overage: Boolean(input.overage),
+        shortLane: shouldUseShortCache(inputPayload, input.sourceHeaders) });
+      walkCacheControls(payload, (control) => {
+        if (!control.ttl && ttl === "1h") control.ttl = "1h";
+      });
     }
     payload = normalizeCacheControlTTL(payload);
   }
@@ -84,6 +89,17 @@ function walkCacheControls(value: unknown, visit: (control: Record<string, unkno
   const control = recordValue(item.cache_control);
   if (control) visit(control);
   for (const [key, child] of Object.entries(item)) if (key !== "cache_control") walkCacheControls(child, visit);
+}
+
+// Probes, title helpers and subagents get the default 5m pool; everything else
+// gets 1h. A subagent that already asked for 1h (its own marker or the caller's
+// beta) keeps it, matching native Claude Code.
+function shouldUseShortCache(original: Record<string, unknown>, headers: Headers) {
+  if (isClaudeProbeOrHelperRequest(original)) return true;
+  if (!isClaudeSubagentRequest(headers, original)) return false;
+  if (claudePayloadHasOneHourCache(original)) return false;
+  return !(headers.get("anthropic-beta") || "")
+    .split(",").some((beta) => beta.trim() === "extended-cache-ttl-2025-04-11");
 }
 
 function disableThinkingIfToolChoiceForced(payload: Record<string, unknown>) {

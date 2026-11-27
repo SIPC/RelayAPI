@@ -27,6 +27,13 @@ function intEnv(name: string, fallback: number) {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+function listEnv(name: string) {
+  return (process.env[name] || "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
+
 function ensureLocalSecret(dataDir: string) {
   const secretPath = path.join(dataDir, ".relay-encryption-key");
   fs.mkdirSync(dataDir, { recursive: true });
@@ -135,6 +142,13 @@ export const serverConfig = {
     process.env.CLAUDE_BASE_URL || "https://api.anthropic.com"
   ).replace(/\/+$/, ""),
   claudeDefaultModel: process.env.CLAUDE_DEFAULT_MODEL || "claude-sonnet-4-5",
+  // Extra Claude Code entrypoint labels treated as native, mirroring CPA's
+  // header-defaults.native-entrypoints. Comma-separated, case-insensitive.
+  claudeNativeEntrypoints: listEnv("CLAUDE_NATIVE_ENTRYPOINTS"),
+  // How long a conversation stays bound to one upstream account. Deliberately
+  // independent of the prompt-cache TTL: a short 5m cache must not move a
+  // running session to another account (cold cache) after a brief pause.
+  claudeSessionAffinityTtlMs: intEnv("CLAUDE_SESSION_AFFINITY_TTL_MS", 3_600_000),
   claudeUserAgent:
     process.env.CLAUDE_USER_AGENT || "claude-cli/2.1.332 (external, cli)",
   claudeStainlessPackageVersion:

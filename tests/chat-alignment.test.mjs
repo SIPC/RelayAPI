@@ -225,3 +225,45 @@ test("Claude Responses forwards parallel tool control and text.format", () => {
   assert.equal(payload.tool_choice.disable_parallel_tool_use, true);
   assert.ok(prepare(payload).body.includes("Schema Name: answer"));
 });
+test("CC cache pool: main turns keep 1h while probes, title helpers and subagents use 5m", () => {
+  const titleHelper = cc({ messages: [
+    { role: "system", content: "Return a short title for this coding session." },
+    { role: "user", content: "Hello" }],
+    output_config: { format: { type: "json_schema", schema: { properties: { title: { type: "string" } } } } } });
+  const invocations = [
+    ["main", cc(), new Headers()],
+    ["probe", { model: "claude-sonnet-4-5", max_tokens: 1, messages: [{ role: "user", content: "quota" }] }, new Headers()],
+    ["title", titleHelper, new Headers()],
+    ["subagent", cc(), new Headers({ "x-claude-code-agent-id": "agent-1" })],
+  ];
+  for (const [name, payload, headers] of invocations) {
+    const result = prepare(payload, { sourceHeaders: headers });
+    const ttls = cacheControls(result.payload).map((control) => control.ttl);
+    if (name === "main") assert.ok(ttls.length > 0 && ttls.every((ttl) => ttl === "1h"), name);
+    else assert.ok(ttls.length > 0 && ttls.every((ttl) => ttl === undefined), name + " must stay on the 5m pool");
+    // Only a payload that really carries a 1h marker may advertise the 1h pool.
+    assert.equal(claudeBetas(result.payload, null, [], false).split(",").includes("extended-cache-ttl-2025-04-11"),
+      name === "main", name);
+  }
+});
+test("CC cache pool: a subagent that asks for 1h keeps it", () => {
+  const payload = cc();
+  payload.system[0] = { ...payload.system[0], cache_control: { type: "ephemeral", ttl: "1h" } };
+  const result = prepare(payload, { sourceHeaders: new Headers({ "x-claude-code-agent-id": "agent-1" }) });
+  assert.ok(cacheControls(result.payload).every((control) => control.ttl === "1h"));
+});
+test("CC native detection accepts the background lane and a stripped UA suffix", () => {
+  const sessionId = "30000000-0000-4000-8000-000000000003";
+  const payload = () => ({ model: "claude-sonnet-4-6", system: "S", max_tokens: 10,
+    metadata: { user_id: JSON.stringify({ device_id: "ef".repeat(32), account_uuid: accountId, session_id: sessionId }) },
+    messages: [{ role: "user", content: "Hi" }] });
+  const native = (overrides) => prepare(payload(), { sourceHeaders: new Headers({
+    "user-agent": "claude-cli/2.1.332 (external, cli)", "x-app": "cli",
+    "anthropic-beta": "claude-code-20250219", ...overrides }) }).native;
+  assert.equal(native({}), true);
+  assert.equal(native({ "x-app": "cli-bg" }), true, "the subagent lane must stay native");
+  assert.equal(native({ "user-agent": "claude-cli/2.1.280" }), true, "a stripped entrypoint is still the CLI");
+  assert.equal(native({ "user-agent": "claude-cli/2.1.280 (external, sdk-py)" }), false);
+  assert.equal(native({ "x-app": "web" }), false);
+  assert.equal(native({ "anthropic-beta": "" }), false);
+});

@@ -1,5 +1,6 @@
 import "server-only";
 import crypto from "node:crypto";
+import { serverConfig } from "@/src/server/config/env";
 import { HttpError } from "@/src/server/http/errors";
 import { parseClaudeModelSuffixes } from "@/src/server/claude/modelSuffix";
 import { CLAUDE_MODEL_POLICIES } from "@/src/server/claude/modelPolicies";
@@ -8,6 +9,13 @@ import { anthropicBodyBetas, requestedAnthropicBetas } from "@/src/server/upstre
 type RecordValue = Record<string, unknown>;
 export const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Claude Code's own entrypoint labels. Forks opt in through
+// CLAUDE_NATIVE_ENTRYPOINTS, as CPA does with native-entrypoints.
+const NATIVE_CLAUDE_ENTRYPOINTS = new Set(["cli", "sdk-cli", "sdk-ts", "claude-vscode"]);
+const CLAUDE_CLI_USER_AGENT = /^claude-cli\/\d+(?:\.\d+)*(?:\s*\(external,\s*([^,)]+))?/i;
+const TITLE_HELPER_MARKERS = [
+  "Return a short title", "naming a coding session", "Write the title in the predominant language",
+];
 const dates = new Map<string, { date: string; expires: number }>();
 const budgetByEffort: Record<string, number> = {
   none: 0, auto: -1, minimal: 512, low: 1024, medium: 8192,
@@ -43,14 +51,32 @@ function userIdentity(payload: RecordValue) {
   }
 }
 export function isNativeClaudeCodeRequest(headers: Headers, payload: RecordValue, countTokens = false) {
-  const ua = headers.get("user-agent") || "";
-  const entrypoint = /^claude-cli\/\d+\.\d+\.\d+ \(external,\s*([^,)]+)/i.exec(ua)?.[1];
+  const match = CLAUDE_CLI_USER_AGENT.exec(headers.get("user-agent") || "");
+  if (!match) return false;
+  // "claude-cli/<version>" already identifies the CLI, so a stripped
+  // "(external, <label>)" suffix means a wrapper rewrote the UA, not that the
+  // client stopped being Claude Code.
+  const entrypoint = match[1]?.trim().toLowerCase() || "cli";
   const identity = userIdentity(payload);
-  return Boolean(entrypoint && ["cli", "sdk-cli", "sdk-ts", "claude-vscode"].includes(entrypoint)
-    && headers.get("x-app") === "cli"
-    && (headers.get("anthropic-beta") || "").split(",").some((beta) => beta.trim() === "claude-code-20250219")
+  return Boolean(isNativeClaudeEntrypoint(entrypoint)
+    && isNativeClaudeXApp(headers.get("x-app"))
+    && hasClaudeCodeBeta(headers)
     && (countTokens || (identity && /^[a-f0-9]{64}$/i.test(text(identity.device_id))
       && UUID.test(text(identity.account_uuid)) && UUID.test(text(identity.session_id)))));
+}
+function isNativeClaudeEntrypoint(entrypoint: string) {
+  return NATIVE_CLAUDE_ENTRYPOINTS.has(entrypoint) || serverConfig.claudeNativeEntrypoints.includes(entrypoint);
+}
+// Native clients send "cli"; subagents and background helpers send "cli-bg".
+// Accepting only "cli" made every cli-bg turn look foreign and get cloaked,
+// which rewrote its system prompt and cache layout.
+function isNativeClaudeXApp(value: string | null) {
+  const normalized = (value || "").trim().toLowerCase();
+  return normalized === "cli" || normalized === "cli-bg";
+}
+function hasClaudeCodeBeta(headers: Headers) {
+  return (headers.get("anthropic-beta") || "")
+    .split(",").some((beta) => beta.trim() === "claude-code-20250219");
 }
 export function stableUuid(seed: string) {
   const hash = crypto.createHash("sha1").update(seed).digest();
@@ -102,6 +128,87 @@ export function claudeCacheTtlMs(payload: RecordValue) {
   }
   visit(payload);
   return ttl || 3600000;
+}
+// Account affinity must outlive the prompt cache it protects, and it must never
+// be as short as the cache TTL: a 5m marker used to expire the binding after a
+// five-minute pause, so the next turn landed on a different account with a cold
+// cache and rewrote the whole context.
+export function claudeSessionAffinityTtlMs(payload: RecordValue) {
+  return Math.max(claudeCacheTtlMs(payload), serverConfig.claudeSessionAffinityTtlMs);
+}
+// A caller that already wrote a 1h marker opted into the 1h pool itself.
+export function claudePayloadHasOneHourCache(payload: RecordValue) {
+  return hasOneHourMarker(payload);
+}
+function hasOneHourMarker(value: unknown, depth = 0): boolean {
+  if (depth > 12 || !value || typeof value !== "object") return false;
+  if (Array.isArray(value)) return value.some((child) => hasOneHourMarker(child, depth + 1));
+  const item = value as RecordValue;
+  if (text(record(item.cache_control)?.ttl) === "1h") return true;
+  return Object.values(item).some((child) => hasOneHourMarker(child, depth + 1));
+}
+// Subagent signals, as CPA reads them: agent headers, a parent session in the
+// caller identity, or the cc_is_subagent billing marker.
+export function isClaudeSubagentRequest(headers: Headers, payload: RecordValue) {
+  for (const name of ["x-claude-code-agent-id", "x-claude-code-parent-agent-id"]) {
+    if ((headers.get(name) || "").trim()) return true;
+  }
+  if (text(record(payload.metadata)?.user_id).includes("parent_session_id")) return true;
+  const system = payload.system;
+  const first = typeof system === "string" ? system
+    : text(record(Array.isArray(system) ? system[0] : null)?.text);
+  return first.includes("cc_is_subagent=true");
+}
+// Probes and Claude Code's session-title helper write a tiny cache entry, so
+// they belong in the 5m pool instead of paying 2x for a 1h write.
+export function isClaudeProbeOrHelperRequest(payload: RecordValue) {
+  if (isClaudeProbeRequest(payload)) return true;
+  const outputConfig = record(payload.output_config);
+  const properties = record(record(record(outputConfig?.format)?.schema)?.properties);
+  const markers = [...systemTexts(payload), ...roleTexts(payload, "system")];
+  const matched = [...markers, ...(properties ? roleTexts(payload) : [])]
+    .some(matchesTitleHelper);
+  if (properties) return Boolean(properties.title) && Object.keys(properties).length === 1 && matched;
+  return markers.some(matchesTitleHelper);
+}
+function isClaudeProbeRequest(payload: RecordValue) {
+  const maxTokens = payload.max_tokens;
+  if (typeof maxTokens !== "number" || maxTokens !== 1) return false;
+  const tools = Array.isArray(payload.tools) ? payload.tools : [];
+  if (tools.length > 0) return false;
+  const messages = Array.isArray(payload.messages) ? payload.messages : [];
+  if (messages.length === 0) return true;
+  if (messages.length !== 1) return false;
+  const message = record(messages[0]);
+  if (!message || text(message.role) !== "user") return false;
+  const probes = ["quota", "test", ".", "probe"];
+  const content = message.content;
+  if (typeof content === "string") return probes.includes(content.trim());
+  if (!Array.isArray(content)) return false;
+  const texts = content.map((part) => text(record(part)?.text)).filter(Boolean);
+  return texts.length === 1 && probes.includes(texts[0]);
+}
+function matchesTitleHelper(value: string) {
+  return TITLE_HELPER_MARKERS.some((marker) => value.includes(marker));
+}
+function systemTexts(payload: RecordValue) {
+  const system = payload.system;
+  if (typeof system === "string") return system.trim() ? [system] : [];
+  if (!Array.isArray(system)) return [];
+  return system.map((part) => text(record(part)?.text)).filter(Boolean);
+}
+function roleTexts(payload: RecordValue, role?: string) {
+  const messages = Array.isArray(payload.messages) ? payload.messages : [];
+  const out: string[] = [];
+  for (const raw of messages) {
+    const message = record(raw);
+    if (!message || (role && text(message.role) !== role)) continue;
+    const content = message.content;
+    if (typeof content === "string") { if (content.trim()) out.push(content); continue; }
+    if (!Array.isArray(content)) continue;
+    for (const part of content) out.push(text(record(part)?.text));
+  }
+  return out.filter(Boolean);
 }
 export function applyClaudeCredentialIdentity(
   payload: RecordValue,

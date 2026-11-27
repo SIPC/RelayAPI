@@ -823,16 +823,20 @@ test("Claude affinity: independent Node workers atomically reserve one account f
   await Promise.all(exited);
 });
 
-for (const ttl of ["5m", "1h", "unknown"]) test("Claude affinity: sliding " + ttl + " TTL expires at its boundary, not on token counting", async (t) => {
+test("Claude affinity: bindings outlive the prompt cache and expire at the affinity window, not on token counting", async (t) => {
   const pair = await claudePair();
   const start = Date.now();
   let now = start;
   t.mock.method(Date, "now", () => now);
-  const duration = ttl === "5m" ? 300000 : 3600000;
-  const cache = ttl === "unknown" ? {} : { prompt_cache_options: { mode: "explicit" },
-    system: [{ type: "text", text: "Cache prefix", cache_control: { type: "ephemeral", ttl } }] };
+  // A 5m marker no longer ends the binding: the window is the affinity floor,
+  // so a short pause keeps the conversation on its warm account.
+  const duration = 3600000;
+  const cache = { prompt_cache_options: { mode: "explicit" },
+    system: [{ type: "text", text: "Cache prefix", cache_control: { type: "ephemeral", ttl: "5m" } }] };
   await affinityRequest(pair, cache);
   updateClaudeCredential(pair.second, { priority: 999 });
+  now = start + 300000;
+  assert.equal((await affinityRequest(pair, cache)).account, pair.id, "a 5m cache must not move the session");
   now = start + duration - 1000;
   assert.equal((await affinityRequest(pair, cache)).account, pair.id);
   now = start + duration + 1000;
@@ -845,7 +849,7 @@ for (const ttl of ["5m", "1h", "unknown"]) test("Claude affinity: sliding " + tt
   assert.equal(affinitySelection(pair, cache).credential.id, pair.second);
 });
 
-test("Claude affinity: a five-minute helper cannot shorten a confirmed one-hour binding", async (t) => {
+test("Claude affinity: a five-minute helper cannot shorten a one-hour binding", async (t) => {
   const pair = await claudePair();
   let now = Date.now();
   const start = now;
@@ -858,6 +862,9 @@ test("Claude affinity: a five-minute helper cannot shorten a confirmed one-hour 
   cache.system[0].cache_control.ttl = "5m";
   await affinityRequest(pair, cache);
   now = start + 3600000 - 1;
+  assert.equal(affinitySelection(pair, cache).credential.id, pair.id);
+  // The 5m helper slid the window forward from its own start, not backward.
+  now = start + 60000 + 3600000 - 1;
   assert.equal(affinitySelection(pair, cache).credential.id, pair.id);
   now += 1;
   assert.equal(affinitySelection(pair, cache).credential.id, pair.second);
@@ -895,7 +902,7 @@ test("Claude affinity: client validation and upstream 400 neither migrate nor ex
   mode = "reject";
   assert.equal((await affinityRequest(pair, cache, handleClaudeMessages, {}, 400)).account, pair.id);
   assert.equal(affinitySelection(pair, cache).credential.id, pair.id);
-  now = start + 300000;
+  now = start + 3600000;
   assert.equal(affinitySelection(pair, cache).credential.id, pair.second);
 });
 

@@ -4,7 +4,7 @@ import { withAccountQuotaHeaders } from "@/src/server/http/accountQuota";
 import { recordClaudeQuotaHeaders } from "@/src/server/services/claudeQuota";
 
 import crypto from "node:crypto";
-import { claudeBetas, claudeCacheTtlMs } from "@/src/server/claude/wire";
+import { claudeBetas, claudeSessionAffinityTtlMs } from "@/src/server/claude/wire";
 import { claudeChannelSession } from "@/src/server/services/channels";
 import { prepareClaudeOAuthUpstreamPayload } from "@/src/server/claude/compat";
 import { claudeCredentialInOverage, recordClaudeOverage } from "@/src/server/claude/cacheTtl";
@@ -89,7 +89,7 @@ export async function claudeFetch(
   });
   const session = input.channel && claudeChannelSession(input.channel);
   if (session) {
-    session.ttlMs = claudeCacheTtlMs(upstreamPayload);
+    session.ttlMs = claudeSessionAffinityTtlMs(upstreamPayload);
     session.startedAt = Date.now();
     session.upstreamStarted = true;
   }

@@ -13,7 +13,7 @@ import type {
   UpstreamOperation,
 } from "@/src/shared/types/entities";
 import { claudeModelAllowlistCandidates, stripClaudeModelSuffixes } from "@/src/server/claude/modelSuffix";
-import { claudeCacheTtlMs, claudeSessionId } from "@/src/server/claude/wire";
+import { claudeSessionAffinityTtlMs, claudeSessionId } from "@/src/server/claude/wire";
 import { isClaudeModel } from "@/src/server/claude/chat";
 import { isCodexImageModel } from "@/src/server/codex/imageModels";
 import {
@@ -344,7 +344,7 @@ export function selectChannelForRequest(input: {
     .map((channel) => [channel.id, channel.baseUrl]).sort((a, b) => a[0].localeCompare(b[0]));
   const key = sha256(JSON.stringify([input.apiKey.id, "claude", domain,
     stripClaudeModelSuffixes(input.model), sessionId]));
-  const ttlMs = claudeCacheTtlMs(input.request.payload);
+  const ttlMs = claudeSessionAffinityTtlMs(input.request.payload);
   const { selected, binding } = reserveSessionBinding(key, ttlMs,
     (previous) => selectRequestChannel(input, previous));
   if (binding) claudeSessions.set(selected.channel, {
