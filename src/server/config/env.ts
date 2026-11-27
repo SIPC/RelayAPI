@@ -136,9 +136,9 @@ export const serverConfig = {
   ).replace(/\/+$/, ""),
   claudeDefaultModel: process.env.CLAUDE_DEFAULT_MODEL || "claude-sonnet-4-5",
   claudeUserAgent:
-    process.env.CLAUDE_USER_AGENT || "claude-cli/2.1.280 (external, cli)",
+    process.env.CLAUDE_USER_AGENT || "claude-cli/2.1.332 (external, cli)",
   claudeStainlessPackageVersion:
-    process.env.CLAUDE_STAINLESS_PACKAGE_VERSION || "0.112.1",
+    process.env.CLAUDE_STAINLESS_PACKAGE_VERSION || "0.128.0",
   claudeStainlessRuntimeVersion:
     process.env.CLAUDE_STAINLESS_RUNTIME_VERSION || "v26.3.0",
   claudeStainlessOs: process.env.CLAUDE_STAINLESS_OS || "MacOS",

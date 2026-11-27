@@ -321,8 +321,8 @@ for (const protocol of ["chat", "responses"]) for (const stream of [false, true]
     assert.equal(identity.account_uuid, accountId);
     assert.equal(identity.session_id, call.headers["x-claude-code-session-id"]);
     assert.equal(identity.device_id, getClaudeCredentialWithTokens(id).metadata.device_ids[0]);
-    assert.equal(call.headers["user-agent"], "claude-cli/2.1.280 (external, cli)");
-    assert.equal(call.headers["x-stainless-package-version"], "0.112.1");
+    assert.equal(call.headers["user-agent"], "claude-cli/2.1.332 (external, cli)");
+    assert.equal(call.headers["x-stainless-package-version"], "0.128.0");
     assert.ok(call.headers["anthropic-beta"].includes("extended-cache-ttl-2025-04-11"));
     assert.ok(!call.headers["anthropic-beta"].includes("fast-mode-2026-02-01"));
     const second = await run(); await second.text();
@@ -455,9 +455,9 @@ test("Native Claude Code HTTP request preserves native body and rebinds selected
   const response = await handleClaudeMessages(new Request("http://relay.invalid/v1/messages", {
     method: "POST", body: JSON.stringify(payload),
     headers: { "content-type": "application/json", "x-api-key": key.key,
-      "user-agent": "claude-cli/2.1.280 (external, cli)", "x-app": "cli",
+      "user-agent": "claude-cli/2.1.332 (external, cli)", "x-app": "cli",
       "anthropic-beta": "claude-code-20250219", "x-claude-code-session-id": sessionId,
-      "x-stainless-package-version": "0.112.1" },
+      "x-stainless-package-version": "0.128.0" },
   }));
   assert.equal(response.status, 200);
   await response.text();
@@ -500,9 +500,9 @@ test("Native and converted Claude OAuth requests leave with Relay's Claude Code 
   const convertedCall = calls.at(-1);
 
   for (const call of [nativeCall, convertedCall]) {
-    assert.equal(call.headers["user-agent"], "claude-cli/2.1.280 (external, cli)");
+    assert.equal(call.headers["user-agent"], "claude-cli/2.1.332 (external, cli)");
     assert.equal(call.headers["anthropic-version"], "2023-06-01");
-    assert.equal(call.headers["x-stainless-package-version"], "0.112.1");
+    assert.equal(call.headers["x-stainless-package-version"], "0.128.0");
     assert.equal(call.headers["x-stainless-os"], "MacOS");
     assert.equal(call.headers["x-stainless-runtime-version"], "v26.3.0");
     assert.equal(call.headers["x-stainless-timeout"], "600");
@@ -514,7 +514,7 @@ test("Native and converted Claude OAuth requests leave with Relay's Claude Code 
     assert.deepEqual(betas.slice(0, 2), ["claude-code-20250219", "oauth-2025-04-20"]);
     assert.ok(!betas.includes("unknown-future-2099-01-01"), "Unknown caller betas are not copied");
     const billing = call.payload.system[0].text;
-    assert.match(billing, /^x-anthropic-billing-header: cc_version=2\.1\.280\.[0-9a-f]{3}; cc_entrypoint=cli; cch=[0-9a-f]{5};/);
+    assert.match(billing, /^x-anthropic-billing-header: cc_version=2\.1\.332\.[0-9a-f]{3}; cc_entrypoint=cli; cch=[0-9a-f]{5};/);
     assert.equal(JSON.parse(call.payload.metadata.user_id).account_uuid, accountId);
   }
   assert.ok(nativeCall.headers["anthropic-beta"].split(",").includes("advisor-tool-2026-03-01"), "Body features keep their beta");

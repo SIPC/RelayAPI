@@ -15,7 +15,7 @@ const accountId = "10000000-0000-4000-8000-000000000001";
 const deviceId = "ab".repeat(32);
 const context = {
   accessToken: "sk-ant-oat01-synthetic", sourceHeaders: new Headers(),
-  claudeUserAgent: "claude-cli/2.1.280 (external, cli)", accountId, deviceId,
+  claudeUserAgent: "claude-cli/2.1.332 (external, cli)", accountId, deviceId,
 };
 const system = "CUSTOM_SYSTEM_SENTINEL: Always reply in Chinese. Output JSON only.";
 function cc(extra = {}) {
@@ -156,7 +156,7 @@ test("CC native caller owns system, cache placement and valid sampling, while id
     metadata: { user_id: JSON.stringify({ device_id: "cd".repeat(32), account_uuid: accountId, session_id: sessionId, extra: 1 }) },
     messages: [{ role: "user", content: "Hi" }], temperature: 0.7, max_tokens: 100,
   };
-  const headers = new Headers({ "user-agent": "claude-cli/2.1.280 (external, cli)", "x-app": "cli",
+  const headers = new Headers({ "user-agent": "claude-cli/2.1.332 (external, cli)", "x-app": "cli",
     "anthropic-beta": "claude-code-20250219", "x-claude-code-session-id": sessionId });
   const result = prepare(payload, { sourceHeaders: headers });
   assert.equal(result.native, true);
@@ -168,7 +168,7 @@ test("CC native caller owns system, cache placement and valid sampling, while id
   assert.equal(result.sessionId, sessionId);
 });
 test("CC copied User-Agent alone does not bypass the normal request pipeline", () => {
-  const result = prepare(cc(), { sourceHeaders: new Headers({ "user-agent": "claude-cli/2.1.280 (external, cli)" }) });
+  const result = prepare(cc(), { sourceHeaders: new Headers({ "user-agent": "claude-cli/2.1.332 (external, cli)" }) });
   assert.equal(result.native, false);
   assert.ok(result.payload.system[0].text.startsWith("x-anthropic-billing-header:"));
 });

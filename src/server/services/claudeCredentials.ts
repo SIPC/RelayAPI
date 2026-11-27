@@ -47,7 +47,7 @@ const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const OAUTH_SCOPE =
   "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 const OAUTH_STATE_TTL_MS = 15 * 60 * 1000;
-const DEFAULT_CLAUDE_USER_AGENT = "claude-cli/2.1.280 (external, cli)";
+const DEFAULT_CLAUDE_USER_AGENT = "claude-cli/2.1.332 (external, cli)";
 const TOKEN_REFRESH_ERROR_PREFIX = "Claude token 自动刷新失败";
 const TOKEN_REFRESH_METADATA_KEYS = [
   "token_refresh_attempt_count",

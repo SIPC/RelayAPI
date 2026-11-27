@@ -8,6 +8,7 @@ import {
 import {
   countCacheControls, enforceCacheControlLimit, ensureCacheControl, MAX_CACHE_CONTROL_BLOCKS,
 } from "@/src/server/claude/cacheControl";
+import { claudeCacheTtlFor } from "@/src/server/claude/cacheTtl";
 
 const CLAUDE_CCH_SEED = BigInt("0x4d659218e32a3268");
 const BILLING_CCH_PATTERN = /\bcch=([0-9a-f]{5});/;
@@ -30,6 +31,8 @@ export function prepareClaudeOAuthUpstreamPayload(
     deviceId: string;
     sessionId?: string;
     countTokens?: boolean;
+    // The credential's latest response put it on overage billing (see cacheTtl.ts).
+    overage?: boolean;
   },
 ): ClaudeOAuthPreparedPayload {
   let payload = cloneRecord(inputPayload);
@@ -52,7 +55,11 @@ export function prepareClaudeOAuthUpstreamPayload(
   if (!native && !explicitCache && !input.countTokens) payload = ensureCacheControl(payload);
   payload = enforceCacheControlLimit(payload, MAX_CACHE_CONTROL_BLOCKS);
   if (!native && !explicitCache) {
-    if (!input.countTokens) walkCacheControls(payload, (control) => { if (!control.ttl) control.ttl = "1h"; });
+    if (!input.countTokens) {
+      // Claude Code 2.1.332 keeps the 1h pool for subscriber main turns and falls back to 5m on overage.
+      const ttl = claudeCacheTtlFor({ subscriber: true, overage: Boolean(input.overage), shortLane: false });
+      walkCacheControls(payload, (control) => { if (!control.ttl && ttl === "1h") control.ttl = "1h"; });
+    }
     payload = normalizeCacheControlTTL(payload);
   }
   delete payload.prompt_cache_options;

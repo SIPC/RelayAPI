@@ -13,7 +13,7 @@ const { createClaudeNativeSseStream } = await import("../src/server/claude/nativ
 const sessionId = "20000000-0000-4000-8000-000000000002";
 const identity = { device_id: "ab".repeat(32), account_uuid: "10000000-0000-4000-8000-000000000001", session_id: sessionId };
 const context = { accessToken: "sk-ant-oat01-synthetic", sourceHeaders: new Headers(),
-  claudeUserAgent: "claude-cli/2.1.280 (external, cli)", accountId: identity.account_uuid, deviceId: identity.device_id, sessionId };
+  claudeUserAgent: "claude-cli/2.1.332 (external, cli)", accountId: identity.account_uuid, deviceId: identity.device_id, sessionId };
 const nativeContext = { ...context, sourceHeaders: new Headers({ "user-agent": context.claudeUserAgent,
   "x-app": "cli", "anthropic-beta": "claude-code-20250219" }) };
 const cch = (result) => /cch=([0-9a-f]{5});/.exec(result.payload.system[0].text)[1];
@@ -43,8 +43,8 @@ function markers(value, path = "", result = []) {
 test("Claude CCH ignores only CPA dispatch fields and model values, not conversation growth", () => {
   const original = nativePayload();
   const first = prepare(original, nativeContext);
-  // Independently computed with the local CPA claude_signing.go, not Relay's hash, over the body\n  // after its billing block is restated for Relay's Claude Code profile (2.1.280, cli).
-  assert.equal(cch(first), "5ba51");
+  // Independently computed with the local CPA claude_signing.go, not Relay's hash, over the body\n  // after its billing block is restated for Relay's Claude Code profile (2.1.332, cli).
+  assert.equal(cch(first), "9adfd");
   assert.equal(prepare(original, nativeContext).body, first.body);
   for (const extra of [{ model: "claude-opus-4-6" }, { max_tokens: 999 },
     { fallbacks: [{ model: "claude-opus-4-8" }] }, { fallback_credit_token: "synthetic-credit" }]) {
@@ -60,12 +60,12 @@ test("Claude CCH ignores only CPA dispatch fields and model values, not conversa
 
 test("Claude CCH matches CPA recursive normalization and trailing-dispatch golden vectors", () => {
   for (const [extra, expected] of [
-    [{ model: "a", plain: "b" }, "41164"],
-    [{ max_tokens: 999, plain: "b" }, "83202"],
-    [{ plain: "b", max_tokens: 999, fallbacks: [] }, "b8e01"],
-    [{ max_tokens: 999, fallbacks: [], fallback_credit_token: "fake" }, "735f4"],
-    [{ max_tokens: 999, model: "a", fallbacks: [] }, "82871"],
-    [{ plain: 'literal "model":"a" and "max_tokens":1 cch=00000; 🐈 中文', max_tokens: 123 }, "32edf"],
+    [{ model: "a", plain: "b" }, "54bdc"],
+    [{ max_tokens: 999, plain: "b" }, "415ce"],
+    [{ plain: "b", max_tokens: 999, fallbacks: [] }, "c0837"],
+    [{ max_tokens: 999, fallbacks: [], fallback_credit_token: "fake" }, "03aea"],
+    [{ max_tokens: 999, model: "a", fallbacks: [] }, "3f5ae"],
+    [{ plain: 'literal "model":"a" and "max_tokens":1 cch=00000; 🐈 中文', max_tokens: 123 }, "df2ce"],
   ]) {
     const result = prepare({ ...nativePayload(), extra }, nativeContext);
     assert.equal(cch(result), expected);
@@ -121,10 +121,10 @@ test("Claude keep-all retains signed historical thinking and caller context edit
 });
 
 test("Claude attribution fingerprint matches CPA UTF-16 vectors for emoji", () => {
-  for (const [text, expected] of [["😀abcdefghijklmnopqrstuvwxyz", "dac"], ["abc😀abcdefghijklmnop", "695"]]) {
+  for (const [text, expected] of [["😀abcdefghijklmnopqrstuvwxyz", "e4b"], ["abc😀abcdefghijklmnop", "880"]]) {
     const original = conversation();
     original.messages[0].content = text;
-    assert.match(prepare(original, context).payload.system[0].text, new RegExp(`cc_version=2\\.1\\.280\\.${expected};`));
+    assert.match(prepare(original, context).payload.system[0].text, new RegExp(`cc_version=2\\.1\\.332\\.${expected};`));
   }
 });
 

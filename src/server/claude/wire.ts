@@ -191,7 +191,7 @@ function insertBeforeText(content: unknown, blocks: RecordValue[]) {
   return parts;
 }
 function claudeCliVersion(userAgent: string) {
-  return /claude-cli\/([\d.]+)/.exec(userAgent)?.[1] || "2.1.280";
+  return /claude-cli\/([\d.]+)/.exec(userAgent)?.[1] || "2.1.332";
 }
 // Claude Code's 3-character build fingerprint in cc_version, over its first user message.
 function claudeBuildHash(firstUserContent: unknown, version: string) {
@@ -330,7 +330,6 @@ export function claudeBetas(payload: RecordValue, source: string | null, extra: 
       || (beta === "thinking-binding-controls-2026-08-01" && Boolean(record(payload.thinking)?.block_binding)));
   }
   add("fast-mode-2026-02-01", payload.speed === "fast" || requested.has("fast-mode-2026-02-01"));
-  add("extended-cache-ttl-2025-04-11");
   add("prompt-caching-evict-2026-05-12", JSON.stringify(payload).includes('"evict_on_complete"') || requested.has("prompt-caching-evict-2026-05-12"));
   add("cache-diagnosis-2026-04-07", Boolean(payload.diagnostics));
   for (const beta of anthropicBodyBetas(payload, requested)) add(beta);

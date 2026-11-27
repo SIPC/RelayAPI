@@ -729,7 +729,7 @@ test("Anthropic API Key Messages: a native Claude Code caller owns its breakpoin
   const fixture = setup("anthropic", { model: "claude-opus-5-5" });
   const identity = { device_id: "a".repeat(64), account_uuid: "10000000-0000-4000-8000-000000000001", session_id: "20000000-0000-4000-8000-000000000002" };
   const native = await sendMessages(fixture, { model: "claude-opus-5-5", system, messages: turns(2), metadata: { user_id: JSON.stringify(identity) } },
-    { "user-agent": "claude-cli/2.1.280 (external, cli)", "x-app": "cli", "anthropic-beta": "claude-code-20250219" });
+    { "user-agent": "claude-cli/2.1.332 (external, cli)", "x-app": "cli", "anthropic-beta": "claude-code-20250219" });
   assert.deepEqual(breakpoints(native.payload), [], "A confirmed native client writes its own markers");
   const before = calls.length;
   const response = await run(fixture, "count_tokens", { model: "claude-opus-5-5", system, messages: turns(2) });

@@ -7,6 +7,7 @@ import crypto from "node:crypto";
 import { claudeBetas, claudeCacheTtlMs } from "@/src/server/claude/wire";
 import { claudeChannelSession } from "@/src/server/services/channels";
 import { prepareClaudeOAuthUpstreamPayload } from "@/src/server/claude/compat";
+import { claudeCredentialInOverage, recordClaudeOverage } from "@/src/server/claude/cacheTtl";
 import { serverConfig } from "@/src/server/config/env";
 import { logServerError } from "@/src/server/http/errors";
 import { proxiedFetch } from "@/src/server/net/proxy";
@@ -68,6 +69,7 @@ export async function claudeFetch(
     ...ensureClaudeRequestIdentity(credential),
     sessionId: input.channel && claudeChannelSession(input.channel)?.sessionId,
     countTokens: input.upstreamPath === "/v1/messages/count_tokens",
+    overage: claudeCredentialInOverage(credential.id),
   });
   const upstreamPayload = prepared.payload;
   const proxy = resolveClaudeCredentialProxy({
@@ -122,6 +124,7 @@ export async function claudeFetch(
       },
       proxy,
     ));
+  recordClaudeOverage(credential.id, response.headers);
   try {
     recordClaudeQuotaHeaders(credential.id, response.headers);
   } catch (error) {

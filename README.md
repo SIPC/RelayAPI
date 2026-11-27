@@ -36,8 +36,8 @@ RelayAPI 是一个基于 Next.js App Router 的分层中继服务，用于管理
 - Codex 保留显式 `parallel_tool_calls`、`prompt_cache_key`、`service_tier`；支持 `fast` 转 `priority` 和 `ultrafast`，路由提示头与最终请求体一致。Chat 未指定思考摘要时不默认请求摘要。省略模型时默认使用 `gpt-6.1-sol`，环境变量 `CODEX_DEFAULT_MODEL` 可覆盖。
 - Claude OAuth 保留调用方系统提示原文，并按模型选择系统提示的位置、思考等级或预算；设备标识持久化到凭据，对话标识在请求体和请求头中保持一致。
 - Claude OAuth 请求支持 `anthropic/` 前缀及 Opus / Sonnet / Haiku 的点分版本号，例如 `anthropic/claude-opus-5-5`、`anthropic/claude-opus-5.5` 均发送为 `claude-opus-5-5`，也可附加 `(1m)`、`(high)` 等现有后缀。渠道和 Relay Key 白名单推荐配置规范名 `claude-opus-5-5`；别名不绕过授权。API Key 渠道仍使用配置中的精确模型名，不自动去前缀或改版本号。
-- Claude 普通转换请求采用最近可缓存消息的断点及 OAuth 1h TTL；显式缓存模式保留调用方设置。通过原生客户端识别后保留其系统提示和缓存布局，并重绑定所选上游凭据的账户和设备身份。
-- 默认客户端标识与上述 CPA 版本一致：Codex `codex-tui/0.154.0`、Claude Code `2.1.280` / SDK `0.112.1`。已有凭据、数据库设置或环境变量中的自定义 User-Agent 仍优先。
+- Claude 普通转换请求采用最近可缓存消息的断点；OAuth 订阅主线程用 1h TTL，账号处于额外付费用量（overage，由最近一次响应的 `anthropic-ratelimit-unified-*` 头判断，未知按非 overage）时与 Claude Code 一样退回 5m，调用方显式写的 TTL 保留；显式缓存模式保留调用方设置。通过原生客户端识别后保留其系统提示和缓存布局，并重绑定所选上游凭据的账户和设备身份。
+- 默认客户端标识：Codex 与 CPA 一致（`codex-tui/0.154.0`）；Claude Code 取官方 `2.1.332`（UA、`cc_version`、stainless 包 `0.128.0`，CPA 内置的是 `2.1.321`），运行时版本 `v26.3.0` 未能从官方二进制静态核实，仍保持原值。已有凭据、数据库设置或环境变量中的自定义 User-Agent 仍优先。
 
 回归验证使用临时数据库、合成凭据和本机模拟上游：`pnpm test`。实际账号可用性需要部署后验证。
 
@@ -62,7 +62,7 @@ X-Relay-Quota-7d-Remaining-Percent: 60
 
 ## 上游 API Key 接入
 
-上游 API Key 与客户端使用的 `relay_sk_*` 是两种不同凭据：客户端继续使用 Relay Key，服务端按授权渠道选择 OAuth 或供应商 Key。原有 Codex / Claude OAuth 通道保留，API Key 不参与 OAuth 刷新，也不注入 CLI 身份、账户标识或 OAuth 缓存策略。
+上游 API Key 与客户端使用的 `relay_sk_*` 是两种不同凭据：客户端继续使用 Relay Key，服务端按授权渠道选择 OAuth 或供应商 Key。原有 Codex / Claude OAuth 通道保留，API Key 不参与 OAuth 刷新，也不注入 CLI 身份或账户标识；Anthropic API Key 渠道与 OAuth 共用默认缓存断点（调用方没写任何断点才补，上限 4 个），但 TTL 保持默认 5m，调用方显式写 1h 才发 `extended-cache-ttl`。
 
 ### 配置步骤
 
