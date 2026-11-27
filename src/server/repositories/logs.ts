@@ -808,26 +808,38 @@ function requestLogWhere(input: RequestLogQueryInput) {
   };
 }
 
-export function getAdminOverviewStats(): AdminOverviewStats {
+// Concurrent callers (page render, overview route) share one computation.
+let adminOverviewPending: Promise<AdminOverviewStats> | null = null;
+
+export async function getAdminOverviewStats(): Promise<AdminOverviewStats> {
   const now = Date.now();
   if (adminOverviewCache && adminOverviewCache.expiresAt > now) {
     return adminOverviewCache.value;
   }
+  if (!adminOverviewPending) {
+    adminOverviewPending = computeAdminOverviewStats().finally(() => {
+      adminOverviewPending = null;
+    });
+  }
+  return adminOverviewPending;
+}
 
-  const totals = getOverviewTotals();
+async function computeAdminOverviewStats(): Promise<AdminOverviewStats> {
+  const window = await scanOverviewWindow(overviewRecentStartedAt());
+  const totals = getOverviewTotals(window.samples);
   const value = {
     generatedAt: new Date().toISOString(),
     totals,
-    byApiKey: getApiKeyUsageStats(),
-    byApiKeyModel: getApiKeyModelUsageStats(),
-    byModel: getGroupedUsageStats("model", "model"),
-    byChannel: getGroupedUsageStats("channel_id", "channel_name"),
-    byCredential: getGroupedUsageStats("credential_id", "credential_email"),
-    byRequestType: getGroupedUsageStats("request_type", "request_type"),
-    byDay: getDailyUsageStats(),
+    byApiKey: getApiKeyUsageStats(window),
+    byApiKeyModel: getApiKeyModelUsageStats(window),
+    byModel: getGroupedUsageStats(window, "model"),
+    byChannel: getGroupedUsageStats(window, "channel_id"),
+    byCredential: getGroupedUsageStats(window, "credential_id"),
+    byRequestType: getGroupedUsageStats(window, "request_type"),
+    byDay: getDailyUsageStats(window),
   };
   adminOverviewCache = {
-    expiresAt: now + ADMIN_OVERVIEW_CACHE_TTL_MS,
+    expiresAt: Date.now() + ADMIN_OVERVIEW_CACHE_TTL_MS,
     value,
   };
   return value;
@@ -983,7 +995,7 @@ function isSuccessfulStatusCode(value: unknown) {
   return statusCode >= 200 && statusCode < 400;
 }
 
-function getOverviewTotals(): AdminOverviewTotals {
+function getOverviewTotals(samples: LatencySamples): AdminOverviewTotals {
   const row = getLogDb()
     .prepare(
       `SELECT
@@ -1009,7 +1021,7 @@ function getOverviewTotals(): AdminOverviewTotals {
   const promptTokens = numberValue(row?.prompt_tokens);
   const totalTokens = numberValue(row?.total_tokens);
   const cachedTokens = numberValue(row?.cached_tokens);
-  const firstTokenLatency = firstTokenLatencyStats();
+  const latencyStats = latencySampleStats(samples.get(latencySampleKey("all")));
   return {
     requestCount,
     successCount: numberValue(row?.success_count),
@@ -1021,8 +1033,7 @@ function getOverviewTotals(): AdminOverviewTotals {
     cachedTokens,
     cacheHitRate: cacheHitRate(cachedTokens, promptTokens),
     avgLatencyMs: Math.round(numberValue(row?.avg_latency_ms)),
-    p95LatencyMs: percentileLatency(),
-    ...firstTokenLatency,
+    ...latencyStats,
     avgTokensPerRequest: average(totalTokens, requestCount),
     tokensPerSecond: throughput(totalTokens, row?.total_latency_ms),
     distinctApiKeyCount: numberValue(row?.distinct_api_key_count),
@@ -1033,19 +1044,9 @@ function getOverviewTotals(): AdminOverviewTotals {
   };
 }
 
-function getApiKeyUsageStats(): ApiKeyUsageStatsRow[] {
-  const overviewWindowStart = overviewRecentStartedAt();
-  const rows = getLogDb()
-    .prepare(
-      `${aggregateSelect("api_key_id", "api_key_prefix")}
-       WHERE started_at >= ?
-       GROUP BY COALESCE(api_key_id, ''), COALESCE(api_key_prefix, '')
-       ORDER BY total_tokens DESC, request_count DESC
-       LIMIT ?`,
-    )
-    .all(overviewWindowStart, OVERVIEW_GROUP_LIMIT) as Array<
-    Record<string, unknown>
-  >;
+function getApiKeyUsageStats(window: OverviewWindow): ApiKeyUsageStatsRow[] {
+  const { samples } = window;
+  const rows = topUsageRows(window, "api_key_id");
   const keysById = apiKeysById();
   const todayTokensByKey = todayTokensByApiKey();
   const stats = rows.map((row) => {
@@ -1059,7 +1060,7 @@ function getApiKeyUsageStats(): ApiKeyUsageStatsRow[] {
         "未知 Key",
       subLabel: keyRecord?.prefix || nullableString(row.group_label),
       emptyLabel: "未知 Key",
-      groupColumn: "api_key_id",
+      sample: samples.get(latencySampleKey("api_key_id", row.group_key)),
     });
     const tokenLimitDaily = keyRecord?.token_limit_daily ?? null;
     const todayTokens = apiKeyId ? todayTokensByKey.get(apiKeyId) || 0 : 0;
@@ -1109,36 +1110,11 @@ function getApiKeyUsageStats(): ApiKeyUsageStatsRow[] {
   return stats;
 }
 
-function getApiKeyModelUsageStats(): ApiKeyModelUsageStatsRow[] {
-  const recentStartedAt = overviewRecentStartedAt();
-  const rows = getLogDb()
-    .prepare(
-      `SELECT
-        COALESCE(api_key_id, '') AS api_key_id,
-        COALESCE(api_key_prefix, '') AS api_key_prefix,
-        MAX(NULLIF(api_key_name, '')) AS api_key_name,
-        COALESCE(model, '') AS model,
-        COUNT(*) AS request_count,
-        SUM(CASE WHEN status_code >= 200 AND status_code < 400 THEN 1 ELSE 0 END) AS success_count,
-        SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS error_count,
-        SUM(stream) AS stream_count,
-        COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
-        COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
-        COALESCE(SUM(total_tokens), 0) AS total_tokens,
-        COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
-        COALESCE(AVG(latency_ms), 0) AS avg_latency_ms,
-        COALESCE(SUM(latency_ms), 0) AS total_latency_ms,
-        MIN(started_at) AS first_request_at,
-        MAX(started_at) AS last_request_at
-      FROM request_logs
-      WHERE started_at >= ?
-      GROUP BY COALESCE(api_key_id, ''), COALESCE(api_key_prefix, ''), COALESCE(model, '')
-      ORDER BY total_tokens DESC, request_count DESC
-      LIMIT ?`,
-    )
-    .all(recentStartedAt, OVERVIEW_GROUP_LIMIT) as Array<
-    Record<string, unknown>
-  >;
+function getApiKeyModelUsageStats(
+  window: OverviewWindow,
+): ApiKeyModelUsageStatsRow[] {
+  const { samples } = window;
+  const rows = topUsageRows(window, "api_key_model");
   const keysById = apiKeysById();
   return rows.map((row) => {
     const apiKeyId = nullableString(row.api_key_id);
@@ -1157,10 +1133,9 @@ function getApiKeyModelUsageStats(): ApiKeyModelUsageStatsRow[] {
           nullableString(row.api_key_name) ||
           nullableString(row.api_key_prefix),
         emptyLabel: "未知模型",
-        filters: [
-          { column: "api_key_id", value: apiKeyId || "" },
-          { column: "model", value: nullableString(row.model) || "" },
-        ],
+        sample: samples.get(
+          latencySampleKey("api_key_id+model", row.api_key_id, row.model),
+        ),
       },
     );
     return {
@@ -1178,62 +1153,33 @@ function getApiKeyModelUsageStats(): ApiKeyModelUsageStatsRow[] {
 }
 
 function getGroupedUsageStats(
-  keyColumn: string,
-  labelColumn: string,
+  window: OverviewWindow,
+  grouping: "model" | "channel_id" | "credential_id" | "request_type",
 ): UsageStatsRow[] {
-  const recentStartedAt = overviewRecentStartedAt();
-  const rows = getLogDb()
-    .prepare(
-      `${aggregateSelect(keyColumn, labelColumn)}
-       WHERE started_at >= ?
-       GROUP BY COALESCE(${keyColumn}, ''), COALESCE(${labelColumn}, '')
-       ORDER BY total_tokens DESC, request_count DESC
-       LIMIT ?`,
-    )
-    .all(recentStartedAt, OVERVIEW_GROUP_LIMIT) as Array<
-    Record<string, unknown>
-  >;
-  return rows.map((row) =>
+  return topUsageRows(window, grouping).map((row) =>
     toUsageStatsRow(row, {
       emptyLabel: "未记录",
-      groupColumn: keyColumn,
+      sample: window.samples.get(latencySampleKey(grouping, row.group_key)),
     }),
   );
 }
 
-function getDailyUsageStats(): DailyUsageStatsRow[] {
-  const recentStartedAt = overviewRecentStartedAt();
-  const rows = getLogDb()
-    .prepare(
-      `SELECT
-        substr(started_at, 1, 10) AS date,
-        COUNT(*) AS request_count,
-        SUM(CASE WHEN status_code >= 200 AND status_code < 400 THEN 1 ELSE 0 END) AS success_count,
-        SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS error_count,
-        SUM(stream) AS stream_count,
-        COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
-        COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
-        COALESCE(SUM(total_tokens), 0) AS total_tokens,
-        COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
-        COALESCE(AVG(latency_ms), 0) AS avg_latency_ms,
-        COALESCE(SUM(latency_ms), 0) AS total_latency_ms,
-        MIN(started_at) AS first_request_at,
-        MAX(started_at) AS last_request_at
-      FROM request_logs
-      WHERE started_at >= ?
-      GROUP BY substr(started_at, 1, 10)
-      ORDER BY date DESC
-      LIMIT ?`,
+function getDailyUsageStats(window: OverviewWindow): DailyUsageStatsRow[] {
+  const { samples } = window;
+  // ORDER BY date DESC LIMIT OVERVIEW_DAILY_WINDOW_DAYS.
+  const rows = [...window.groups.day.values()]
+    .sort((left, right) =>
+      String(right.date).localeCompare(String(left.date)),
     )
-    .all(recentStartedAt, OVERVIEW_DAILY_WINDOW_DAYS) as Array<
-    Record<string, unknown>
-  >;
+    .slice(0, OVERVIEW_DAILY_WINDOW_DAYS);
   return rows.map((row) => {
     const requestCount = numberValue(row.request_count);
     const totalTokens = numberValue(row.total_tokens);
     const cachedTokens = numberValue(row.cached_tokens);
     const date = String(row.date || "");
-    const firstTokenLatency = firstTokenLatencyStats({ day: date });
+    const latencyStats = latencySampleStats(
+      samples.get(latencySampleKey("day", date)),
+    );
     return {
       date,
       requestCount,
@@ -1246,32 +1192,11 @@ function getDailyUsageStats(): DailyUsageStatsRow[] {
       cachedTokens,
       cacheHitRate: cacheHitRate(cachedTokens, numberValue(row.prompt_tokens)),
       avgLatencyMs: Math.round(numberValue(row.avg_latency_ms)),
-      p95LatencyMs: percentileLatency({ day: date }),
-      ...firstTokenLatency,
+      ...latencyStats,
       avgTokensPerRequest: average(totalTokens, requestCount),
       tokensPerSecond: throughput(totalTokens, row.total_latency_ms),
     };
   });
-}
-
-function aggregateSelect(keyColumn: string, labelColumn: string) {
-  return `SELECT
-    COALESCE(${keyColumn}, '') AS group_key,
-    COALESCE(${labelColumn}, '') AS group_label,
-    MAX(NULLIF(api_key_name, '')) AS api_key_name,
-    COUNT(*) AS request_count,
-    SUM(CASE WHEN status_code >= 200 AND status_code < 400 THEN 1 ELSE 0 END) AS success_count,
-    SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS error_count,
-    SUM(stream) AS stream_count,
-    COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
-    COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
-    COALESCE(SUM(total_tokens), 0) AS total_tokens,
-    COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
-    COALESCE(AVG(latency_ms), 0) AS avg_latency_ms,
-    COALESCE(SUM(latency_ms), 0) AS total_latency_ms,
-    MIN(started_at) AS first_request_at,
-    MAX(started_at) AS last_request_at
-  FROM request_logs`;
 }
 
 function emptyUsageStatsRow(input: {
@@ -1309,8 +1234,7 @@ function toUsageStatsRow(
     label?: string;
     subLabel?: string | null;
     emptyLabel: string;
-    groupColumn?: string;
-    filters?: Array<{ column: string; value: string }>;
+    sample: LatencySample | undefined;
   },
 ): UsageStatsRow {
   const requestCount = numberValue(row.request_count);
@@ -1337,16 +1261,7 @@ function toUsageStatsRow(
     cachedTokens,
     cacheHitRate: cacheHitRate(cachedTokens, promptTokens),
     avgLatencyMs: Math.round(numberValue(row.avg_latency_ms)),
-    p95LatencyMs: percentileLatency({
-      groupKey: nullableString(row.group_key),
-      groupColumn: options.groupColumn,
-      filters: options.filters,
-    }),
-    ...firstTokenLatencyStats({
-      groupKey: nullableString(row.group_key),
-      groupColumn: options.groupColumn,
-      filters: options.filters,
-    }),
+    ...latencySampleStats(options.sample),
     avgTokensPerRequest: average(totalTokens, requestCount),
     tokensPerSecond: throughput(totalTokens, row.total_latency_ms),
     firstRequestAt,
@@ -1354,126 +1269,298 @@ function toUsageStatsRow(
   };
 }
 
-function percentileLatency(
-  input: {
-    day?: string;
-    groupColumn?: string;
-    groupKey?: string | null;
-    filters?: Array<{ column: string; value: string }>;
-  } = {},
-) {
-  const { where, params } = latencyWhereClause(input);
-  const rows = getLogDb()
-    .prepare(
-      `SELECT latency_ms
-       FROM (
-         SELECT latency_ms
-         FROM request_logs
-         ${where}
-         ORDER BY started_at DESC
-         LIMIT ?
-       )
-       ORDER BY latency_ms ASC`,
-    )
-    .all(...params, LATENCY_SAMPLE_LIMIT) as Array<{ latency_ms: number }>;
-  if (rows.length === 0) {
-    return 0;
-  }
-  const index = Math.min(rows.length - 1, Math.ceil(rows.length * 0.95) - 1);
-  return numberValue(rows[index]?.latency_ms);
+// The overview groups the requests of its window seven ways, and each group
+// row reports p95 latency over its newest LATENCY_SAMPLE_LIMIT requests and
+// first-token latency over its newest FIRST_TOKEN_SAMPLE_LIMIT requests.
+// One newest-first scan of the window builds every group and its samples, in
+// chunks that yield to the event loop, so relay requests keep being served
+// while the overview is computed.
+type LatencySample = { latencies: number[]; firstTokens: number[]; seen: number };
+type LatencySamples = Map<string, LatencySample>;
+
+type UsageAggregateRow = {
+  [column: string]: unknown;
+  api_key_name: string | null;
+  request_count: number;
+  success_count: number;
+  error_count: number;
+  stream_count: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cached_tokens: number;
+  avg_latency_ms: number;
+  total_latency_ms: number;
+  first_request_at: string;
+  last_request_at: string;
+};
+
+type LogRow = Record<string, unknown>;
+
+const textValue = (value: unknown) => nullableString(value) ?? "";
+
+// Same groupings and output columns as the former per-group GROUP BY queries.
+const OVERVIEW_GROUPINGS = {
+  api_key_id: (row: LogRow) => ({
+    group_key: textValue(row.api_key_id),
+    group_label: textValue(row.api_key_prefix),
+  }),
+  api_key_model: (row: LogRow) => ({
+    api_key_id: textValue(row.api_key_id),
+    api_key_prefix: textValue(row.api_key_prefix),
+    model: textValue(row.model),
+  }),
+  model: (row: LogRow) => ({
+    group_key: textValue(row.model),
+    group_label: textValue(row.model),
+  }),
+  channel_id: (row: LogRow) => ({
+    group_key: textValue(row.channel_id),
+    group_label: textValue(row.channel_name),
+  }),
+  credential_id: (row: LogRow) => ({
+    group_key: textValue(row.credential_id),
+    group_label: textValue(row.credential_email),
+  }),
+  request_type: (row: LogRow) => ({
+    group_key: textValue(row.request_type),
+    group_label: textValue(row.request_type),
+  }),
+  day: (row: LogRow) => ({ date: String(row.started_at).slice(0, 10) }),
+};
+
+type OverviewGrouping = keyof typeof OVERVIEW_GROUPINGS;
+
+interface OverviewWindow {
+  samples: LatencySamples;
+  groups: Record<OverviewGrouping, Map<string, UsageAggregateRow>>;
 }
 
-function firstTokenLatencyStats(
-  input: {
-    day?: string;
-    groupColumn?: string;
-    groupKey?: string | null;
-    filters?: Array<{ column: string; value: string }>;
-  } = {},
-) {
-  const { where, params } = latencyWhereClause(input);
-  const rows = getLogDb()
-    .prepare(
-      `WITH recent_requests AS (
-         SELECT
-           id, started_at, api_key_id, model, channel_id, credential_id,
-           request_type
-         FROM request_logs
-         ${where}
-         ORDER BY started_at DESC
-         LIMIT ?
-       )
-       SELECT COALESCE(
-         MAX(CASE WHEN json_extract(value, '$.name') = 'stream_first_token' THEN json_extract(value, '$.startedAtMs') END),
-         MAX(CASE WHEN json_extract(value, '$.name') = 'stream_first_chunk' THEN json_extract(value, '$.startedAtMs') END)
-       ) AS latency_ms
-       FROM recent_requests
-       INNER JOIN request_log_details ON request_log_details.request_log_id = recent_requests.id,
-       json_each(request_log_details.stage_timings_json)
-       GROUP BY recent_requests.id
-       HAVING latency_ms IS NOT NULL`,
-    )
-    .all(...params, FIRST_TOKEN_SAMPLE_LIMIT) as Array<{ latency_ms: number }>;
-  if (rows.length === 0) {
-    return {
-      avgFirstTokenLatencyMs: 0,
-      p95FirstTokenLatencyMs: 0,
-    };
+const OVERVIEW_SCAN_CHUNK_SIZE = 2_000;
+
+function latencySampleKey(dimension: string, ...values: unknown[]) {
+  return [dimension, ...values.map(textValue)].join("\u0000");
+}
+
+async function scanOverviewWindow(
+  recentStartedAt: string,
+): Promise<OverviewWindow> {
+  const window: OverviewWindow = {
+    samples: new Map(),
+    groups: Object.fromEntries(
+      Object.keys(OVERVIEW_GROUPINGS).map((grouping) => [grouping, new Map()]),
+    ) as OverviewWindow["groups"],
+  };
+  // Keyset pages walk idx_request_logs_started newest first without sorting.
+  const statement = getLogDb().prepare(
+    `SELECT
+      request_logs.rowid AS row_id,
+      request_logs.started_at, request_logs.status_code, request_logs.stream,
+      request_logs.latency_ms, request_logs.prompt_tokens,
+      request_logs.completion_tokens, request_logs.total_tokens,
+      request_logs.cached_tokens, request_logs.api_key_id,
+      request_logs.api_key_prefix, request_logs.api_key_name,
+      request_logs.model, request_logs.channel_id, request_logs.channel_name,
+      request_logs.credential_id, request_logs.credential_email,
+      request_logs.request_type,
+      request_log_details.stage_timings_json
+    FROM request_logs
+    LEFT JOIN request_log_details
+      ON request_log_details.request_log_id = request_logs.id
+    WHERE request_logs.started_at >= ?
+      AND (request_logs.started_at, request_logs.rowid) < (?, ?)
+    ORDER BY request_logs.started_at DESC, request_logs.rowid DESC
+    LIMIT ?`,
+  );
+  let cursorStartedAt = "\uffff";
+  let cursorRowId = Number.MAX_SAFE_INTEGER;
+  for (;;) {
+    const rows = statement.all(
+      recentStartedAt,
+      cursorStartedAt,
+      cursorRowId,
+      OVERVIEW_SCAN_CHUNK_SIZE,
+    ) as LogRow[];
+    for (const row of rows) {
+      addOverviewRow(window, row);
+    }
+    if (rows.length < OVERVIEW_SCAN_CHUNK_SIZE) {
+      return window;
+    }
+    const last = rows[rows.length - 1];
+    cursorStartedAt = String(last.started_at);
+    cursorRowId = Number(last.row_id);
+    await new Promise((resolve) => setImmediate(resolve));
   }
-  const values = rows
-    .map((row) => numberValue(row.latency_ms))
-    .sort((left, right) => left - right);
-  const index = Math.min(
-    values.length - 1,
-    Math.ceil(values.length * 0.95) - 1,
+}
+
+function addOverviewRow(window: OverviewWindow, row: LogRow) {
+  for (const [grouping, fieldsOf] of Object.entries(OVERVIEW_GROUPINGS)) {
+    addUsage(window.groups[grouping as OverviewGrouping], fieldsOf(row), row);
+  }
+
+  const rowSamples = [
+    latencySampleKey("all"),
+    latencySampleKey("day", String(row.started_at).slice(0, 10)),
+    latencySampleKey("api_key_id", row.api_key_id),
+    latencySampleKey("model", row.model),
+    latencySampleKey("channel_id", row.channel_id),
+    latencySampleKey("credential_id", row.credential_id),
+    latencySampleKey("request_type", row.request_type),
+    latencySampleKey("api_key_id+model", row.api_key_id, row.model),
+  ].map((key) => {
+    let sample = window.samples.get(key);
+    if (!sample) {
+      sample = { latencies: [], firstTokens: [], seen: 0 };
+      window.samples.set(key, sample);
+    }
+    return sample;
+  });
+  const latency = numberValue(row.latency_ms);
+  // Parsing timings dominates the scan, so parse only while a group still
+  // needs first-token samples.
+  const firstToken = rowSamples.some(
+    (sample) => sample.seen < FIRST_TOKEN_SAMPLE_LIMIT,
+  )
+    ? firstTokenLatencyFromTimings(row.stage_timings_json)
+    : null;
+  for (const sample of rowSamples) {
+    if (sample.seen < LATENCY_SAMPLE_LIMIT) {
+      sample.latencies.push(latency);
+    }
+    if (sample.seen < FIRST_TOKEN_SAMPLE_LIMIT && firstToken !== null) {
+      sample.firstTokens.push(firstToken);
+    }
+    sample.seen += 1;
+  }
+}
+
+function addUsage(
+  aggregates: Map<string, UsageAggregateRow>,
+  fields: Record<string, string>,
+  row: LogRow,
+) {
+  const key = Object.values(fields).join("\u0000");
+  const startedAt = String(row.started_at);
+  let aggregate = aggregates.get(key);
+  if (!aggregate) {
+    aggregate = {
+      ...fields,
+      api_key_name: null,
+      request_count: 0,
+      success_count: 0,
+      error_count: 0,
+      stream_count: 0,
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+      cached_tokens: 0,
+      avg_latency_ms: 0,
+      total_latency_ms: 0,
+      first_request_at: startedAt,
+      last_request_at: startedAt,
+    };
+    aggregates.set(key, aggregate);
+  }
+  const statusCode = numberValue(row.status_code);
+  aggregate.request_count += 1;
+  aggregate.success_count += statusCode >= 200 && statusCode < 400 ? 1 : 0;
+  aggregate.error_count += statusCode >= 400 ? 1 : 0;
+  aggregate.stream_count += numberValue(row.stream);
+  aggregate.prompt_tokens += numberValue(row.prompt_tokens);
+  aggregate.completion_tokens += numberValue(row.completion_tokens);
+  aggregate.total_tokens += numberValue(row.total_tokens);
+  aggregate.cached_tokens += numberValue(row.cached_tokens);
+  aggregate.total_latency_ms += numberValue(row.latency_ms);
+  aggregate.avg_latency_ms = aggregate.total_latency_ms / aggregate.request_count;
+  const apiKeyName = nullableString(row.api_key_name);
+  if (
+    apiKeyName &&
+    (aggregate.api_key_name === null || apiKeyName > aggregate.api_key_name)
+  ) {
+    aggregate.api_key_name = apiKeyName;
+  }
+  if (startedAt < aggregate.first_request_at) {
+    aggregate.first_request_at = startedAt;
+  }
+  if (startedAt > aggregate.last_request_at) {
+    aggregate.last_request_at = startedAt;
+  }
+}
+
+// ORDER BY total_tokens DESC, request_count DESC LIMIT OVERVIEW_GROUP_LIMIT.
+function topUsageRows(window: OverviewWindow, grouping: OverviewGrouping) {
+  return [...window.groups[grouping].values()]
+    .sort(
+      (left, right) =>
+        right.total_tokens - left.total_tokens ||
+        right.request_count - left.request_count,
+    )
+    .slice(0, OVERVIEW_GROUP_LIMIT);
+}
+
+// Same rule as firstTokenLatencySelect: the stream_first_token stage start,
+// else the stream_first_chunk stage start.
+function firstTokenLatencyFromTimings(value: unknown) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  let stages: unknown;
+  try {
+    stages = JSON.parse(value);
+  } catch {
+    return null;
+  }
+  if (!stages || typeof stages !== "object") {
+    return null;
+  }
+  let firstTokenAt: number | null = null;
+  let firstChunkAt: number | null = null;
+  for (const stage of Object.values(stages)) {
+    const startedAtMs = (stage as { startedAtMs?: unknown } | null)
+      ?.startedAtMs;
+    if (typeof startedAtMs !== "number") {
+      continue;
+    }
+    const name = (stage as { name?: unknown }).name;
+    if (name === "stream_first_token") {
+      firstTokenAt = Math.max(firstTokenAt ?? startedAtMs, startedAtMs);
+    } else if (name === "stream_first_chunk") {
+      firstChunkAt = Math.max(firstChunkAt ?? startedAtMs, startedAtMs);
+    }
+  }
+  return firstTokenAt ?? firstChunkAt;
+}
+
+function latencySampleStats(sample: LatencySample | undefined) {
+  const latencies = [...(sample?.latencies || [])].sort(
+    (left, right) => left - right,
+  );
+  const firstTokens = [...(sample?.firstTokens || [])].sort(
+    (left, right) => left - right,
   );
   return {
-    avgFirstTokenLatencyMs: Math.round(
-      values.reduce((total, value) => total + value, 0) / values.length,
-    ),
-    p95FirstTokenLatencyMs: values[index] || 0,
+    p95LatencyMs: percentile95(latencies),
+    avgFirstTokenLatencyMs:
+      firstTokens.length > 0
+        ? Math.round(
+            firstTokens.reduce((total, value) => total + value, 0) /
+              firstTokens.length,
+          )
+        : 0,
+    p95FirstTokenLatencyMs: percentile95(firstTokens),
   };
 }
 
-function latencyWhereClause(
-  input: {
-    day?: string;
-    groupColumn?: string;
-    groupKey?: string | null;
-    filters?: Array<{ column: string; value: string }>;
-    timingName?: string;
-  } = {},
-  tableAlias?: string,
-) {
-  const column = (name: string) => {
-    const safeName = safeLatencyColumnName(name);
-    return tableAlias ? `${tableAlias}.${safeName}` : safeName;
-  };
-  const conditions: string[] = [];
-  const params: string[] = [];
-  if (input.day) {
-    conditions.push(`substr(${column("started_at")}, 1, 10) = ?`);
-    params.push(input.day);
-  } else {
-    conditions.push(`${column("started_at")} >= ?`);
-    params.push(overviewRecentStartedAt());
+function percentile95(sortedValues: number[]) {
+  if (sortedValues.length === 0) {
+    return 0;
   }
-  if (input.groupColumn) {
-    conditions.push(`COALESCE(${column(input.groupColumn)}, '') = ?`);
-    params.push(input.groupKey || "");
-  }
-  for (const filter of input.filters || []) {
-    conditions.push(`COALESCE(${column(filter.column)}, '') = ?`);
-    params.push(filter.value);
-  }
-  if (input.timingName) {
-    conditions.push("json_extract(value, '$.name') = ?");
-    params.push(input.timingName);
-  }
-  return {
-    where: conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "",
-    params,
-  };
+  const index = Math.min(
+    sortedValues.length - 1,
+    Math.ceil(sortedValues.length * 0.95) - 1,
+  );
+  return sortedValues[index] || 0;
 }
 
 function safeLatencyColumnName(name: string) {

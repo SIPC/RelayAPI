@@ -80,6 +80,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -182,7 +183,6 @@ type AdminDashboardProps = {
   initialUpstreamCredentials: UpstreamCredentialRecord[];
   initialProxyPool: ProxyPoolRecord[];
   initialRequestLogsPage: RequestLogsPage;
-  initialOverviewStats: AdminOverviewStats;
   initialGlobalSettings: GlobalSettingsRecord;
   initialNow: number;
 };
@@ -341,7 +341,6 @@ export function AdminDashboard({
   initialUpstreamCredentials,
   initialProxyPool,
   initialRequestLogsPage,
-  initialOverviewStats,
   initialGlobalSettings,
   initialNow,
 }: AdminDashboardProps) {
@@ -364,8 +363,12 @@ export function AdminDashboard({
   const [requestLogs, setRequestLogs] = React.useState(
     initialRequestLogsPage.data,
   );
+  // Loaded after the first render; see app/page.tsx.
   const [overviewStats, setOverviewStats] =
-    React.useState(initialOverviewStats);
+    React.useState<AdminOverviewStats | null>(null);
+  const [overviewError, setOverviewError] = React.useState<string | null>(
+    null,
+  );
   const [snapshotTime, setSnapshotTime] = React.useState(initialNow);
   const [refreshing, setRefreshing] = React.useState(false);
   const [loggingOut, setLoggingOut] = React.useState(false);
@@ -422,6 +425,7 @@ export function AdminDashboard({
       setGlobalSettings(snapshot.globalSettings);
       setRequestLogs(snapshot.requestLogs);
       setOverviewStats(snapshot.overviewStats);
+      setOverviewError(null);
       setSnapshotTime(snapshot.generatedAt);
       toast.success("管理数据已刷新");
     } catch (error) {
@@ -447,9 +451,30 @@ export function AdminDashboard({
   async function refreshOverviewStats() {
     const stats = await getOverview();
     setOverviewStats(stats);
+    setOverviewError(null);
     setSnapshotTime(Date.now());
     return stats;
   }
+
+  React.useEffect(() => {
+    let cancelled = false;
+    getOverview().then(
+      (stats) => {
+        if (!cancelled) {
+          setOverviewStats(stats);
+          setOverviewError(null);
+        }
+      },
+      (error) => {
+        if (!cancelled) {
+          setOverviewError(adminErrorMessage(error));
+        }
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   function handleRequestLogsLoaded(logs: AdminDashboardRequestLogRow[]) {
     setRequestLogs(logs);
@@ -588,7 +613,7 @@ export function AdminDashboard({
     setChannels((current) => current.filter((channel) => channel.id !== id));
   }
 
-  const totals = overviewStats.totals;
+  const totals = overviewStats?.totals;
   const enabledApiKeyCount = apiKeys.filter((key) => key.enabled).length;
   const enabledChannelCount = channels.filter(
     (channel) => channel.enabled,
@@ -596,8 +621,9 @@ export function AdminDashboard({
   const healthyChannelCount = channels.filter(
     (channel) => channel.status === "healthy",
   ).length;
-  const successRate = ratio(totals.successCount, totals.requestCount);
-  const hasOperationalData = totals.requestCount > 0;
+  const successRate = totals
+    ? ratio(totals.successCount, totals.requestCount)
+    : null;
 
   const navigationItems: NavigationItem[] = [
     {
@@ -793,7 +819,7 @@ export function AdminDashboard({
               <div className="flex items-center justify-between gap-3">
                 <span>成功率</span>
                 <span className="font-medium text-foreground">
-                  {formatPercent(successRate)}
+                  {successRate === null ? "—" : formatPercent(successRate)}
                 </span>
               </div>
             </div>
@@ -806,8 +832,8 @@ export function AdminDashboard({
                 channelCount={channels.length}
                 credentialCount={credentials.length + claudeCredentials.length + antigravityCredentials.length + upstreamCredentials.length}
                 enabledChannelCount={enabledChannelCount}
-                hasOperationalData={hasOperationalData}
                 overviewStats={overviewStats}
+                overviewError={overviewError}
                 onRefresh={refreshOverviewStats}
               />
             )}
@@ -1552,23 +1578,19 @@ function OverviewSection({
   channelCount,
   credentialCount,
   enabledChannelCount,
-  hasOperationalData,
   overviewStats,
+  overviewError,
   onRefresh,
 }: {
   apiKeyCount: number;
   channelCount: number;
   credentialCount: number;
   enabledChannelCount: number;
-  hasOperationalData: boolean;
-  overviewStats: AdminOverviewStats;
+  overviewStats: AdminOverviewStats | null;
+  overviewError: string | null;
   onRefresh: () => Promise<AdminOverviewStats>;
 }) {
   const [refreshing, setRefreshing] = React.useState(false);
-  const trendMetrics = buildOverviewTrendMetrics(overviewStats.byDay);
-  const topModels = overviewStats.byModel.slice(0, 5);
-  const topApiKeys = overviewStats.byApiKey.slice(0, 5);
-  const recentDays = overviewStats.byDay.slice(0, 7);
 
   async function refresh() {
     setRefreshing(true);
@@ -1605,11 +1627,19 @@ function OverviewSection({
           刷新总览
         </Button>
       </div>
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        {trendMetrics.map((metric) => (
-          <TrendMetricCard key={metric.title} {...metric} />
-        ))}
-      </div>
+      {overviewStats ? (
+        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+          {buildOverviewTrendMetrics(overviewStats.byDay).map((metric) => (
+            <TrendMetricCard key={metric.title} {...metric} />
+          ))}
+        </div>
+      ) : (
+        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+          {Array.from({ length: 4 }, (_, index) => (
+            <Skeleton key={index} className="h-36 rounded-xl" />
+          ))}
+        </div>
+      )}
 
       <div className="grid gap-4 md:grid-cols-3">
         <ResourceSummaryCard
@@ -1632,6 +1662,37 @@ function OverviewSection({
         />
       </div>
 
+      {overviewStats ? (
+        <OverviewStatsCards overviewStats={overviewStats} />
+      ) : overviewError ? (
+        <Alert variant="destructive">
+          <AlertTriangleIcon />
+          <AlertTitle>总览统计加载失败</AlertTitle>
+          <AlertDescription>{overviewError}</AlertDescription>
+        </Alert>
+      ) : (
+        <div className="grid gap-4 xl:grid-cols-3">
+          {Array.from({ length: 3 }, (_, index) => (
+            <Skeleton key={index} className="h-72 rounded-xl" />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function OverviewStatsCards({
+  overviewStats,
+}: {
+  overviewStats: AdminOverviewStats;
+}) {
+  const hasOperationalData = overviewStats.totals.requestCount > 0;
+  const topModels = overviewStats.byModel.slice(0, 5);
+  const topApiKeys = overviewStats.byApiKey.slice(0, 5);
+  const recentDays = overviewStats.byDay.slice(0, 7);
+
+  return (
+    <>
       {!hasOperationalData && (
         <Alert>
           <WorkflowIcon />
@@ -1681,7 +1742,7 @@ function OverviewSection({
           emptyTitle="暂无请求类型统计"
         />
       </div>
-    </div>
+    </>
   );
 }
 

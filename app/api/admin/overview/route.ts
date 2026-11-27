@@ -10,7 +10,7 @@ export const dynamic = "force-dynamic";
 export async function GET(request: Request) {
   try {
     requireWebRequest(request);
-    return Response.json(getAdminOverviewStats());
+    return Response.json(await getAdminOverviewStats());
   } catch (error) {
     return errorToResponse(error);
   }

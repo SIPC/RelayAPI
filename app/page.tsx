@@ -3,10 +3,7 @@ import { cookies } from "next/headers";
 import { AdminDashboard } from "@/components/admin-dashboard";
 import { WebAccessLogin } from "@/components/auth/web-access-login";
 import { listPublicAntigravityCredentials } from "@/src/server/services/antigravityCredentials";
-import {
-  getAdminOverviewStats,
-  queryRequestLogs,
-} from "@/src/server/repositories/logs";
+import { queryRequestLogs } from "@/src/server/repositories/logs";
 import { listApiKeyPublicRecords } from "@/src/server/services/apiKeys";
 import { listChannelRecords } from "@/src/server/services/channels";
 import { listPublicClaudeCredentials } from "@/src/server/services/claudeCredentials";
@@ -14,7 +11,6 @@ import { listPublicCodexCredentials } from "@/src/server/services/codexCredentia
 import { listPublicUpstreamCredentials } from "@/src/server/services/upstreamCredentials";
 import { getPublicGlobalSettings } from "@/src/server/services/settings";
 import { listPublicProxyPoolItems } from "@/src/server/services/proxyPool";
-import type { AdminOverviewStats } from "@/src/shared/types/entities";
 import {
   initializeWebAccessKey,
   isValidWebSessionValue,
@@ -68,7 +64,8 @@ export default async function Home() {
     offset: 0,
     skipTotal: true,
   });
-  const overviewStats = getAdminOverviewStats() as AdminOverviewStats;
+  // Overview aggregates scan the whole log window, so the dashboard loads them
+  // after the first render instead of holding the page for them.
   const globalSettings = getPublicGlobalSettings();
   const initialNow = new Date().getTime();
 
@@ -97,7 +94,6 @@ export default async function Home() {
           avgLatencyMs: requestLogs.avgLatencyMs,
         },
       }}
-      initialOverviewStats={overviewStats}
       initialGlobalSettings={globalSettings}
       initialNow={initialNow}
     />
