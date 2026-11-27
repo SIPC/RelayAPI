@@ -471,6 +471,68 @@ test("Native Claude Code HTTP request preserves native body and rebinds selected
   assert.equal(JSON.parse(call.payload.metadata.user_id).session_id, sessionId);
   assert.notEqual(JSON.parse(call.payload.metadata.user_id).device_id, "cd".repeat(32));
 });
+test("Native and converted Claude OAuth requests leave with Relay's Claude Code profile, not the caller's", async () => {
+  mode = "normal";
+  const { key, model } = setup("claude");
+  const sessionId = "20000000-0000-4000-8000-000000000004";
+  const firstUser = "Inspect the repository layout";
+  const native = { model, stream: false, max_tokens: 100, messages: [{ role: "user", content: firstUser }],
+    system: [{ type: "text", text: "x-anthropic-billing-header: cc_version=2.1.332.f00; cc_entrypoint=sdk-cli; cch=00000; cc_workload=cron;" },
+      { type: "text", text: system }],
+    tools: [{ type: "advisor_20260301", name: "advisor" }],
+    metadata: { user_id: JSON.stringify({ device_id: "cd".repeat(32), account_uuid: accountId, session_id: sessionId }) } };
+  const callerHeaders = { "content-type": "application/json", "x-api-key": key.key,
+    "user-agent": "claude-cli/2.1.332 (external, sdk-cli)", "x-app": "cli", "anthropic-version": "2099-01-01",
+    "anthropic-beta": "claude-code-20250219,redact-thinking-2026-02-12,afk-mode-2026-01-31,unknown-future-2099-01-01,fast-mode-2026-02-01",
+    "x-claude-code-session-id": sessionId, "x-client-request-id": "caller-request-id",
+    "x-stainless-package-version": "9.9.9", "x-stainless-os": "Windows", "x-stainless-runtime-version": "v99.0.0",
+    "x-stainless-timeout": "42", "x-stainless-async": "async", "x-claude-code-agent-id": "caller-agent",
+    "x-claude-remote-session-id": "caller-remote", "x-client-app": "caller-app" };
+  const response = await handleClaudeMessages(new Request("http://relay.invalid/v1/messages", {
+    method: "POST", body: JSON.stringify(native), headers: callerHeaders }));
+  assert.equal(response.status, 200);
+  await response.text();
+  const nativeCall = calls.at(-1);
+  const converted = await handleChatCompletions(request(key, { model, stream: false,
+    messages: [{ role: "system", content: system }, { role: "user", content: firstUser }] }));
+  assert.equal(converted.status, 200);
+  await converted.text();
+  const convertedCall = calls.at(-1);
+
+  for (const call of [nativeCall, convertedCall]) {
+    assert.equal(call.headers["user-agent"], "claude-cli/2.1.280 (external, cli)");
+    assert.equal(call.headers["anthropic-version"], "2023-06-01");
+    assert.equal(call.headers["x-stainless-package-version"], "0.112.1");
+    assert.equal(call.headers["x-stainless-os"], "MacOS");
+    assert.equal(call.headers["x-stainless-runtime-version"], "v26.3.0");
+    assert.equal(call.headers["x-stainless-timeout"], "600");
+    for (const name of ["x-stainless-async", "x-claude-code-agent-id", "x-claude-remote-session-id", "x-client-app"]) {
+      assert.equal(call.headers[name], undefined, name);
+    }
+    assert.notEqual(call.headers["x-client-request-id"], "caller-request-id");
+    const betas = call.headers["anthropic-beta"].split(",");
+    assert.deepEqual(betas.slice(0, 2), ["claude-code-20250219", "oauth-2025-04-20"]);
+    assert.ok(!betas.includes("unknown-future-2099-01-01"), "Unknown caller betas are not copied");
+    const billing = call.payload.system[0].text;
+    assert.match(billing, /^x-anthropic-billing-header: cc_version=2\.1\.280\.[0-9a-f]{3}; cc_entrypoint=cli; cch=[0-9a-f]{5};/);
+    assert.equal(JSON.parse(call.payload.metadata.user_id).account_uuid, accountId);
+  }
+  assert.ok(nativeCall.headers["anthropic-beta"].split(",").includes("advisor-tool-2026-03-01"), "Body features keep their beta");
+  assert.ok(nativeCall.headers["anthropic-beta"].split(",").includes("fast-mode-2026-02-01"), "A requested option stays an opt-in");
+  // Without per-request features the two paths emit the same profile list; the 1h cache
+  // beta follows each body's own cache markers.
+  const withoutFeatures = (call) => call.headers["anthropic-beta"].split(",").filter((beta) => ![
+    "advisor-tool-2026-03-01", "fast-mode-2026-02-01", "afk-mode-2026-01-31", "extended-cache-ttl-2025-04-11"].includes(beta));
+  assert.deepEqual(withoutFeatures(nativeCall), withoutFeatures(convertedCall));
+  // The build hash depends only on the first user text and the version, so both paths state the same cc_version.
+  const version = (call) => /cc_version=([^;]+);/.exec(call.payload.system[0].text)[1];
+  assert.equal(version(nativeCall), version(convertedCall));
+  assert.ok(nativeCall.payload.system[0].text.endsWith(" cc_workload=cron;"), "Other billing fields are kept");
+  assert.equal(nativeCall.headers["x-claude-code-session-id"], sessionId, "The session ID keys stickiness and cache affinity");
+  assert.deepEqual(nativeCall.payload.system.slice(1), native.system.slice(1));
+  assert.deepEqual(nativeCall.payload.messages, native.messages);
+  assert.deepEqual(nativeCall.payload.tools, native.tools);
+});
 
 for (const provider of ["codex", "claude"]) for (const protocol of ["chat", "responses"]) for (const stream of [false, true]) {
   test(provider + " " + protocol + " stream=" + stream + ": quota survives upstream 429 without another probe", async () => {

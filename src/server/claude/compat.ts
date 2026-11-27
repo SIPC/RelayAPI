@@ -1,7 +1,7 @@
 import "server-only";
 
 import {
-  applyClaudeCredentialIdentity, applyClaudeModelOptions, claudeSessionId,
+  alignClaudeBillingVersion, applyClaudeCredentialIdentity, applyClaudeModelOptions, claudeSessionId,
   cloakClaudeRequest, isNativeClaudeCodeRequest, normalizeClaudeSampling,
   relocateClaudeCountSystem,
 } from "@/src/server/claude/wire";
@@ -39,6 +39,7 @@ export function prepareClaudeOAuthUpstreamPayload(
     || countCacheControls(payload) > 0;
   applyClaudeModelOptions(payload);
   if (input.countTokens) payload = relocateClaudeCountSystem(payload, native);
+  else if (native) alignClaudeBillingVersion(payload, input.claudeUserAgent);
   else payload = cloakClaudeRequest(payload, {
     native, sessionId, userAgent: input.claudeUserAgent, explicitCache,
     workload: input.sourceHeaders.get("x-cpa-claude-workload") || "",

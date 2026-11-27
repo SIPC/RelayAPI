@@ -50,8 +50,7 @@ const REQUIRED_BY_BODY: Record<string, (payload: RecordValue) => boolean> = {
 // removed for the same reason; messages, system text, tools and thinking stay.
 export function prepareAnthropicApiPayload(input: RecordValue, headerBetas: string | null) {
   const payload: RecordValue = { ...input };
-  const requested = new Set([...(headerBetas || "").split(","), ...betaList(payload.betas)]
-    .map((beta) => beta.trim()).filter(Boolean));
+  const requested = requestedAnthropicBetas(headerBetas, betaList(payload.betas));
   delete payload.betas;
   delete payload.diagnostics;
   const metadata = record(payload.metadata);
@@ -68,11 +67,20 @@ export function prepareAnthropicApiPayload(input: RecordValue, headerBetas: stri
       else delete payload.system;
     }
   }
-  const betas = [
+  return { payload, beta: anthropicBodyBetas(payload, requested).join(",") };
+}
+
+// The feature betas a body needs, shared with the Claude OAuth profile: requested betas count only as
+// opt-ins the body can use, and betas a body field cannot be sent without are always included.
+export function anthropicBodyBetas(payload: RecordValue, requested: Set<string>) {
+  return [
     ...Object.entries(REQUESTABLE).filter(([beta, usable]) => requested.has(beta) && usable(payload)).map(([beta]) => beta),
     ...Object.entries(REQUIRED_BY_BODY).filter(([, required]) => required(payload)).map(([beta]) => beta),
   ];
-  return { payload, beta: betas.join(",") };
+}
+
+export function requestedAnthropicBetas(header: string | null, extra: string[]) {
+  return new Set([...(header || "").split(","), ...extra].map((beta) => beta.trim()).filter(Boolean));
 }
 
 function betaList(value: unknown) {

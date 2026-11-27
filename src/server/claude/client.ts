@@ -4,7 +4,7 @@ import { withAccountQuotaHeaders } from "@/src/server/http/accountQuota";
 import { recordClaudeQuotaHeaders } from "@/src/server/services/claudeQuota";
 
 import crypto from "node:crypto";
-import { claudeBetas, claudeCacheTtlMs, isNativeClaudeCodeRequest } from "@/src/server/claude/wire";
+import { claudeBetas, claudeCacheTtlMs } from "@/src/server/claude/wire";
 import { claudeChannelSession } from "@/src/server/services/channels";
 import { prepareClaudeOAuthUpstreamPayload } from "@/src/server/claude/compat";
 import { serverConfig } from "@/src/server/config/env";
@@ -60,11 +60,7 @@ export async function claudeFetch(
   if (!credential.tokens.access_token) {
     throw new Error("Saved Claude credential does not contain access_token");
   }
-  const claudeUserAgent = resolveClaudeUpstreamUserAgent(
-    input.sourceHeaders,
-    getEffectiveClaudeUserAgent(credential),
-    isNativeClaudeCodeRequest(input.sourceHeaders, payload, input.upstreamPath === "/v1/messages/count_tokens"),
-  );
+  const claudeUserAgent = getEffectiveClaudeUserAgent(credential);
   const prepared = prepareClaudeOAuthUpstreamPayload(cloneJsonObject(payload), {
     accessToken: credential.tokens.access_token,
     sourceHeaders: input.sourceHeaders,
@@ -85,7 +81,6 @@ export async function claudeFetch(
     sourceHeaders: input.sourceHeaders,
     claudeUserAgent,
     extraBetas: prepared.extraBetas,
-    native: prepared.native,
     sessionId: prepared.sessionId,
     payload: upstreamPayload,
     countTokens: input.upstreamPath === "/v1/messages/count_tokens",
@@ -189,6 +184,11 @@ export function copyClaudeUpstreamHeaders(headers: Headers) {
   return output;
 }
 
+// Relay owns the Claude Code client profile on OAuth: the selected credential's
+// User-Agent and the configured stainless profile, for native and converted
+// callers alike. No caller version, environment or agent header is copied; the
+// session ID is Relay's routing key (it also keys account stickiness and
+// metadata.user_id), and caller betas only opt into features the body uses.
 function buildClaudeHeaders(
   credential: ClaudeCredentialWithTokens,
   input: {
@@ -196,7 +196,6 @@ function buildClaudeHeaders(
     sourceHeaders: Headers;
     claudeUserAgent: string;
     extraBetas: string[];
-    native: boolean;
     sessionId: string;
     payload: Record<string, unknown>;
     countTokens: boolean;
@@ -204,8 +203,7 @@ function buildClaudeHeaders(
 ) {
   const beta = input.countTokens
     ? "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,token-counting-2024-11-01"
-    : claudeBetas(input.payload, input.sourceHeaders.get("anthropic-beta"), input.extraBetas, input.native);
-  const profileHeaders = input.native ? input.sourceHeaders : new Headers();
+    : claudeBetas(input.payload, input.sourceHeaders.get("anthropic-beta"), input.extraBetas);
   const headers: Record<string, string> = {
     Authorization: `Bearer ${credential.tokens.access_token}`,
     "Content-Type": "application/json",
@@ -213,79 +211,23 @@ function buildClaudeHeaders(
     Accept: input.stream ? "text/event-stream" : "application/json",
     "Accept-Encoding": "gzip, deflate, br, zstd",
     "Anthropic-Dangerous-Direct-Browser-Access": "true",
-    "Anthropic-Version":
-      input.native ? input.sourceHeaders.get("anthropic-version") || "2023-06-01" : "2023-06-01",
+    "Anthropic-Version": "2023-06-01",
     "Anthropic-Beta": beta,
     "X-App": "cli",
     "X-Stainless-Retry-Count": "0",
     "X-Stainless-Runtime": "node",
     "X-Stainless-Lang": "js",
-    "X-Stainless-Timeout": sourceOrDefault(
-      profileHeaders,
-      "x-stainless-timeout",
-      "600",
-    ),
+    "X-Stainless-Timeout": "600",
     "X-Claude-Code-Session-Id": input.sessionId,
-    "x-client-request-id": input.native ? input.sourceHeaders.get("x-client-request-id") || crypto.randomUUID() : crypto.randomUUID(),
+    "x-client-request-id": crypto.randomUUID(),
     "User-Agent": input.claudeUserAgent,
-    "X-Stainless-Package-Version": sourceOrDefault(
-      profileHeaders,
-      "x-stainless-package-version",
-      serverConfig.claudeStainlessPackageVersion,
-    ),
-    "X-Stainless-Runtime-Version": sourceOrDefault(
-      profileHeaders,
-      "x-stainless-runtime-version",
-      serverConfig.claudeStainlessRuntimeVersion,
-    ),
-    "X-Stainless-Os": sourceOrDefault(
-      profileHeaders,
-      "x-stainless-os",
-      serverConfig.claudeStainlessOs,
-    ),
-    "X-Stainless-Arch": sourceOrDefault(
-      profileHeaders,
-      "x-stainless-arch",
-      serverConfig.claudeStainlessArch,
-    ),
+    "X-Stainless-Package-Version": serverConfig.claudeStainlessPackageVersion,
+    "X-Stainless-Runtime-Version": serverConfig.claudeStainlessRuntimeVersion,
+    "X-Stainless-Os": serverConfig.claudeStainlessOs,
+    "X-Stainless-Arch": serverConfig.claudeStainlessArch,
   };
   if (input.countTokens) delete headers["X-Stainless-Timeout"];
-  if (input.native) {
-    for (const name of ["x-stainless-async", "x-claude-code-agent-id", "x-claude-code-parent-agent-id",
-      "x-claude-remote-container-id", "x-claude-remote-session-id", "x-client-app", "x-anthropic-additional-protection",
-      "x-claude-code-request-class", "x-claude-code-agent-type", "x-claude-code-compaction", "x-claude-code-context-compacted"]) {
-      const value = input.sourceHeaders.get(name);
-      if (value) headers[name] = value;
-    }
-  }
   return headers;
-}
-
-function resolveClaudeUpstreamUserAgent(
-  sourceHeaders: Headers,
-  fallback: string,
-  native: boolean,
-) {
-  const userAgent = sourceHeaders.get("user-agent")?.trim() || "";
-  if (native) {
-    return userAgent;
-  }
-  return fallback;
-}
-
-function sourceOrDefault(
-  sourceHeaders: Headers,
-  name: string,
-  fallback: string,
-) {
-  const userAgent = sourceHeaders.get("user-agent")?.trim() || "";
-  if (userAgent.startsWith("claude-cli/")) {
-    const value = sourceHeaders.get(name)?.trim();
-    if (value) {
-      return value;
-    }
-  }
-  return fallback;
 }
 
 function normalizeClaudeBaseUrl(value: string | undefined) {

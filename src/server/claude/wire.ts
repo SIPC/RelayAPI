@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import { HttpError } from "@/src/server/http/errors";
 import { parseClaudeModelSuffixes } from "@/src/server/claude/modelSuffix";
 import { CLAUDE_MODEL_POLICIES } from "@/src/server/claude/modelPolicies";
+import { anthropicBodyBetas, requestedAnthropicBetas } from "@/src/server/upstream/anthropicBetas";
 
 type RecordValue = Record<string, unknown>;
 export const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -189,6 +190,28 @@ function insertBeforeText(content: unknown, blocks: RecordValue[]) {
   parts.splice(index, 0, ...blocks);
   return parts;
 }
+function claudeCliVersion(userAgent: string) {
+  return /claude-cli\/([\d.]+)/.exec(userAgent)?.[1] || "2.1.280";
+}
+// Claude Code's 3-character build fingerprint in cc_version, over its first user message.
+function claudeBuildHash(firstUserContent: unknown, version: string) {
+  const fingerprintText = contentText(firstUserContent);
+  // Native JavaScript indices sample UTF-16 code units, not Unicode code points.
+  return crypto.createHash("sha256").update("59cf53e54c78" + [4, 7, 20].map((i) => fingerprintText[i] || "0").join("") + version).digest("hex").slice(0, 3);
+}
+// A native caller's billing block names its own CLI version and entrypoint. Relay sends
+// its own Claude Code profile, so the block is restated for that profile; the caller's
+// other billing fields stay, and CCH is signed afterwards over the result.
+export function alignClaudeBillingVersion(payload: RecordValue, userAgent: string) {
+  const first = record(Array.isArray(payload.system) ? payload.system[0] : null);
+  const billing = text(first?.text);
+  if (!first || !billing.startsWith("x-anthropic-billing-header:")) return;
+  const version = claudeCliVersion(userAgent);
+  const firstUser = (Array.isArray(payload.messages) ? payload.messages as RecordValue[] : []).find((message) => message.role === "user");
+  first.text = String(first.text)
+    .replace(/cc_version=[^;]*;/, "cc_version=" + version + "." + claudeBuildHash(firstUser?.content, version) + ";")
+    .replace(/cc_entrypoint=[^;]*;/, "cc_entrypoint=cli;");
+}
 export function cloakClaudeRequest(
   payload: RecordValue,
   input: { native: boolean; sessionId: string; userAgent: string; explicitCache: boolean; workload: string },
@@ -202,14 +225,11 @@ export function cloakClaudeRequest(
     return text(item.text) && !text(item.text).startsWith("x-anthropic-billing-header:")
       && text(item.text) !== CLAUDE_CODE_IDENTITY;
   });
-  const version = /claude-cli\/([\d.]+)/.exec(input.userAgent)?.[1] || "2.1.280";
+  const version = claudeCliVersion(input.userAgent);
   const messages = Array.isArray(payload.messages) ? payload.messages as RecordValue[] : [];
   const firstUserIndex = messages.findIndex((message) => message.role === "user");
   const firstUser = messages[firstUserIndex];
-  const fingerprintText = contentText(firstUser?.content);
-  // Native JavaScript indices sample UTF-16 code units, not Unicode code points.
-  const hash = crypto.createHash("sha256").update("59cf53e54c78" + [4, 7, 20].map((i) => fingerprintText[i] || "0").join("") + version).digest("hex").slice(0, 3);
-  const billing = "x-anthropic-billing-header: cc_version=" + version + "." + hash
+  const billing = "x-anthropic-billing-header: cc_version=" + version + "." + claudeBuildHash(firstUser?.content, version)
     + "; cc_entrypoint=cli; cch=00000;" + (input.workload ? " cc_workload=" + input.workload + ";" : "");
   payload.system = [
     { type: "text", text: billing },
@@ -282,14 +302,10 @@ export function normalizeClaudeSampling(payload: RecordValue, native: boolean) {
     delete payload.top_k;
   } else if (payload.temperature !== undefined) delete payload.top_p;
 }
-export function claudeBetas(payload: RecordValue, source: string | null, extra: string[], native: boolean) {
-  const requested = new Set([...(source || "").split(","), ...extra].map((v) => v.trim()).filter(Boolean));
-  if (native) {
-    const values = [...requested];
-    if (!requested.has("oauth-2025-04-20")) values.splice(values[0] === "claude-code-20250219" ? 1 : 0, 0, "oauth-2025-04-20");
-    if (!requested.has("extended-cache-ttl-2025-04-11")) values.push("extended-cache-ttl-2025-04-11");
-    return values.join(",");
-  }
+// Relay owns the Claude Code client profile on OAuth, for native callers too: the
+// caller's betas only opt into features its body can use, never copied as a list.
+export function claudeBetas(payload: RecordValue, source: string | null, extra: string[]) {
+  const requested = requestedAnthropicBetas(source, extra);
   const values = ["claude-code-20250219", "oauth-2025-04-20"];
   const add = (beta: string, condition = true) => { if (condition && !values.includes(beta)) values.push(beta); };
   add("context-1m-2025-08-07", requested.has("context-1m-2025-08-07"));
@@ -317,5 +333,6 @@ export function claudeBetas(payload: RecordValue, source: string | null, extra: 
   add("extended-cache-ttl-2025-04-11");
   add("prompt-caching-evict-2026-05-12", JSON.stringify(payload).includes('"evict_on_complete"') || requested.has("prompt-caching-evict-2026-05-12"));
   add("cache-diagnosis-2026-04-07", Boolean(payload.diagnostics));
+  for (const beta of anthropicBodyBetas(payload, requested)) add(beta);
   return values.join(",");
 }
